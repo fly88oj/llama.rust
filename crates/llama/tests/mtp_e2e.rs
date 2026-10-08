@@ -1,6 +1,6 @@
 //! mtp_e2e.rs — the MTP/NextN draft-graph trilogy (deepseek2 / deepseek32 /
 //! deepseek4, `graph_mtp` @ bd4f514db1) on synthetic GGUFs, following the
-//! arch-batch protocol (PARITY.md 批次 6/7):
+//! arch-batch protocol (PARITY.md batch 6/7):
 //!
 //!   * the generator writes, per arch, a **nextn file** (`block_count =
 //!     n_layer + 1`, `{arch}.nextn_predict_layers = 1`, the MTP layer's full

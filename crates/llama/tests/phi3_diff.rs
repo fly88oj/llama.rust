@@ -1,133 +1,176 @@
-//! phi3_diff.rs — P4 侦查：实模型 Phi-4-mini Q6_K 上 phi3 前向与参考的数值分歧定位。
+//! phi3_diff.rs — P4 investigation: locating the numeric divergence between
+//! the port's phi-3 forward and the reference on the real Phi-4-mini Q6_K model.
 //!
-//! 背景（代理 L 既得）：prompt `"The capital of France is"` 上参考稳定输出
-//! `" Paris. What is the capital of Germany? ..."`，本移植在第 7 个 token 分叉
-//! （参考 ` Germany`，本移植 ` France`）。qwen2 在同协议下 64/64 对齐，所以分歧
-//! 只能来自 phi3 特有的图构建逻辑。
+//! Background (agent L pre-existing finding): on the prompt
+//! `"The capital of France is"`, the reference stably outputs
+//! `" Paris. What is the capital of Germany? ..."`, and the port diverges at
+//! the 7th token (reference: ` Germany`, port: ` France`). qwen2 aligns 64/64
+//! under the same protocol, so the divergence can only come from
+//! phi-3-specific graph construction.
 //!
-//! # 结论（2026-09-24，代理 N）
-//! **根因 = 移植缺少 `cparams.yarn_attn_factor *= hparams.rope_attn_factor`
-//! （参考 src/llama-context.cpp:214）**。Phi-4-mini 的 GGUF 带
-//! `phi3.rope.scaling.attn_factor = 1.190238118171692`，参考把它乘进 rope 的
-//! `mscale`（llama-graph.cpp:1476 `attn_factor (cparams.yarn_attn_factor)`
-//! → `ggml_rope_ext(...)` 的 attn_factor → ops.cpp:5959 `rope_yarn`
-//! `*cos_theta = cosf(theta) * mscale`），于是参考把旋转通道的 Q/K 放大 1.1902 倍；
-//! 本移植传 attn_factor = 1.0（`hp.yarn_attn_factor`，未乘 `hp.rope_attn_factor`），
-//! 旋转通道幅度差 19%、注意力分数里旋转部分的贡献差 mscale² = 41.7%。
+//! # Conclusion (2026-09-24, agent N)
+//! **Root cause = the port is missing
+//! `cparams.yarn_attn_factor *= hparams.rope_attn_factor`**
+//! (reference: src/llama-context.cpp:214). Phi-4-mini's GGUF carries
+//! `phi3.rope.scaling.attn_factor = 1.190238118171692`; the reference
+//! multiplies it into rope's `mscale` (llama-graph.cpp:1476
+//! `attn_factor (cparams.yarn_attn_factor)` → `ggml_rope_ext(...)` attn_factor
+//! → ops.cpp:5959 `rope_yarn` `*cos_theta = cosf(theta) * mscale`), so the
+//! reference scales the Q/K rotation channel by 1.1902x; the port passes
+//! attn_factor = 1.0 (`hp.yarn_attn_factor`, without multiplying by
+//! `hp.rope_attn_factor`), so the rotation channel amplitude differs by 19%
+//! and the rotation contribution to the attention score differs by
+//! mscale^2 = 41.7%.
 //!
-//! ## 证据链（两条独立路线，互相闭合）
-//! 1. `phi3_ref_gap_trace`（现配置，attn_factor = 1.0）：第 7 步复现分叉，
-//!    France − Germany = **+1.79** logits（参考 −1.35，即参考 Germany 高 1.35），
-//!    pair-gap 最大偏差 6.53，轨迹 9/10。
-//! 2. `phi3_attn_factor_probe`（attn_factor = 1.190238118171692，并把 ext_factor
-//!    从 -1.0 归 0.0、n_ctx_orig 从 131072 归 4096，即完全照参考 cparams 接线）：
-//!    **逐 token 复现参考的 10 个 token**（含 ` Germany`），pair-gap 偏差降到
-//!    0.01..0.56。
-//! 3. 反向对照（参考侧，单字节改动）：把同一 GGUF 的
-//!    `phi3.rope.scaling.attn_factor` 改成 1.0（`cp --reflink` 不适用 → 全量
-//!    cp 到 /tmp + patch 文件偏移 109 的 4 字节；`cmp` 确认全文件只有这 3 字节不同），
-//!    参考 server 的输出翻转为 ` Paris. What is the capital of France? The`
-//!    —— 与本移植现输出一致，且本移植（attn_factor = 1.0）与该参考轨迹 10/10 相同
-//!    （见 `phi3_attn1_reference_trace` 与 `REF_TOP6_ATTN1`）。两侧在同一位点上
-//!    互换了行为，只有 attn_factor 这一个变量。
-//! 4. 参考侧自身稳定：`-t 1` 与 `-t 8` 的 top-20 logprob 逐位一致（0.000 差），
-//!    两个 fresh 实例的 capture 完全一致 → 残差不是参考的抖动。
+//! ## Evidence chain (two independent paths, mutually closing)
+//! 1. `phi3_ref_gap_trace` (current configuration, attn_factor = 1.0):
+//!    step 7 reproduces the divergence, France − Germany = **+1.79** logits
+//!    (reference −1.35, i.e. reference's Germany is higher by 1.35),
+//!    max pair-gap 6.53, trajectory 9/10.
+//! 2. `phi3_attn_factor_probe` (attn_factor = 1.190238118171692, ext_factor
+//!    zeroed from -1.0, n_ctx_orig zeroed from 131072 to 4096, i.e. exactly
+//!    matching the reference's cparams wiring): **reproduces the reference
+//!    10 tokens token-by-token** (including ` Germany`), pair-gap drops
+//!    to 0.01..0.56.
+//! 3. Reverse verify against (reference side, single-byte edit): patch
+//!    the same GGUF's `phi3.rope.scaling.attn_factor` to 1.0 (`cp --reflink`
+//!    does not apply → full cp to /tmp + patch the 4 bytes at file offset
+//!    109; `cmp` confirms the whole file differs by exactly those 3 bytes),
+//!    the reference server flips its output to
+//!    ` Paris. What is the capital of France? The` — matching the port's
+//!    current output, and the port (attn_factor = 1.0) matches that
+//!    reference trajectory 10/10 (see `phi3_attn1_reference_trace` and
+//!    `REF_TOP6_ATTN1`). Both sides swap behaviour at the same point;
+//!    attn_factor is the only variable.
+//! 4. Reference side itself is stable: `-t 1` and `-t 8` top-20 logprobs
+//!    match bit-for-bit (0.000 delta), two fresh instances' capture matches
+//!    exactly → the residual is not reference jitter.
 //!
-//! ## 逐疑点结论（全部排除，附 C 行号）
-//! 1. **部分 rope（n_rot=96 < head_dim=128）**：与 C 一致。`phi3_rope_mscale_check`
-//!    在 ne0=128/n_rot=96/NEOX 下把移植的 rope op 与 C 公式
-//!    （`ggml_rope_cache_init` ops.cpp:5975 + `rope_yarn` ops.cpp:5959 +
-//!    `rotate_pairs` ops.cpp:6063 + 非旋转通道回填 ops.cpp:6217-6226）
-//!    **逐位对齐（0/768 位差）**；通道映射为 pairs (j, j+48)（rotate_pairs 的
-//!    scale=2 → `ic = i0/2`），非旋转通道 96..127 原样复制。
-//! 2. **ffn_up 两半切分**：与 C 一致。参考走 phi3.cpp:149
-//!    `build_ffn(up, NULL, NULL, NULL /*gate*/, ..., LLM_FFN_SWIGLU, LLM_FFN_SEQ)`
-//!    → llama-graph.cpp:1885 `ggml_swiglu(cur)`，CPU 内核（ops.cpp:3189-3224，
-//!    `nc = ne0/2`、`swapped = 0`）即 `dst = silu(前半) * 后半`
-//!    （vec.cpp:417 `ggml_v_silu(x[i])*g[i]`）。`phi3_ffn_up_swiglu_split_check`
-//!    （0/288 位差）验证移植的 views+silu+mul 组合与此逐位相同。
-//! 3. **融合 qkv 切分**：与 C 一致。llama-graph.cpp:1667-1674 的三段 view_3d
-//!    （偏移 0 / row_size(n_embd_q) / row_size(n_embd_q+n_embd_k)，
-//!    `nb1 = row_size(type, head_dim)`，`nb2 = qkv->nb[1]`，reshape=true 见
-//!    llama-graph.cpp:1619-1631）；`phi3_fused_qkv_split_check` 用分段标记权重
-//!    在 24/8 头几何下验证三段偏移全部正确（0 失配）。
-//! 4. **longrope / rope factors**：数值上是 no-op。llama-model.cpp:2259
-//!    `get_rope_factors` 在 `n_ctx_seq <= n_ctx_orig_yarn`（512 <= 4096）时返回
-//!    `rope_short`，作为 `ggml_rope_ext` 的 src2 → `freq_factors`；
-//!    `rope_yarn(theta/ff)` 中 ff=1.0 时 `x/1.0f == x` 位精确。
-//!    `phi3_rope_factors_are_all_one` 实测 rope_short 48 个值全 = 1.0
-//!    （rope_long 才非 1）。顺带发现参考侧 quirk：C 的 cache 循环按 ne0=128
-//!    访问 freq_factors[0..64]，而张量只有 n_rot/2=48 个元素（越界读 mmap 尾部，
-//!    因前 48 个全是 1.0 且实际只用到 n_dims=96 个通道，无影响）。
+//! ## Per-suspect conclusions (all ruled out, with C line numbers)
+//! 1. **Partial rope (n_rot=96 < head_dim=128)**: matches C.
+//!    `phi3_rope_mscale_check` under ne0=128/n_rot=96/NEOX aligns the port's
+//!    rope op bit-for-bit against the C formula (`ggml_rope_cache_init`
+//!    ops.cpp:5975 + `rope_yarn` ops.cpp:5959 + `rotate_pairs` ops.cpp:6063
+//!    + non-rotation channel fill-back ops.cpp:6217-6226) (**0/768 bits
+//!    differ**); the channel mapping is pairs (j, j+48) (rotate_pairs's
+//!    scale=2 → `ic = i0/2`), non-rotation channels 96..127 copy as-is.
+//! 2. **ffn_up two-half split**: matches C. Reference goes through
+//!    phi3.cpp:149 `build_ffn(up, NULL, NULL, NULL /*gate*/, ...,
+//!    LLM_FFN_SWIGLU, LLM_FFN_SEQ)` → llama-graph.cpp:1885
+//!    `ggml_swiglu(cur)`, the CPU kernel (ops.cpp:3189-3224, `nc = ne0/2`,
+//!    `swapped = 0`) is `dst = silu(front half) * back half` (vec.cpp:417
+//!    `ggml_v_silu(x[i])*g[i]`). `phi3_ffn_up_swiglu_split_check` (0/288
+//!    bits differ) verifies the port's views+silu+mul composition matches
+//!    this bit-for-bit.
+//! 3. **Fused qkv split**: matches C. The three-way view_3d at
+//!    llama-graph.cpp:1667-1674 (offsets 0 / row_size(n_embd_q) /
+//!    row_size(n_embd_q+n_embd_k), `nb1 = row_size(type, head_dim)`,
+//!    `nb2 = qkv->nb[1]`, reshape=true see llama-graph.cpp:1619-1631);
+//!    `phi3_fused_qkv_split_check` uses segment-marked weights under the
+//!    24/8 head geometry to verify all three segment offsets are correct
+//!    (0 mismatches).
+//! 4. **longrope / rope factors**: numerically a no-op. llama-model.cpp:2259
+//!    `get_rope_factors` returns `rope_short` when
+//!    `n_ctx_seq <= n_ctx_orig_yarn` (512 <= 4096), which is fed as src2
+//!    → `freq_factors` of `ggml_rope_ext`; in `rope_yarn(theta/ff)` when
+//!    ff=1.0, `x/1.0f == x` is bit-exact. `phi3_rope_factors_are_all_one`
+//!    measures all 48 values of rope_short = 1.0 (rope_long is the non-one
+//!    one). Incidentally noted reference-side quirk: C's cache loop reads
+//!    freq_factors[0..64] at ne0=128, but the tensor only has n_rot/2=48
+//!    elements (out-of-bounds read of the mmap tail; harmless because
+//!    the first 48 are all 1.0 and only n_dims=96 channels are used).
 //!
-//! ## 修复建议（≤5 行，未施加 —— 本文件只读实现）
-//! `crates/tools/llama-cli/src/main.rs` 的 `AttnParams`（唯一生产接线点）：
+//! ## Suggested fix (≤5 lines, NOT applied — this file is read-only
+//! implementation)
+//! `crates/tools/llama-cli/src/main.rs`'s `AttnParams` (the only
+//! production wiring point):
 //! ```diff
 //! -        ext_factor: hp.yarn_ext_factor,
 //! -        attn_factor: hp.yarn_attn_factor,
-//! +        // llama-context.cpp:173-175: 负值 = "未设置" → YARN ? 1.0 : 0.0
+//! +        // llama-context.cpp:173-175: negative = "unset" → YARN ? 1.0 : 0.0
 //! +        ext_factor: if hp.yarn_ext_factor < 0.0 { 0.0 } else { hp.yarn_ext_factor },
 //! +        // llama-context.cpp:214 `cparams.yarn_attn_factor *= hparams.rope_attn_factor`
 //! +        attn_factor: hp.yarn_attn_factor * hp.rope_attn_factor,
 //! ```
-//! 另需把 `crates/llama/src/hparams.rs:570` 的默认值 `rope_attn_factor: 0.0`
-//! 改为 `1.0`（参考 llama-hparams.h:149 `float rope_attn_factor = 1.0f;`），
-//! 否则缺该 key 的模型会整条 rope 归零。`n_ctx_orig` 建议同时改为
-//! `hp.n_ctx_orig_yarn`（llama-graph.cpp:1486；仅在 ext_factor != 0 时有数值影响，
-//! 属语义修正）。同一改法需同步 `crates/llama/tests/arch_e2e.rs:243` 的
-//! `attn_params()` 辅助函数（测试口径）。
+//! Also change `crates/llama/src/hparams.rs:570`'s default
+//! `rope_attn_factor: 0.0` to `1.0` (reference: llama-hparams.h:149
+//! `float rope_attn_factor = 1.0f;`), otherwise models lacking that key
+//! zero out the whole rope. `n_ctx_orig` should also become
+//! `hp.n_ctx_orig_yarn` (llama-graph.cpp:1486; only has numerical effect
+//! when ext_factor != 0, semantic correction). The same change must
+//! propagate to `crates/llama/tests/arch_e2e.rs:243`'s `attn_params()`
+//! helper (test convention).
 //!
-//! ## 已知残留（新发现，超出 P4 范围，已定位到机制，见 `phi3_layerwise_probe`）
-//! 修好 attn_factor 后，本移植与参考的 pair-gap 仍有 0.01..0.56 logits 的偏差
-//! （10 步 greedy 轨迹不受影响，修好 attn_factor 后 10/10 一致）。这不是
-//! attn_factor 造成的（两侧都归到 1.0 时偏差同量级），也不是本移植独有：
+//! ## Known residual (newly discovered, beyond P4 scope, mechanism
+//! located — see `phi3_layerwise_probe`)
+//! After fixing attn_factor, the port and the reference still have a
+//! 0.01..0.56 logits pair-gap (10-step greedy trajectory unaffected;
+//! 10/10 matches after the attn_factor fix). This is not caused by
+//! attn_factor (both sides collapse to 1.0 and the gap is the same), nor
+//! is it port-specific:
 //!
-//! * `phi3_layerwise_probe`（用参考 libllama 的 cb_eval dump 每层张量，见
-//!   `/tmp/ref_dump.c`）显示 0/1/2 层全部张量在 **≤3e-6（1-2 ulp）** 内一致，
-//!   **首个 >1e-3 的偏差出现在第 3 层的 ffn_out-3 / l_out-3**（且只出现在
-//!   token 3/4 —— 即 attend 过更多 KV 的靠后位置），此后逐层放大到
-//!   result_output 的 max|d| = 1.46 logits。这是 F16 KV cache 的“量化阈值翻转”
-//!   放大：Kcur/Vcur 只有 1e-6 级差异，落到 F16（相对精度 4.9e-4）时个别元素
-//!   跨过舍入边界 → 注意力输出跳 1e-4 → 残差流逐层放大。
-//! * 同一机制在参考侧同样存在，量级相同：同一 binary、同一模型，只把 KV cache
-//!   从 F16 换成 F32（`-ctk f32 -ctv f32`），参考**自己**的 pair-gap 就变了
-//!   0.1..2.59 logits，第 7 步答案从 ` Germany` 变成 ` Italy`（这正是 PARITY.md
-//!   记录的“参考自身双模态”的同一根源）。
+//! * `phi3_layerwise_probe` (using the reference libllama's cb_eval to
+//!   dump every layer's tensor, see `/tmp/ref_dump.c`) shows layers 0/1/2
+//!   tensors all agree within **≤3e-6 (1-2 ulp)**, **the first >1e-3
+//!   deviation appears at layer 3's ffn_out-3 / l_out-3** (and only at
+//!   tokens 3/4 — i.e. the later positions that have attended to more KV),
+//!   and from there it grows per layer to max\|d\| = 1.46 logits at
+//!   result_output. This is the F16 KV cache "quantization threshold
+//!   flip" amplification: Kcur/Vcur differ only at the 1e-6 level, but
+//!   once they fall into F16 (relative precision 4.9e-4) individual
+//!   elements cross the rounding boundary → attention output jumps 1e-4
+//!   → the residual stream amplifies per layer.
+//! * The same mechanism exists on the reference side with the same
+//!   magnitude: the same binary, the same model, only swapping the KV
+//!   cache from F16 to F32 (`-ctk f32 -ctv f32`), the **reference's
+//!   own** pair-gap changes by 0.1..2.59 logits and the step-7 answer
+//!   flips from ` Germany` to ` Italy` (this is exactly the
+//!   "reference's own dual-mode" recorded in PARITY.md).
 //!
-//! 结论：残差 = 已归档的 K-quant mul_mat 最后 1-2 ulp 差异（PARITY.md
-//! “已知数值差异来源” 1）经 F16 KV cache 放大后的必然结果，< 0.6 logits 且不改
-//! 变 10 步轨迹，不阻塞 P4。要做到更严格的一致性只能改 KV cache 精度
-//! （两侧同时改 F32）或逐内核复刻 AVX512 lane 顺序。
+//! Conclusion: the residual = the 1-2 ulp tail-difference of the
+//! archived K-quant mul_mat (PARITY.md "known numeric divergence
+//! sources" #1) amplified through F16 KV cache; < 0.6 logits, does not
+//! change the 10-step trajectory, does not block P4. Tighter agreement
+//! requires changing KV cache precision (both sides switch to F32) or
+//! replicating the AVX512 lane order kernel-by-kernel.
 //!
-//! # 复现跑法
+//! # How to reproduce
 //! ```text
-//! # 1) 参考侧（fresh server + 首请求，PARITY.md 协议；端口避开 8801/8802/8805）
+//! # 1) reference side (fresh server + first request, PARITY.md protocol;
+//! #    avoid ports 8801/8802/8805)
 //! REF=/home/jeffrey/llm/llama.cpp/build-rust-ref/bin
 //! $REF/llama-server -m <Phi-4-mini-Q6_K.gguf> -c 512 -t 8 -fa off --port 8820 &
 //! curl -s localhost:8820/completion -H 'Content-Type: application/json' \
 //!   -d '{"prompt":"The capital of France is","n_predict":10,"temperature":0,
 //!        "top_k":1,"cache_prompt":false,"logprobs":20}' > /tmp/ref.json
-//! # 1b) 反向对照：attn_factor = 1.0 的参考（把 /tmp 副本的 f32 元数据改掉）
+//! # 1b) reverse verify against: an attn_factor = 1.0 reference (patch the
+//! #    f32 metadata of a /tmp copy)
 //! python3 - <<'PY'
-//! # 定位 phi3.rope.scaling.attn_factor 的值偏移并在副本上写 1.0f（偏移 109）
+//! # locate the value offset of phi3.rope.scaling.attn_factor in the copy and
+//! # write 1.0f there (offset 109)
 //! import struct; f=open('/tmp/phi4mini-attn1.gguf','r+b'); f.seek(109)
 //! f.write(struct.pack('<f',1.0)); f.close()
 //! PY
 //! $REF/llama-server -m /tmp/phi4mini-attn1.gguf ... --port 8821 &   # -> " France"
-//! # 1c) KV 精度对照：同一模型 -ctk f32 -ctv f32（第 7 步变 " Italy"，gap 动 0.1..2.59）
-//! # 2) 本移植（release；调试构建在这个 3.8B 模型上太慢）
+//! # 1c) KV-precision verify against: same model with -ctk f32 -ctv f32
+//! #    (step 7 flips to " Italy", the gap moves by 0.1..2.59)
+//! # 2) the port (release; a debug build is too slow on this 3.8B model)
 //! cargo test -p llama --release --test phi3_diff -- --ignored --nocapture
-//! # 3) 逐层对照（可选）：参考侧 dump + phi3_layerwise_probe
+//! # 3) layer-by-layer verify against (optional): reference-side dump +
+//! #    phi3_layerwise_probe
 //! gcc -O2 -I<sp>/llama.cpp-pinned/include -I<sp>/ggml/include /tmp/ref_dump.c \
 //!     -o /tmp/ref_dump -L$REF -lllama -lggml -lggml-base -lggml-cpu -lm -Wl,-rpath,$REF
 //! /tmp/ref_dump <Phi-4-mini-Q6_K.gguf> /tmp/refdump
 //! cargo test -p llama --release --test phi3_diff -- --ignored --nocapture phi3_layerwise_probe
 //! ```
-//! 参考的 top-6 已内置为 `REF_TOP6` / `REF_TOP6_ATTN1`（每步 (id, logprob)，由上面
-//! 的 curl 捕获），所以前两个端到端测试不需要 server 也能跑。
+//! The reference's top-6 are baked in as `REF_TOP6` / `REF_TOP6_ATTN1`
+//! (per step (id, logprob), captured by the curl above), so the first two
+//! end-to-end tests run without a server.
 //!
-//! 只读约束：本文件不修改任何实现代码；`build_phi3_forward` 只通过 `AttnParams`
-//! 参数化（attn_factor / ext_factor / n_ctx_orig 三个字段的接线差异即根因）。
+//! Read-only constraint: this file does not modify any implementation code;
+//! `build_phi3_forward` is only parameterised through `AttnParams`
+//! (the wiring difference of the three fields attn_factor / ext_factor /
+//! n_ctx_orig is the root cause).
 
 use std::path::Path;
 use std::sync::Arc;

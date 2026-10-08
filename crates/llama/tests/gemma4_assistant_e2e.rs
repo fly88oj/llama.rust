@@ -12,7 +12,7 @@
 //!
 //! The reference's own driver cannot reach the head (the pinned
 //! common/speculative.cpp:2562 loads the *target* path as the draft model —
-//! see PARITY.md 批次 15 §gemma4-assistant), so the truth comes from
+//! see PARITY.md batch 15 §gemma4-assistant), so the truth comes from
 //! `parity/ref_gemma4_assistant_dump.c`: it pairs the contexts by hand
 //! (`cparams.ctx_other = ctx_tgt`, llama-context.cpp:147-153) and replays the
 //! draft-mtp step shape (speculative.cpp:1602-1751) — seed (id_last,

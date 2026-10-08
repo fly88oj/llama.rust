@@ -1,6 +1,6 @@
 //! gdn.rs — gated delta net kernel (GGML_OP_GATED_DELTA_NET).
 //!
-//! 对照 ggml/src/ggml-cpu/ops.cpp:10894-11105 (`ggml_compute_forward_gated_delta_net`
+//! verify against ggml/src/ggml-cpu/ops.cpp:10894-11105 (`ggml_compute_forward_gated_delta_net`
 //! / `_one_chunk`) in the pinned worktree @ bd4f514db1, restricted to the
 //! **K == 1** slice (the only shape the port's graphs build: K is
 //! `cparams.n_rs_seq + 1` and the port models a single sequence with no

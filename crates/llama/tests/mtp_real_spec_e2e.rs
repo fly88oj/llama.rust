@@ -13,7 +13,7 @@
 //!      greedy stream — the speculative invariant,
 //!   3. (#[ignore], diagnostic) the same spec run **without** the ring: the
 //!      port CLI's current construction (n_rs_seq = 0) — printed, not
-//!      asserted; this is the documented divergence of PARITY.md 批次 20.
+//!      asserted; this is the documented divergence of PARITY.md batch 20.
 //!
 //! Root cause the ring fixes (batch 20, real-model bisect): qwen35 is a
 //! hybrid (48 of 64 layers are gated-delta-net). The driver's verify batch

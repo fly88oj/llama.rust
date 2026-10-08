@@ -16,12 +16,12 @@
 //! Exceptions (the established precedents):
 //!   * **llada** — the diffusion family (llama-model.cpp:2289-2295 creates no
 //!     memory; every reference driver refuses to generate): verified in-port
-//!     like llada-moe/dream/rnd1 (PARITY.md 批次 10/11b).
+//!     like llada-moe/dream/rnd1 (PARITY.md batch 10/11b).
 //!   * **gemma-embedding / llama-embed** — encoder-side graphs (no logits):
 //!     verified in-port here + against the reference `llama_encode` dumps via
 //!     `parity/ref_encode_dump` (the ignored reference-parity tests below,
 //!     the bert/t5/eurobert protocol).
-//!   * **gemma4-assistant** — documented-skip (PARITY.md 批次 15): the graph
+//!   * **gemma4-assistant** — documented-skip (PARITY.md batch 15): the graph
 //!     GGML_ASSERTs `cparams.ctx_other != nullptr` (gemma4-assistant.cpp:108)
 //!     — it is a draft module of the gemma4 trunk, unloadable standalone.
 
@@ -3410,7 +3410,7 @@ fn arch_batch15_encoder_reference_parity() {
             );
             eprintln!(
                 "gemma-embedding: reference llama_encode crashes (GGML_ASSERT(buffer)) \
-                 — documented skip, see PARITY.md 批次 15"
+                 — documented skip, see PARITY.md batch 15"
             );
             continue;
         }

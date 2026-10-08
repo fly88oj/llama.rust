@@ -614,7 +614,7 @@ fn qwen4exp_qsa_prefill_node_dump() {
 // same 13 graph builds, bit-compare the named nodes against the stored
 // reference stream (parity/qwen4exp_qsa_nodes_ref.bin — the no-embeddings
 // probe variant over the NEW reference; the reference's own embeddings
-// output extraction aborts on the QSA graph, see PARITY.md 批次 19).
+// output extraction aborts on the QSA graph, see PARITY.md batch 19).
 // ---------------------------------------------------------------------------
 
 fn read_nodes(

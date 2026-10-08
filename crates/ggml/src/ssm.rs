@@ -1,8 +1,8 @@
 //! ssm.rs — SSM / short-conv kernels. Owner: agent T.
 //!
-//! 对照 ggml-cpu/ops.cpp (pinned worktree @ bd4f514db1):
-//!   * `ggml_compute_forward_ssm_conv`  (ops.cpp:9701-9768)  — 因果 1D 卷积
-//!   * `ggml_compute_forward_ssm_scan`  (ops.cpp:9771-10008) — mamba2 选择性扫描
+//! verify against ggml-cpu/ops.cpp (pinned worktree @ bd4f514db1):
+//!   * `ggml_compute_forward_ssm_conv`  (ops.cpp:9701-9768)  — causal 1D convolution
+//!   * `ggml_compute_forward_ssm_scan`  (ops.cpp:9771-10008) — mamba2 selective scan
 //!
 //! Both are scalar ports of the C reference: the C code only takes the SIMD
 //! path when GGML_SIMD is defined, and the reference build (-march=native)

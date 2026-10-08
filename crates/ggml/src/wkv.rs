@@ -1,6 +1,6 @@
 //! wkv.rs — the three fused RWKV attention kernels.
 //!
-//! 对照 ggml/src/ggml-cpu/ops.cpp (pinned worktree @ bd4f514db1):
+//! verify against ggml/src/ggml-cpu/ops.cpp (pinned worktree @ bd4f514db1):
 //!   * `ggml_compute_forward_rwkv_wkv6_f32` (ops.cpp:10413-10603) —
 //!     GGML_OP_RWKV_WKV6 (ggml.c:5873), the rwkv6 / rwkv6qwen2… no: the
 //!     rwkv6 WKV;

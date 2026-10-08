@@ -1145,7 +1145,7 @@ pub fn arch_tensors_support(arch: LlmArch) -> ArchTensorsSupport {
         // indexer) + the co-arms mistral4 (deepseek2's loader+graph),
         // paddleocr (ernie4_5's loader) and hunyuan-dense (hunyuan_vl's).
         // MTP tensors of hy-v3/mimo2/step35 load; their graph_mtp heads are
-        // the documented batch-15 skip (PARITY.md 批次 15) — the bailingmoe3/
+        // the documented batch-15 skip (PARITY.md batch 15) — the bailingmoe3/
         // cohere2moe/glm4-moe precedent. llama-embed reuses the LLAMA arm
         // (graph<true> = the port's build_llama_forward embed tap).
         | LlmArch::QWEN
@@ -1196,7 +1196,7 @@ pub fn arch_tensors_support(arch: LlmArch) -> ArchTensorsSupport {
         | LlmArch::QWEN3TTS
         | LlmArch::POCKETTTS
         | LlmArch::WAVTOKENIZER_DEC => Partial,
-        // 同步批次 A (def4d406a): glm5-next — loader 1:1 (tests/glm5_e2e.rs +
+        // sync batch A (def4d406a): glm5-next — loader 1:1 (tests/glm5_e2e.rs +
         // parity/glm5_parity.sh vs the NEW reference); the graph waits on the
         // kv-cache lane's kpool port
         // sync batch A2 (2026-10-05, a7b94df2c) — clef: the qwen35 trunk
@@ -11367,7 +11367,7 @@ fn load_arch_tensors(
         // GLM5-Next: hybrid KDA + nope-MLA DSA layers with the k-pool
         // indexer, mHC residual streams, DeepSeek-style MoE + NextN block.
         // The port has no TENSOR_SKIP — the NextN block always loads
-        // (≡ load_mtp=true, PARITY.md 批次 18 model.rs:29-32).
+        // (≡ load_mtp=true, PARITY.md batch 18 model.rs:29-32).
         LlmArch::GLM5_NEXT => {
             let tok_embd = req!(
                 LlmTensor::TOKEN_EMBD,
@@ -18557,7 +18557,7 @@ fn load_arch_tensors(
             // "blk.0.attn_norm.weight" for mtp-only files (trunk tensors
             // TENSOR_NOT_REQUIRED) next to the old trunk-only probe — the
             // port has no partial-file modes (full files only, PARITY.md
-            // 批次 18 model.rs:29-32), both probes stay N/A here.
+            // batch 18 model.rs:29-32), both probes stay N/A here.
             let tok_embd = req!(
                 LlmTensor::TOKEN_EMBD,
                 "weight",
@@ -23827,7 +23827,7 @@ mod tests {
 #[cfg(test)]
 mod batch12_count_check {
     /// sanity for the PARITY/FILE_MAP/COVERAGE count claims: the ported-arch
-    /// count (Full + Partial — the "arch_tensors_support 口径") is 95 after
+    /// count (Full + Partial — the "arch_tensors_support convention") is 95 after
     /// batch 12 (appended by the batch-12 integrator; remove freely)
     #[test]
     fn arch_ported_count_is_95() {
@@ -23842,8 +23842,8 @@ mod batch12_count_check {
         // 147 with MTP batch 17 (LFM2 sharing the lfm2moe arm + the full T5
         // encoder-decoder arch); 148 with sync batch A's GLM5_NEXT (Partial —
         // loader/table face, the graph lands with the kpool memory port,
-        // PARITY.md 同步批次 A §2); 149 with sync batch A2's CLEF (Full —
-        // clef.rs + the decision tables, PARITY.md 同步批次 A2)
+        // PARITY.md sync batch A §2); 149 with sync batch A2's CLEF (Full —
+        // clef.rs + the decision tables, PARITY.md sync batch A2)
         assert_eq!(
             n, 149,
             "arch_tensors_support ported count"

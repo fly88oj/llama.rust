@@ -990,7 +990,7 @@ fn phi3_real_forward_phi4_mini() {
 /// the first difference is index 7, where the reference picks " Germany" and this
 /// port picks " France". At that step the port's own France-vs-Germany gap is
 /// **1.72 logits**, i.e. larger than the documented ulp-level residuals
-/// (PARITY.md "已知数值差异来源": K-quant vec_dot last-ulp lanes, FA not ported), so
+/// (PARITY.md "known numeric divergence sources": K-quant vec_dot last-ulp lanes, FA not ported), so
 /// the size of the reference-side gap is what decides whether this is numeric
 /// noise or a phi3 builder difference. The reference is self-consistent here
 /// (3 identical requests on a fresh server + a second fresh instance reproduce

@@ -41,7 +41,7 @@ use half::{bf16, f16};
 use crate::graph::Graph;
 
 // ======================================================================
-// Thread team — 对照 ggml-cpu.c 的 threadpool + ggml_barrier
+// Thread team — verify against ggml-cpu.c threadpool + ggml_barrier
 // ======================================================================
 
 /// A fixed team of `n` worker threads for the duration of one `graph_compute`
@@ -622,7 +622,7 @@ fn graph_execute(ctx: &mut Context, g: &mut Graph, n_threads: usize, arena_ns: u
     let callback = eval_callback();
     let prof = opprof_interval();
 
-    // 对照 ggml-cpu.c 的 threadpool: fixed worker set, one spin barrier per op
+    // verify against ggml-cpu.c threadpool: fixed worker set, one spin barrier per op
     let shared = TeamShared {
         gen: std::sync::atomic::AtomicUsize::new(0),
         done: std::sync::atomic::AtomicUsize::new(0),
@@ -1021,7 +1021,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // dispatch — 对照 ggml_graph_compute (ggml-cpu.c:2360+) op switch
+    // dispatch — verify against ggml_graph_compute (ggml-cpu.c:2360+) op switch
     // ==================================================================
 
     fn forward(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -1154,7 +1154,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // add / mul — 对照 binary-ops.cpp apply_binary_op (can_repeat broadcast)
+    // add / mul — verify against binary-ops.cpp apply_binary_op (can_repeat broadcast)
     //
     // Documented skip (AUDIT_ggml.md §5-A.3): the reference's *quantized*
     // src0/dst add path — `ggml_compute_forward_add_q_f32` (ops.cpp:578, a
@@ -1336,7 +1336,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // mul_mat — 对照 ggml-cpu.c:1255 ggml_compute_forward_mul_mat
+    // mul_mat — verify against ggml-cpu.c:1255 ggml_compute_forward_mul_mat
     // ==================================================================
 
     /// One `llamafile_sgemm` attempt over every `(i12, i13)` broadcast plane
@@ -1840,7 +1840,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // mul_mat_id — 对照 ggml-cpu.c:1470 ggml_compute_forward_mul_mat_id
+    // mul_mat_id — verify against ggml-cpu.c:1470 ggml_compute_forward_mul_mat_id
     // ==================================================================
 
     /// C reference (ggml-cpu.c:1550-1740): for every expert matrix `cur_a` the
@@ -2200,7 +2200,7 @@ impl<'a> Cpu<'a> {
         self.par_mul_mat(ne01, n_ids * ne12, rowchunk, nth, team, run);
     }
 
-    /// 对照 ggml-cpu/ops.cpp:ggml_compute_forward_add_id_f32 — per-expert bias:
+    /// verify against ggml-cpu/ops.cpp:ggml_compute_forward_add_id_f32 — per-expert bias:
     /// dst(i0, i1, i2) = a(i0, i1, i2) + b(i0, ids(i1, i2)). `ids` may be the
     /// strided argsort_top_k view, hence the nb-based reads (ops.cpp uses nb20/nb21).
     fn forward_add_id(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -2259,7 +2259,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // glu — 对照 ggml-cpu/ops.cpp:3319 ggml_compute_forward_swiglu_oai_f32
+    // glu — verify against ggml-cpu/ops.cpp:3319 ggml_compute_forward_swiglu_oai_f32
     // ==================================================================
 
     /// SWIGLU_OAI (ops.cpp:3321-3385): x = min(gate, limit); y = clamp(up, -limit,
@@ -2478,7 +2478,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // norm / rms_norm — 对照 ops.cpp:3827 / ops.cpp:3924
+    // norm / rms_norm — verify against ops.cpp:3827 / ops.cpp:3924
     // ==================================================================
 
     fn forward_norm(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -2653,7 +2653,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // scale — 对照 ops.cpp:4697 ggml_compute_forward_scale_f32
+    // scale — verify against ops.cpp:4697 ggml_compute_forward_scale_f32
     // ==================================================================
 
     fn forward_scale(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -2730,7 +2730,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // soft_max — 对照 ops.cpp:5584 ggml_compute_forward_soft_max_f32
+    // soft_max — verify against ops.cpp:5584 ggml_compute_forward_soft_max_f32
     // ==================================================================
 
     fn forward_soft_max(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -2852,11 +2852,11 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // tanh / silu / gelu — 对照 unary-ops.cpp:253 (tanh) / ops.cpp:2579
+    // tanh / silu / gelu — verify against unary-ops.cpp:253 (tanh) / ops.cpp:2579
     // (silu) / ops.cpp:2206 (gelu) + their vec.h scalar tails
     // ==================================================================
 
-    /// 对照 ggml_compute_forward_tanh (unary-ops.cpp:253 → op_tanh at line 19).
+    /// verify against ggml_compute_forward_tanh (unary-ops.cpp:253 → op_tanh at line 19).
     /// The reference has no SIMD tanh at this commit: `unary_op<op_tanh>` calls
     /// `tanhf` per element (vec.h:909 ggml_vec_tanh_f32 is a plain scalar loop
     /// too). Rust's f32::tanh resolves to the same glibc tanhf — verified
@@ -3177,7 +3177,7 @@ impl<'a> Cpu<'a> {
         self.par_rows(nr, nth, team, run);
     }
 
-    /// 对照 ggml_compute_forward_gelu_erf (ops.cpp:2436-2453): F32 via
+    /// verify against ggml_compute_forward_gelu_erf (ops.cpp:2436-2453): F32 via
     /// `ggml_vec_gelu_erf_f32` (ops.cpp:2341-2379, vec.h:1010's plain scalar
     /// erff loop), F16 via `ggml_vec_gelu_erf_f16` (ops.cpp:2388-2426,
     /// vec.h:979), anything else aborts in C. Row split identical to the
@@ -3264,7 +3264,7 @@ impl<'a> Cpu<'a> {
         self.par_rows(nr, nth, team, run);
     }
 
-    /// 对照 ggml_compute_forward_gated_delta_net (ops.cpp:11090) → gdn.rs.
+    /// verify against ggml_compute_forward_gated_delta_net (ops.cpp:11090) → gdn.rs.
     /// Rows split exactly like C's `_f32` entry (`nr = V->ne[1]*V->ne[3]`,
     /// ops.cpp:11049-11088).
     fn forward_gated_delta_net(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -3316,11 +3316,11 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // rwkv wkv — 对照 ops.cpp:10413-10603 / 10623-11418 / 11422-11617
+    // rwkv wkv — verify against ops.cpp:10413-10603 / 10623-11418 / 11422-11617
     // (batch 14 round 2, agent WKV; kernels in wkv.rs)
     // ==================================================================
 
-    /// 对照 ggml_compute_forward_rwkv_wkv6 (ops.cpp:10408) → wkv.rs. The
+    /// verify against ggml_compute_forward_rwkv_wkv6 (ops.cpp:10408) → wkv.rs. The
     /// heads are sharded like C's h_start/h_end (ops.cpp:10434-10437) —
     /// contiguous ascending ranges via par_rows.
     fn forward_rwkv_wkv6(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -3371,7 +3371,7 @@ impl<'a> Cpu<'a> {
         self.par_rows(heads, nth, team, run);
     }
 
-    /// 对照 ggml_compute_forward_gla (ops.cpp:10618) → wkv.rs.
+    /// verify against ggml_compute_forward_gla (ops.cpp:10618) → wkv.rs.
     fn forward_gated_linear_attn(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
         let td = self.t(dst);
         let (k, v, q, g, state) = (
@@ -3418,7 +3418,7 @@ impl<'a> Cpu<'a> {
         self.par_rows(heads, nth, team, run);
     }
 
-    /// 对照 ggml_compute_forward_rwkv_wkv7 (ops.cpp:11417) → wkv.rs. No
+    /// verify against ggml_compute_forward_rwkv_wkv7 (ops.cpp:11417) → wkv.rs. No
     /// memset: the kernel assigns every dst element (REDUCE per (t, h, i)).
     fn forward_rwkv_wkv7(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
         let td = self.t(dst);
@@ -3477,7 +3477,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // rope — 对照 ops.cpp:5951-6237
+    // rope — verify against ops.cpp:5951-6237
     // ==================================================================
 
     /// ops.cpp:5951 rope_yarn_ramp
@@ -3805,7 +3805,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // get_rows — 对照 ops.cpp:4979-5144
+    // get_rows — verify against ops.cpp:4979-5144
     // ==================================================================
 
     fn forward_get_rows(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -3862,7 +3862,7 @@ impl<'a> Cpu<'a> {
         self.par_rows(nr, nth, team, run);
     }
 
-    /// 对照 ops.cpp:5361 ggml_compute_forward_get_rows_back_f32
+    /// verify against ops.cpp:5361 ggml_compute_forward_get_rows_back_f32
     fn forward_get_rows_back(&self, dst: TensorId) {
         let s0 = self.t(dst).src[0].unwrap();
         let s1 = self.t(dst).src[1].unwrap();
@@ -3897,7 +3897,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // dup / cpy / cont — 对照 ops.cpp:17-574
+    // dup / cpy / cont — verify against ops.cpp:17-574
     // ==================================================================
 
     fn forward_dup(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
@@ -4171,7 +4171,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // argmax / argsort — 对照 ops.cpp:1570 / ops.cpp:8489
+    // argmax / argsort — verify against ops.cpp:1570 / ops.cpp:8489
     // ==================================================================
 
     fn forward_argmax(&self, dst: TensorId) {
@@ -4224,7 +4224,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // sum_rows / repeat — 对照 ops.cpp:1460 / ops.cpp:1698
+    // sum_rows / repeat — verify against ops.cpp:1460 / ops.cpp:1698
     // ==================================================================
 
     /// ops.cpp:5221 ggml_compute_forward_set_rows_impl — scatter rows of
@@ -4374,7 +4374,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // diag_mask_inf — 对照 ops.cpp:5496 ggml_compute_forward_diag_mask_f32
+    // diag_mask_inf — verify against ops.cpp:5496 ggml_compute_forward_diag_mask_f32
     // ==================================================================
 
     fn forward_diag_mask_inf(&self, dst: TensorId, nth: usize, team: &Team<'_>, value: f32) {
@@ -4411,7 +4411,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // concat — 对照 ops.cpp:2037 ggml_compute_forward_concat_f32
+    // concat — verify against ops.cpp:2037 ggml_compute_forward_concat_f32
     // ==================================================================
 
     /// C's F32 concat is **element-wise** (ops.cpp:2061-2076): element
@@ -4515,7 +4515,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // flash_attn_ext — 对照 ggml_compute_forward_flash_attn_ext (ops.cpp:9348)
+    // flash_attn_ext — verify against ggml_compute_forward_flash_attn_ext (ops.cpp:9348)
     // → ..._f16 (ops.cpp:9212) → ..._f16_one_chunk (ops.cpp:8614)
     // ==================================================================
 
@@ -4612,7 +4612,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // vision: im2col / upscale(interpolate) — 对照 ops.cpp:6871 / ops.cpp:7978
+    // vision: im2col / upscale(interpolate) — verify against ops.cpp:6871 / ops.cpp:7978
     // ==================================================================
 
     /// ggml_compute_forward_im2col (ops.cpp:6986) → ..._f16 (ops.cpp:6907) /
@@ -4801,7 +4801,7 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // ssm_conv / ssm_scan — 对照 ops.cpp:9701 / ops.cpp:9771
+    // ssm_conv / ssm_scan — verify against ops.cpp:9701 / ops.cpp:9771
     // ==================================================================
 
     /// ggml_compute_forward_ssm_conv (ops.cpp:9756) → ..._f32 (ops.cpp:9703).
@@ -5333,8 +5333,8 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // fill / lightning indexer — 对照 ops.cpp fill (via ggml_compute_forward_fill)
-    // 与 ops.cpp:12124 ggml_compute_forward_lightning_indexer (DSA, batch 6)
+    // fill / lightning indexer — verify against ops.cpp fill (via ggml_compute_forward_fill)
+    // with ops.cpp:12124 ggml_compute_forward_lightning_indexer (DSA, batch 6)
     // ==================================================================
 
     /// ggml_compute_forward_fill_f32/_f16 (ops.cpp): every row of dst gets the
@@ -5660,8 +5660,8 @@ impl<'a> Cpu<'a> {
     }
 
     // ==================================================================
-    // sqrt + the fused DeepSeek-V4 hyper-connection ops — 对照
-    // unary-ops.cpp:285 ggml_compute_forward_sqrt 与 ops.cpp:11108-11419
+    // sqrt + the fused DeepSeek-V4 hyper-connection ops — verify against
+    // unary-ops.cpp:285 ggml_compute_forward_sqrt with ops.cpp:11108-11419
     // ggml_compute_forward_dsv4_hc_{comb,pre,post} (arch batch 7)
     // ==================================================================
 
@@ -6995,7 +6995,7 @@ fn mxfp4_vec_dot_type(ty: GgmlType) -> Option<GgmlType> {
     }
 }
 
-/// 对照 ggml-cpu/quants.c:298 `ggml_vec_dot_mxfp4_q8_0_generic` (QK_MXFP4 ==
+/// verify against ggml-cpu/quants.c:298 `ggml_vec_dot_mxfp4_q8_0_generic` (QK_MXFP4 ==
 /// QK8_0 == 32): per 32-element block, `d = fp16(y.d) * e8m0_half(x.e)` and an
 /// exact integer sum of the 32 nibble products, accumulated into one f32.
 ///
@@ -9406,8 +9406,8 @@ mod tests {
 
     // ===================== end-to-end mini graph =====================
 
-    /// 随机 896×896 F32 权重 × 3 token 激活 → rms_norm → mul_mat → softmax,
-    /// 与朴素 Rust 实现逐步对照。
+    /// Random 896x896 F32 weights x 3 token activations → rms_norm → mul_mat → softmax,
+    /// with the naive Rust implementation step by step verify against.
     #[test]
     fn end_to_end_rms_mulmat_softmax() {
         let n = 896usize;

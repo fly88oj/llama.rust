@@ -45,7 +45,7 @@
 //! Partial items (full list in the function headers):
 //!   * RoPE freq factors (src[2] of ggml_rope_ext) are not representable in
 //!     TensorMeta::src (MAX_SRC == 2) — rope_long/rope_short of llama3-longrope
-//!     and phi3-mini are passed as None, 对照 ggml.c:4266 rope c 参数.
+//!     and phi3-mini are passed as None, verify against ggml.c:4266 rope c parameter.
 //!   * gemma2/gemma3 logit softcapping IS wired (needs ggml_tanh, now ported):
 //!     attn kq cap at llama-graph.cpp:2691-2698 (gated on hparams.attn_soft_cap)
 //!     and the final cap at gemma2.cpp:167-169 (unguarded) / gemma3.cpp:210-214
@@ -64,7 +64,7 @@ use ggml::types::GgmlType;
 use ggml::{Context, Graph, TensorId};
 
 // ======================================================================
-// llama — 对照 src/models/llama.cpp:98-247 graph<embed>
+// llama — verify against src/models/llama.cpp:98-247 graph<embed>
 // ======================================================================
 
 /// Per-layer weights (llama layout, llama.cpp:48-91). All bias tensors are
@@ -98,7 +98,7 @@ pub struct LlamaModelWeights {
     pub layers: Vec<LlamaLayerWeights>,
 }
 
-/// 对照 src/models/llama.cpp:98-247 llama_model_llama::graph<false>::graph —
+/// verify against src/models/llama.cpp:98-247 llama_model_llama::graph<false>::graph —
 /// RMS norm → separate QKV (no bias for vanilla llama) → RoPE NEOX →
 /// kv-cache MHA (kq_scale = 1/sqrt(head_dim)) → SwiGLU-parallel FFN.
 /// rope_factors (llama.cpp:140, LONGROPE llama3) not supported — see module docs.
@@ -248,7 +248,7 @@ pub fn build_llama_forward(
 }
 
 // ======================================================================
-// gemma2 / gemma3 — 对照 src/models/gemma2.cpp:60-175 / gemma3.cpp:82-220
+// gemma2 / gemma3 — verify against src/models/gemma2.cpp:60-175 / gemma3.cpp:82-220
 // ======================================================================
 
 /// Gemma-family hyperparameters beyond AttnParams.
@@ -334,7 +334,7 @@ fn ones_f32(ctx: &mut Context, n: i64) -> TensorId {
     id
 }
 
-/// 对照 src/models/gemma2.cpp:60-175 llama_model_gemma2::graph::graph.
+/// verify against src/models/gemma2.cpp:60-175 llama_model_gemma2::graph::graph.
 /// gemma3-only features (attn_q_norm/attn_k_norm) must be None.
 /// Softcapping is wired (gemma2.cpp:7 attn_soft_cap → llama-graph.cpp:2691-2698
 /// kq cap; gemma2.cpp:167-169 final cap, unguarded — set
@@ -364,7 +364,7 @@ pub fn build_gemma2_forward(
     build_gemma_forward(ctx, w, p, kv, inp, sinfo, n_kv, n_tokens)
 }
 
-/// 对照 src/models/gemma3.cpp:82-220 llama_model_gemma3::graph<iswa>::graph
+/// verify against src/models/gemma3.cpp:82-220 llama_model_gemma3::graph<iswa>::graph
 /// (non-SWA variant graph<false> differs only in the mask/cache input).
 /// Uses attn_q_norm/attn_k_norm when present (gemma3.cpp:131/139, applied
 /// BEFORE rope). gemma3 never sets hparams.attn_soft_cap (no kq cap) and
@@ -572,7 +572,7 @@ fn build_gemma_forward(
 }
 
 // ======================================================================
-// phi3 — 对照 src/models/phi3.cpp:68-192
+// phi3 — verify against src/models/phi3.cpp:68-192
 // ======================================================================
 
 pub struct Phi3LayerWeights {
@@ -598,7 +598,7 @@ pub struct Phi3ModelWeights {
     pub layers: Vec<Phi3LayerWeights>,
 }
 
-/// 对照 src/models/phi3.cpp:68-192 llama_model_phi3::graph<false>::graph —
+/// verify against src/models/phi3.cpp:68-192 llama_model_phi3::graph<false>::graph —
 /// fused wqkv (mul_mat then three view_3d segments) → RoPE NEOX → Q pre-scale
 /// 1/sqrt(head_dim) → MHA → SwiGLU FFN (ffn_up emits 2*n_ff, split halves).
 /// PARTIAL: rope_factors (phi3.cpp:97, long/short for 128k context) are not
@@ -643,7 +643,7 @@ pub fn build_phi3_forward(
         let qkv_nb1 = ctx.nb(qkv)[1] as usize;
         let hd_k = p.n_embd_head_k as usize;
         let hd_v = p.n_embd_head_v as usize;
-        // 对照 llama-graph.cpp:1667-1674 ggml_view_3d 三段切分
+        // verify against llama-graph.cpp:1667-1674 ggml_view_3d three-way split
         let q = ctx.view_3d(qkv, p.n_embd_head_k, p.n_head, t, hd_k * 4, qkv_nb1, 0);
         let k = ctx.view_3d(
             qkv,
@@ -727,7 +727,7 @@ pub fn build_phi3_forward(
         // splits each row into gate (first half) and up (second half) then
         // computes silu(gate) * up (ops.cpp:3176-3236). No ggml_swiglu op
         // exists in the ggml crate — composed from views + silu + mul,
-        // 对照 vec_swiglu: dst = silu(src0[0..n_ff]) * src0[n_ff..2*n_ff]
+        // verify against vec_swiglu: dst = silu(src0[0..n_ff]) * src0[n_ff..2*n_ff]
         let up2 = crate::adapter::lora_mm(ctx, lw.ffn_up, cur); // [2*n_ff, T] F32 contiguous
         let n_ff = ctx.ne(lw.ffn_down)[0];
         let nb_row = ctx.nb(up2)[1] as usize;
@@ -757,7 +757,7 @@ pub fn build_phi3_forward(
 }
 
 // ======================================================================
-// gpt-oss (openai-moe) — 对照 src/models/openai-moe.cpp:73-175 graph
+// gpt-oss (openai-moe) — verify against src/models/openai-moe.cpp:73-175 graph
 // ======================================================================
 
 /// Per-layer weights (openai-moe.cpp:30-66 load_arch_tensors).
@@ -838,7 +838,7 @@ impl Default for GptOssParams {
     }
 }
 
-/// 对照 src/models/openai-moe.cpp:73-175 llama_model_openai_moe::graph::graph —
+/// verify against src/models/openai-moe.cpp:73-175 llama_model_openai_moe::graph::graph —
 /// RMS norm → separate QKV (no q/k/v bias) → RoPE NEOX with per-layer
 /// freq_base/freq_scale (SWA-aware) → kv-cache MHA with attention sinks →
 /// residual + attn_post_norm → MoE (softmax-after-top-k routing, per-expert
@@ -1233,7 +1233,7 @@ fn attn_kv_cached(
     let k_view = kv.get_k(ctx, il, p.n_embd_head_k, p.n_head_kv, n_kv);
     let v_view = kv.get_v(ctx, il, p.n_embd_head_v, p.n_head_kv, n_kv);
 
-    // FA branch — 对照 build_attn_mha use_flash_attn (llama-graph.cpp:2626-2669):
+    // FA branch — verify against build_attn_mha use_flash_attn (llama-graph.cpp:2626-2669):
     // `cparams.flash_attn && kq_b == nullptr`. None of these four archs has a
     // KQ bias, so the flag alone selects FA.
     //   * max_bias = hparams.f_max_alibi_bias (the `max_bias` parameter — 0.0
@@ -1425,7 +1425,7 @@ impl RecurrentState {
 }
 
 // ======================================================================
-// granite-hybrid — 对照 src/models/granite-hybrid.cpp + mamba-base.cpp:153
+// granite-hybrid — verify against src/models/granite-hybrid.cpp + mamba-base.cpp:153
 // ======================================================================
 
 /// Per-layer weights (granite-hybrid.cpp:41-139 load_arch_tensors). Recurrent
@@ -1514,7 +1514,7 @@ pub struct GraniteParams {
     pub n_embd_s: u32,
 }
 
-/// 对照 src/models/granite-hybrid.cpp:143-198 `graph::graph` —
+/// verify against src/models/granite-hybrid.cpp:143-198 `graph::graph` —
 /// embedding scale → per layer (rms attn_norm → mamba2 mixer | attention) →
 /// residual-scaled FFN (dense / MoE + shared expert) → final norm (logit
 /// scale) → lm_head.
@@ -2140,7 +2140,7 @@ fn build_moe_ffn_silu(
 }
 
 // ======================================================================
-// lfm2moe — 对照 src/models/lfm2moe.cpp → lfm2.cpp graph<> (shared code)
+// lfm2moe — verify against src/models/lfm2moe.cpp → lfm2.cpp graph<> (shared code)
 // ======================================================================
 
 /// Per-layer weights (lfm2moe.cpp:44-80 load_arch_tensors).
@@ -2205,7 +2205,7 @@ pub struct Lfm2Params {
     pub n_embd_r: u32,
 }
 
-/// 对照 src/models/lfm2moe.cpp `build_arch_graph` → lfm2.cpp:100-295
+/// verify against src/models/lfm2moe.cpp `build_arch_graph` → lfm2.cpp:100-295
 /// `graph<>::graph`:
 ///   per layer: rms `operator_norm` → (shortconv block | gated attention
 ///   block) → residual → `ffn_norm` → (dense FFN | MoE) → residual;
@@ -2474,7 +2474,7 @@ fn build_lfm2_attention(
 }
 
 // ======================================================================
-// gemma4 — 对照 src/models/gemma4.cpp (load_arch_tensors + graph::graph)
+// gemma4 — verify against src/models/gemma4.cpp (load_arch_tensors + graph::graph)
 // ======================================================================
 
 /// Per-layer weights (gemma4.cpp:38-146 load_arch_tensors).
@@ -2565,7 +2565,7 @@ pub struct Gemma4Params {
     pub n_ff_exp: Vec<u32>,
 }
 
-/// 对照 src/models/gemma4.cpp:150-370 `llama_model_gemma4::graph::graph` —
+/// verify against src/models/gemma4.cpp:150-370 `llama_model_gemma4::graph::graph` —
 /// embedding scale sqrt(n_embd) → per-layer (rms attn_norm → Q/K/V (fused or
 /// separate, V = K when v_proj is absent) → per-head q/k norms (K with weight,
 /// V without) → proportional rope (full layers carry freq factors, SWA layers
@@ -2619,7 +2619,7 @@ pub fn build_gemma4_forward(
     // `res->add_input(std::move(inp))` to cover the multimodal branch too
     // ([TAG_GEMMA4_IMG_PADDING] — the port's decode always carries tokens;
     // embd batches go through DecodeContext::decode_embd's value-identical
-    // row materialization, PARITY.md 批次 18)
+    // row materialization, PARITY.md batch 18)
     let inp_per_layer = match (
         w.per_layer_tok_embd,
         w.per_layer_model_proj,
@@ -3036,7 +3036,7 @@ fn build_gemma4_per_layer(
 }
 
 // ======================================================================
-// qwen35 — 对照 src/models/qwen35.cpp (gated delta net + full attention)
+// qwen35 — verify against src/models/qwen35.cpp (gated delta net + full attention)
 // ======================================================================
 
 /// Per-layer weights (qwen35.cpp:66-160 load_arch_tensors).
@@ -3110,7 +3110,7 @@ pub struct Qwen35Params {
     pub n_embd_s: u32,
 }
 
-/// 对照 src/models/qwen35.cpp:165-268 `graph::graph` + `build_layer_attn`
+/// verify against src/models/qwen35.cpp:165-268 `graph::graph` + `build_layer_attn`
 /// (:288-355) + `build_layer_attn_linear` (:357-500) — per layer: rms attn_norm
 /// → (gated delta net | full attention with a per-head Q gate) → residual → rms
 /// attn_post_norm → SwiGLU FFN → residual → final norm → lm_head.
@@ -3484,7 +3484,7 @@ pub(crate) fn build_gdn_l2_norm(ctx: &mut Context, x: TensorId, eps_over_n: f32)
 }
 
 // ======================================================================
-// qwen3 — 对照 src/models/qwen3.cpp:49-159 llama_model_qwen3::graph::graph
+// qwen3 — verify against src/models/qwen3.cpp:49-159 llama_model_qwen3::graph::graph
 // ======================================================================
 
 /// Per-layer weights (qwen3.cpp:31-46 load_arch_tensors). attn_q_norm /
@@ -3520,7 +3520,7 @@ pub struct Qwen3ModelWeights {
     pub layers: Vec<Qwen3LayerWeights>,
 }
 
-/// 对照 src/models/qwen3.cpp:53-159 llama_model_qwen3::graph::graph —
+/// verify against src/models/qwen3.cpp:53-159 llama_model_qwen3::graph::graph —
 /// RMS attn_norm → separate QKV (no bias in real files) → **per-head Q/K RMS
 /// norm before RoPE** (qwen3.cpp:88-98) → RoPE NEOX → kv-cache GQA MHA
 /// (kq_scale = 1/sqrt(n_embd_head_v), qwen3.cpp:110-112) → residual → RMS
@@ -4075,7 +4075,7 @@ pub fn build_pooling_rank(
 }
 
 // ======================================================================
-// bert — 对照 src/models/bert.cpp:64-221 llama_model_bert::graph
+// bert — verify against src/models/bert.cpp:64-221 llama_model_bert::graph
 // ======================================================================
 
 /// Per-layer weights of the `LLM_ARCH_BERT` branch (bert.cpp:43-61). The
@@ -4121,7 +4121,7 @@ pub struct BertModelWeights {
     pub n_embd: i64,
 }
 
-/// 对照 src/models/bert.cpp:68-221 — token + type + position embeddings,
+/// verify against src/models/bert.cpp:68-221 — token + type + position embeddings,
 /// embedding layer norm, then per layer: MHA with biases and
 /// `1/sqrt(n_embd_head)` scale, residual, post-attention layer norm, GELU
 /// feed-forward (sequential, bert.cpp:181-185), residual, output layer norm.
@@ -4431,7 +4431,7 @@ fn build_moe_ffn_bert(
     moe_out
 }
 
-/// 对照 src/models/bert.cpp:68-221 `llama_model_bert::graph` with the variant
+/// verify against src/models/bert.cpp:68-221 `llama_model_bert::graph` with the variant
 /// arch branches live — the body the four `using graph =` loader files
 /// instantiate (models.h: `llama_model_{jina_bert_v2, jina_bert_v3,
 /// nomic_bert, nomic_bert_moe}`). Differences from the plain BERT arm
@@ -4692,7 +4692,7 @@ pub fn build_bert_variant_forward(
 }
 
 // ======================================================================
-// neo-bert — 对照 src/models/neo-bert.cpp:43-134 llama_model_neo_bert::graph
+// neo-bert — verify against src/models/neo-bert.cpp:43-134 llama_model_neo_bert::graph
 // ======================================================================
 
 /// Per-layer weights (neo-bert.cpp:24-36): fused QKV (n_embd + 2*n_embd_gqa
@@ -4715,7 +4715,7 @@ pub struct NeoBertModelWeights {
     pub layers: Vec<NeoBertLayerWeights>,
 }
 
-/// 对照 src/models/neo-bert.cpp:43-134 — RMS pre-norm → fused-QKV attention
+/// verify against src/models/neo-bert.cpp:43-134 — RMS pre-norm → fused-QKV attention
 /// with NORM-mode rope and `1/sqrt(n_embd_head)` scale → residual → RMS norm →
 /// SWIGLU-sequential FFN (`ggml_swiglu(up)` over the half-views) → residual;
 /// final `enc.output_norm` RMS norm. No token/type/position embeddings beyond
@@ -4827,7 +4827,7 @@ pub fn build_neo_bert_forward(
 }
 
 // ======================================================================
-// modern-bert — 对照 src/models/modern-bert.cpp:72-172
+// modern-bert — verify against src/models/modern-bert.cpp:72-172
 // llama_model_modern_bert::graph
 // ======================================================================
 
@@ -4910,7 +4910,7 @@ pub struct ModernBertModelWeights {
     pub rank_head: Option<RankHead>,
 }
 
-/// 对照 src/models/modern-bert.cpp:72-172 — embedding layer norm, then per
+/// verify against src/models/modern-bert.cpp:72-172 — embedding layer norm, then per
 /// layer: optional attention LayerNorm (identity on layer 0) → fused-QKV
 /// attention with NORM... NEOX-mode rope at the layer's own freq base (SWA
 /// layers get the *_swa pair) and the symmetric-SWA mask twin on those layers
@@ -5165,7 +5165,7 @@ fn build_modern_bert_decision_head(
 }
 
 // ======================================================================
-// t5encoder — 对照 src/models/t5.cpp:264-358 llama_model_t5::graph<true>
+// t5encoder — verify against src/models/t5.cpp:264-358 llama_model_t5::graph<true>
 // ======================================================================
 
 /// Per-layer weights of the encoder half (t5encoder.cpp:24-39 / t5.cpp:63-78,
@@ -5197,7 +5197,7 @@ pub struct T5EncoderModelWeights {
     pub layers: Vec<T5EncoderLayerWeights>,
 }
 
-/// 对照 src/models/t5.cpp:264-358 `graph<true>` (the `LLM_GRAPH_TYPE_ENCODER`
+/// verify against src/models/t5.cpp:264-358 `graph<true>` (the `LLM_GRAPH_TYPE_ENCODER`
 /// instantiation, t5.cpp:360-370; t5encoder.cpp:42-44 uses the same body).
 ///
 /// Per layer: RMS norm → Q/K/V projections (no bias in T5) → relative-position
@@ -5401,7 +5401,7 @@ fn qkv_fused(
     let nb1 = ctx.nb(qkv)[1] as usize;
     let hd_k = p.n_embd_head_k as usize;
     let hd_v = p.n_embd_head_v as usize;
-    // 对照 llama-graph.cpp:1667-1674 的三段 view_3d
+    // verify against llama-graph.cpp:1667-1674 the three-way view_3d
     let q = ctx.view_3d(qkv, p.n_embd_head_k, p.n_head, t, hd_k * 4, nb1, 0);
     let k = ctx.view_3d(
         qkv,
@@ -5528,7 +5528,7 @@ pub struct Gpt2Params {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/gpt2.cpp:58-148 `llama_model_gpt2::graph::graph` — the only
+/// verify against src/models/gpt2.cpp:58-148 `llama_model_gpt2::graph::graph` — the only
 /// non-rope arch of the batch: learned absolute position embeddings are added
 /// to the token embeddings (:74-77), attention has no positional encoding at
 /// all, both norms are LayerNorm *with* bias, the FFN is GELU-seq and the
@@ -5665,7 +5665,7 @@ pub struct Phi2Params {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/phi2.cpp:47-142 `llama_model_phi2::graph::graph` —
+/// verify against src/models/phi2.cpp:47-142 `llama_model_phi2::graph::graph` —
 /// LayerNorm norms with bias, NEOX rope, the Q pre-scale `1/sqrt(head_dim)`
 /// with a softmax scale of exactly 1.0 (:93-99), GELU-seq FFN, and the phi2
 /// quirk that the FFN consumes `attn_norm_output` rather than the residual
@@ -5804,7 +5804,7 @@ pub struct StarCoder2Params {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/starcoder2.cpp:59-157
+/// verify against src/models/starcoder2.cpp:59-157
 /// `llama_model_starcoder2::graph::graph` — LayerNorm norms with biases, NEOX
 /// rope, split Q/K/V, GELU-seq FFN. Numerically this is phi2/llama-shaped with
 /// LayerNorm and the standard softmax scale.
@@ -5936,7 +5936,7 @@ pub struct CommandRParams {
     pub logit_scale: f32,
 }
 
-/// 对照 src/models/command-r.cpp:46-143 `llama_model_command_r::graph::graph` —
+/// verify against src/models/command-r.cpp:46-143 `llama_model_command_r::graph::graph` —
 /// biasless LayerNorm, parallel residual `x = x + ffn(ln(x)) + attn(ln(x))`
 /// (:110-119), optional per-head Q/K LayerNorms on the reshaped 3D tensors
 /// (present iff the file carries them, i.e. `n_layer >= 64`), SwiGLU-parallel
@@ -6071,7 +6071,7 @@ pub struct GptNeoxParams {
     pub use_par_res: bool,
 }
 
-/// 对照 src/models/gptneox.cpp:87-219 `llama_model_gptneox::graph::graph` —
+/// verify against src/models/gptneox.cpp:87-219 `llama_model_gptneox::graph::graph` —
 /// fused QKV with a fused bias, LayerNorm with bias, GELU-seq FFN, and the
 /// `use_par_res` fork (:141-192): parallel
 /// `x = x + attn(ln1(x)) + ffn(ln2(x))` vs the sequential two residuals.
@@ -6217,7 +6217,7 @@ pub struct Olmo2Params {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/olmo2.cpp:65-197 `llama_model_olmo2::graph<false>::graph` —
+/// verify against src/models/olmo2.cpp:65-197 `llama_model_olmo2::graph<false>::graph` —
 /// the post-norm transformer: no attention input norm at all, per-head Q/K
 /// RMS-norms applied to the *unreshaped* projections (:111-117), a
 /// post-attention RMS norm on the attention output, a parallel FFN and a
@@ -6387,7 +6387,7 @@ pub struct CodeshellParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/codeshell.cpp:53-153 `llama_model_codeshell::graph::graph`
+/// verify against src/models/codeshell.cpp:53-153 `llama_model_codeshell::graph::graph`
 /// — LayerNorm with bias, NEOX rope on separate Q/K/V, a GELU-seq FFN and both
 /// residuals sequential (the gptneox `use_par_res = false` shape with a
 /// different norm and a separate qkv).
@@ -6516,7 +6516,7 @@ pub struct OrionParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/orion.cpp:43-141 `llama_model_orion::graph::graph` —
+/// verify against src/models/orion.cpp:43-141 `llama_model_orion::graph::graph` —
 /// LayerNorm with bias, NEOX rope on separate Q/K/V, parallel-residual SwiGLU
 /// FFN (`x = x + attn(ln(x)) + ffn(ln(x))`), biased output norm, unbiased head.
 #[allow(clippy::too_many_arguments)]
@@ -6645,7 +6645,7 @@ pub struct OlmoParams {
     pub f_clamp_kqv: f32,
 }
 
-/// 对照 src/models/olmo.cpp:43-142 `llama_model_olmo::graph::graph` — the
+/// verify against src/models/olmo.cpp:43-142 `llama_model_olmo::graph::graph` — the
 /// weightless-norm arch of the batch: `build_norm(cur, NULL, NULL, LLM_NORM)`
 /// is a plain `ggml_norm` at every one of the three sites (:65-67, :104-106,
 /// :128-130); NORM-mode rope, parallel SILU FFN, sequential residuals.
@@ -6763,7 +6763,7 @@ pub struct XverseParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/xverse.cpp:41-136 `llama_model_xverse::graph::graph` —
+/// verify against src/models/xverse.cpp:41-136 `llama_model_xverse::graph::graph` —
 /// RMS norms, NEOX rope, parallel SILU FFN, sequential residuals. The body is
 /// the same code as [`build_internlm2_forward`]: internlm2.cpp's graph differs
 /// only in `rope_type` (llama-model.cpp:2935 NORM vs :2937 NEOX).
@@ -6869,7 +6869,7 @@ pub struct Internlm2Params {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/internlm2.cpp:44-139 `llama_model_internlm2::graph::graph`.
+/// verify against src/models/internlm2.cpp:44-139 `llama_model_internlm2::graph::graph`.
 /// The graph body is textually identical to xverse.cpp's, so this is the same
 /// code as [`build_xverse_forward`] with internlm2's own structs.
 #[allow(clippy::too_many_arguments)]
@@ -6978,7 +6978,7 @@ pub struct ExaoneParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/exaone.cpp:46-136 `llama_model_exaone::graph::graph` — RMS
+/// verify against src/models/exaone.cpp:46-136 `llama_model_exaone::graph::graph` — RMS
 /// norms, NEOX rope with per-layer freq factors
 /// (`model.get_rope_factors(cparams, il)`, llama-model.cpp:2259-2272: the
 /// layer's own `rope_freqs` tensor when the file has one, else the long/short
@@ -7107,7 +7107,7 @@ pub struct Gemma1Params {
     pub attention_scale: f32,
 }
 
-/// 对照 src/models/gemma.cpp:41-139 `llama_model_gemma::graph::graph` — the v1
+/// verify against src/models/gemma.cpp:41-139 `llama_model_gemma::graph::graph` — the v1
 /// gemma graph: embeddings scaled by `sqrt(n_embd)` (:47-49), RMS norms with
 /// the (1+w) converter shift shared with gemma2/3, NEOX rope, Q pre-scaled by
 /// `1/sqrt(n_embd_head)`, `kq_scale = 1.0`, a parallel-residual GELU FFN and —
@@ -7225,7 +7225,7 @@ pub struct FalconParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/falcon.cpp:50-161 `llama_model_falcon::graph::graph` —
+/// verify against src/models/falcon.cpp:50-161 `llama_model_falcon::graph::graph` —
 /// fused QKV (no bias), NEOX rope, and the two falcon-specific shapes: the FFN
 /// consumes the **attention** norm tensor rather than a separate ffn_norm
 /// (there is no ffn_norm tensor in a falcon file, :125-130) and the layer's
@@ -7455,7 +7455,7 @@ pub struct BaichuanParams {
     pub use_rope: bool,
 }
 
-/// 对照 src/models/baichuan.cpp:28-121 `graph::graph` — RMS norms, separate
+/// verify against src/models/baichuan.cpp:28-121 `graph::graph` — RMS norms, separate
 /// Q/K/V, rope only on the 7B, ALiBi attention on the 13B, SwiGLU FFN.
 #[allow(clippy::too_many_arguments)]
 pub fn build_baichuan_forward(
@@ -7582,7 +7582,7 @@ pub struct BloomParams {
     pub f_max_alibi_bias: f32,
 }
 
-/// 对照 src/models/bloom.cpp:46-151 `graph::graph` — LayerNorm everywhere
+/// verify against src/models/bloom.cpp:46-151 `graph::graph` — LayerNorm everywhere
 /// (the token embedding gets its own pre-layer norm), fused biased QKV, no
 /// rope, ALiBi attention, GELU-seq FFN, biased output norm.
 #[allow(clippy::too_many_arguments)]
@@ -7730,7 +7730,7 @@ pub struct MptParams {
     pub f_clamp_kqv: f32,
 }
 
-/// 对照 src/models/mpt.cpp:55-171 `graph::graph` — LayerNorm, optional
+/// verify against src/models/mpt.cpp:55-171 `graph::graph` — LayerNorm, optional
 /// learned positions added to the token embeddings, fused QKV (+ optional
 /// clamp), optional full-width Q/K LayerNorms, no rope, ALiBi, GELU-seq FFN
 /// with the AWQ act-scales undo.
@@ -7905,7 +7905,7 @@ pub struct StarcoderParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/starcoder.cpp:46-154 `graph::graph` — LayerNorm, learned
+/// verify against src/models/starcoder.cpp:46-154 `graph::graph` — LayerNorm, learned
 /// positions, fused biased QKV, no rope, GELU-seq FFN.
 #[allow(clippy::too_many_arguments)]
 pub fn build_starcoder_forward(
@@ -8039,7 +8039,7 @@ pub struct RefactParams {
     pub f_max_alibi_bias: f32,
 }
 
-/// 对照 src/models/refact.cpp:41-160 `graph::graph` (dense branch) — RMS
+/// verify against src/models/refact.cpp:41-160 `graph::graph` (dense branch) — RMS
 /// norms, separate Q/K/V, no rope, ALiBi attention, SwiGLU FFN with optional
 /// biases. The MoE branch (`n_expert > 0`, refact.cpp:44-59) is not ported
 /// (the loader rejects such files up front).
@@ -8150,7 +8150,7 @@ pub struct PlamoParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/plamo.cpp:39-136 `graph::graph` — RMS norm, separate
+/// verify against src/models/plamo.cpp:39-136 `graph::graph` — RMS norm, separate
 /// Q/K/V, NEOX rope, and the plamo residual quirk: the FFN consumes the
 /// *normed* attention input (`sa_inp`) and the layer output is
 /// `ffn(sa_inp) + attn_out + inpL` (plamo.cpp:68-113, no second norm tensor).
@@ -8271,7 +8271,7 @@ pub struct StablelmParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/stablelm.cpp:43-172 `graph::graph` — LayerNorm, separate
+/// verify against src/models/stablelm.cpp:43-172 `graph::graph` — LayerNorm, separate
 /// Q/K/V, optional per-head Q/K LayerNorms (over dim0 = head_dim, the 3D
 /// tensor shape), NEOX rope, SwiGLU FFN on either the second norm
 /// (sequential) or the attention norm (parallel residual).
@@ -8506,7 +8506,7 @@ pub struct Qwen2MoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/qwen2moe.cpp:65-194 — RMS attn_norm → QKV + RoPE NEOX →
+/// verify against src/models/qwen2moe.cpp:65-194 — RMS attn_norm → QKV + RoPE NEOX →
 /// MHA → residual → RMS ffn_norm → **MoE with `norm_w = false`** (the shared
 /// expert supplies the missing mass) + the sigmoid-gated shared expert
 /// (`silu(x)/x` on the 1-D router output, qwen2moe.cpp:147-165) → residual.
@@ -8678,7 +8678,7 @@ pub struct Qwen3MoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/qwen3moe.cpp:62-179 — the qwen3 attention stack (RMS
+/// verify against src/models/qwen3moe.cpp:62-179 — the qwen3 attention stack (RMS
 /// attn_norm → QKV → **per-head Q/K RMS norm before RoPE**, qwen3moe.cpp:97 /
 // :106) with the FFN replaced by **MoE with `norm_w = true`** (the only
 /// difference to qwen2moe's routing call, qwen3moe.cpp:136-151) and no shared
@@ -8870,7 +8870,7 @@ pub struct PhimoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/phi3.cpp:67-192 (phimoe's graph) with the MoE branch
+/// verify against src/models/phi3.cpp:67-192 (phimoe's graph) with the MoE branch
 /// (phi3.cpp:151-165): biased RMS norms (the only RMS arch of the batch with
 /// norm biases), fused-or-separate QKV → RoPE (rope_factors at src[2],
 /// phi3.cpp:97 — PARTIAL: real phimoe files carry rope_long/rope_short and
@@ -9082,7 +9082,7 @@ pub struct ArcticParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/arctic.cpp:56-180 — the *double* FFN: a dense SwiGLU on
+/// verify against src/models/arctic.cpp:56-180 — the *double* FFN: a dense SwiGLU on
 /// `ffn_norm(ffn_inp)` whose output joins the MoE output computed on
 /// `ffn_norm_exps(inpSA)` (the layer's raw input, arctic.cpp:136-139), the
 /// sum being the layer output. MoE: SILU, `norm_w = true`, SOFTMAX.
@@ -9244,7 +9244,7 @@ pub struct OlmoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/olmoe.cpp:53-173 — RMS attn_norm → QKV (`build_qkv` with
+/// verify against src/models/olmoe.cpp:53-173 — RMS attn_norm → QKV (`build_qkv` with
 /// `reshape = false`, olmoe.cpp:82-86) → **full-width RMS Q/K norms on the 2D
 /// projections** (olmoe.cpp:91-97 — [n_embd] weights, one row per token, not
 /// per head) → explicit 3D reshape (olmoe.cpp:99-101) → RoPE → MHA →
@@ -9437,7 +9437,7 @@ pub struct Ernie45MoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/ernie4-5-moe.cpp:7-133 — RMS attn_norm → QKV + RoPE → MHA
+/// verify against src/models/ernie4-5-moe.cpp:7-133 — RMS attn_norm → QKV + RoPE → MHA
 /// (optional wo bias) → residual → per-layer FFN: dense SwiGLU on the lead
 /// layers, else MoE (SILU, `norm_w = true`, optional `exp_probs_b` steering
 /// the top-k) plus an *ungated* shared expert when `n_ff_shexp > 0`
@@ -9621,7 +9621,7 @@ pub struct Smollm3Params {
     pub f_attention_scale: f32,
 }
 
-/// 对照 src/models/smollm3.cpp:42-152 — the "nope" pattern: rope runs only
+/// verify against src/models/smollm3.cpp:42-152 — the "nope" pattern: rope runs only
 /// when `(il + 1) % n_no_rope_layer_step != 0` (smollm3.cpp:69, 83-95), one
 /// in four layers attends without positional encoding; everything else is
 /// the plain qwen2 stack (RMS norms + SwiGLU-parallel FFN).
@@ -9767,7 +9767,7 @@ pub struct SeedOssParams {
     pub f_attention_scale: f32,
 }
 
-/// 对照 src/models/seed-oss.cpp:45-151 — RMS attn_norm → QKV (q width
+/// verify against src/models/seed-oss.cpp:45-151 — RMS attn_norm → QKV (q width
 /// `n_head*head_dim`, may differ from n_embd) + RoPE → MHA → residual →
 /// **attn_post_norm as the FFN norm** (seed-oss.cpp:113-116) → SwiGLU →
 /// residual. No q/k norms in this revision's file shape.
@@ -9908,7 +9908,7 @@ pub struct OpenelmParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/openelm.cpp:46-171 — the per-layer-heads arch: each layer
+/// verify against src/models/openelm.cpp:46-171 — the per-layer-heads arch: each layer
 /// fuses `[n_head Q | n_head_kv K | n_head_kv V]` heads into one wqkv
 /// (openelm.cpp:82-94, the views are *head-interleaved segments* of the
 /// reshaped [n_embd_head, n_head_qkv, T] tensor), applies **per-head RMS Q/K
@@ -10059,7 +10059,7 @@ pub fn build_openelm_forward(
 
 // ======================================================================
 // arch batch 5 (2026-09-24): the mamba family — mamba / mamba2 / jamba /
-// nemotron-h. 对照 src/models/{mamba,mamba2,jamba,nemotron-h}.cpp +
+// nemotron-h. verify against src/models/{mamba,mamba2,jamba,nemotron-h}.cpp +
 // src/models/mamba-base.cpp (llm_build_mamba_base).
 // ======================================================================
 
@@ -10309,7 +10309,7 @@ pub struct MambaParams {
     pub n_embd_s: u32,
 }
 
-/// 对照 src/models/mamba.cpp:65-112 `llama_model_mamba::graph::graph` —
+/// verify against src/models/mamba.cpp:65-112 `llama_model_mamba::graph::graph` —
 /// embedding → per layer (rms attn_norm → mamba1 | mamba2 mixer) → residual →
 /// final rms norm → lm_head. mamba2 reaches the same graph through
 /// `using graph = llama_model_mamba::graph` (models.h:942) with the
@@ -10439,7 +10439,7 @@ pub struct JambaParams {
     pub n_embd_s: u32,
 }
 
-/// 对照 src/models/jamba.cpp:108-198 `graph::graph` — embedding → per layer
+/// verify against src/models/jamba.cpp:108-198 `graph::graph` — embedding → per layer
 /// (rms attn_norm → mamba1 mixer | **rope-less** attention) → residual → rms
 /// ffn_norm → dense SwiGLU FFN | MoE(softmax, norm_w = false) → residual →
 /// final rms norm → lm_head.
@@ -10656,7 +10656,7 @@ pub struct NemotronHParams {
     pub n_embd_s: u32,
 }
 
-/// 对照 src/models/nemotron-h.cpp:188-264 `graph::graph` — embedding → per
+/// verify against src/models/nemotron-h.cpp:188-264 `graph::graph` — embedding → per
 /// layer (rms attn_norm → mamba2 mixer | rope-less attention | relu²
 /// FFN(dense|MoE)) → residual → final rms norm → lm_head. The attention and
 /// FFN branches are nemotron-h.cpp:266-280 `build_attention_layer` /
@@ -11414,7 +11414,7 @@ fn build_moe_ffn_deepseek2(
     }
 }
 
-/// 对照 src/models/deepseek2.cpp:417-713 llama_model_deepseek2::graph::graph —
+/// verify against src/models/deepseek2.cpp:417-713 llama_model_deepseek2::graph::graph —
 /// the classic MLA graph (also deepseek2-ocr through `is_ocr`, which shares
 /// this graph class, models.h:1335).
 ///
@@ -11814,7 +11814,7 @@ pub fn build_deepseek2_forward(
     }
 }
 
-/// 对照 src/models/deepseek.cpp:74-194 llama_model_deepseek::graph::graph —
+/// verify against src/models/deepseek.cpp:74-194 llama_model_deepseek::graph::graph —
 /// the non-MLA v2 base: plain MHA attention (build_qkv + NORM rope) with the
 /// dense-lead/shared-expert MoE body. `kq_scale` falls back to
 /// 1/sqrt(n_embd_head) unless hparams.f_attention_scale is set (deepseek.cpp:91).
@@ -12119,7 +12119,7 @@ pub struct NemotronParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/nemotron.cpp:50-150 `graph::graph` — LayerNorm+bias
+/// verify against src/models/nemotron.cpp:50-150 `graph::graph` — LayerNorm+bias
 /// pre-norms, GQA attention with NEOX rope, the relu² up/down MLP (no gate)
 /// and the biased final LayerNorm over a required untied lm_head.
 pub fn build_nemotron_forward(
@@ -12454,7 +12454,7 @@ fn build_moe_ffn_gelu(
     moe_out
 }
 
-/// 对照 src/models/grok.cpp:86-223 `graph::graph` — RMS pre-norm, attention
+/// verify against src/models/grok.cpp:86-223 `graph::graph` — RMS pre-norm, attention
 /// with the grok kq softcap and a *post-attention* RMS norm before the
 /// residual add, GELU MoE (norm_w) with the optional dense-branch
 /// `(dense + moe) * sqrt(2)/2` mix, `ffn_post_norm` after the FFN and the
@@ -12617,7 +12617,7 @@ pub struct ChameleonParams {
     pub f_norm_eps_qk: f32,
 }
 
-/// 对照 src/models/chameleon.cpp:53-204 `graph::graph` — SwiGLU with
+/// verify against src/models/chameleon.cpp:53-204 `graph::graph` — SwiGLU with
 /// full-width q/k LayerNorms before the rope (Swin-norm layout optional),
 /// and the image-token logit suppression of :187-198 that clamps the
 /// vocab range [4, 8196) of the output row to -FLT_MAX.
@@ -12861,7 +12861,7 @@ pub struct DeciParams {
     pub f_attention_scale: f32,
 }
 
-/// 对照 src/models/deci.cpp:80-191 `graph::graph` — the per-layer attention
+/// verify against src/models/deci.cpp:80-191 `graph::graph` — the per-layer attention
 /// kinds of DeciLM (attention / linear-attention / attention-free) with
 /// per-layer head counts, rope factors from get_rope_factors and the
 /// FFN-free layers.
@@ -13075,7 +13075,7 @@ pub struct JaisParams {
     pub f_max_alibi_bias: f32,
 }
 
-/// 对照 src/models/jais.cpp:55-132 `graph::graph` — LayerNorm+bias norms,
+/// verify against src/models/jais.cpp:55-132 `graph::graph` — LayerNorm+bias norms,
 /// the fused qkv with its required bias, NO rope (ALiBi instead: the bias
 /// rides the kq mask/softmax `max_bias`, batch 3's mechanism) and a
 /// fully-biased SwiGLU FFN.
@@ -13240,7 +13240,7 @@ pub struct FalconH1Params {
     pub n_embd_s: u32,
 }
 
-/// 对照 src/models/falcon-h1.cpp:112-209 `graph::graph` — the
+/// verify against src/models/falcon-h1.cpp:112-209 `graph::graph` — the
 /// `llm_build_mamba_base` hybrid where EVERY layer runs attention AND the
 /// mamba2 mixer: `attn_norm → (attention ∥ re-norm + mamba2) →
 /// cur = attn + ssm; inpSA = cur + inpSA → ffn_norm → SwiGLU → residual`.
@@ -13466,7 +13466,7 @@ pub struct Plamo2Params {
     pub n_embd_s: u32,
 }
 
-/// 对照 src/models/plamo2.cpp:110-201 `graph::graph` — per layer:
+/// verify against src/models/plamo2.cpp:110-201 `graph::graph` — per layer:
 /// `attn_norm → (mamba | attention) → attn_post_norm → +residual → ffn_norm
 /// → SWIGLU FFN → ffn_post_norm → +residual`; final RMS norm + lm_head.
 ///
@@ -13911,7 +13911,7 @@ fn build_plamo2_mamba_layer(
     ctx.reshape_2d(cur, p.n_embd, t)
 }
 
-/// 对照 src/models/deepseek32.cpp:162-484 llama_model_deepseek32::graph::graph.
+/// verify against src/models/deepseek32.cpp:162-484 llama_model_deepseek32::graph::graph.
 /// Reuses [`Deepseek2ModelWeights`] (the deepseek32 loader fills the same
 /// tensors plus the indexer five); `kv` must be the `KvCache::new_dsa` pair —
 /// `kv.lid` holds the indexer key rows and `kv.lid_step` the per-step inputs
@@ -14218,7 +14218,7 @@ pub fn build_deepseek32_forward(
 
 // ===========================================================================
 // arch batch 7 (deepseek4): hyper-connections + the compressed DSV4 cache —
-// 对照 src/models/deepseek4.cpp. The cparams defaults make the reference run
+// verify against src/models/deepseek4.cpp. The cparams defaults make the reference run
 // the FUSED hyper-connection ops (`fused_dsv4_hc_pre/comb/post = true`,
 // llama-context.cpp:240-242) and the fused lightning indexer
 // (`fused_lid = true`, :237), so the port wires the fused builders; the
@@ -14815,7 +14815,7 @@ fn attn_dsv4(
     ctx.cont_2d(kqv, n_embd_head_v * n_head, t)
 }
 
-/// 对照 src/models/deepseek4.cpp:1223-1360 `graph::graph` — the deepseek4
+/// verify against src/models/deepseek4.cpp:1223-1360 `graph::graph` — the deepseek4
 /// trunk: per-token hyper-connected residual streams (4 streams by default),
 /// the MLA-style single-head kv projection whose K cache is the iswa raw pair,
 /// and the per-layer compressors (ratio 0: raw SWA only; 4: CSA overlap
@@ -15532,7 +15532,7 @@ pub struct Deepseek2MtpWeights {
 /// `h_nextn` row by the draft-mtp driver (speculative.cpp:1526-1547)
 pub type MtpHInput = TensorId;
 
-/// 对照 src/models/deepseek2.cpp:170-415
+/// verify against src/models/deepseek2.cpp:170-415
 /// `llama_model_deepseek2::graph_mtp::graph_mtp` — the single-block MTP head:
 /// eh_proj(concat(enorm(embd), hnorm(h))) → one MLA attention + MoE/shexp FFN
 /// over it → shared_head_norm → the LM head. `h_in` is the F32
@@ -15581,7 +15581,7 @@ pub fn build_deepseek2_mtp_forward(
     }
 }
 
-/// 对照 src/models/deepseek32.cpp:495-725
+/// verify against src/models/deepseek32.cpp:495-725
 /// `llama_model_deepseek32::graph_mtp::graph_mtp` — see
 /// [`build_deepseek2_mtp_forward`]; the differences are the
 /// `nextn_layer_offset` derivation of `il` (:501-504 — 0 for the single
@@ -15857,7 +15857,7 @@ pub struct Deepseek4MtpWeights {
     pub layer: Deepseek4LayerWeights,
 }
 
-/// 对照 src/models/deepseek4.cpp:1363-1502
+/// verify against src/models/deepseek4.cpp:1363-1502
 /// `llama_model_deepseek4::graph_mtp::graph_mtp` — the hyper-connection MTP
 /// block: eh_proj over [repeat(enorm(embd)); hnorm(h)] streams → one
 /// hc-pre/attn/hc-post + hc-pre/MoE/hc-post round → the flattened streams
@@ -16184,7 +16184,7 @@ pub struct HunyuanMoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/hunyuan-moe.cpp:56-187 — RMS attn_norm → QKV → **rope both
+/// verify against src/models/hunyuan-moe.cpp:56-187 — RMS attn_norm → QKV → **rope both
 /// Q and K first, then the per-head RMS Q/K norms** (hunyuan-moe.cpp:94-118,
 /// the opposite order of qwen3/dots1) → MHA (kq_scale 1/sqrt(head)) →
 /// residual → RMS ffn_norm → MoE (`norm_w = true`, softmax gating) **plus the
@@ -16378,7 +16378,7 @@ pub struct Dots1Params {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/dots1.cpp:74-193 — RMS attn_norm → QKV → **per-head RMS
+/// verify against src/models/dots1.cpp:74-193 — RMS attn_norm → QKV → **per-head RMS
 /// Q/K norms before rope** (dots1.cpp:106-116) → MHA → residual → RMS
 /// ffn_norm → dense SwiGLU on the lead layers, else MoE (gating func and
 /// norm_w straight from hparams, optional exp_probs_b steering the top-k)
@@ -16588,7 +16588,7 @@ pub struct BailingmoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/bailingmoe.cpp:62-180 — the plain MoE stack of the batch:
+/// verify against src/models/bailingmoe.cpp:62-180 — the plain MoE stack of the batch:
 /// RMS attn_norm → QKV (head width from `n_rot` in the loader,
 /// bailingmoe.cpp:35) → rope Q/K (no q/k norms) → MHA with **kq_scale =
 /// 1/sqrt(n_rot)** (bailingmoe.cpp:111) → residual → RMS ffn_norm → MoE
@@ -16764,7 +16764,7 @@ pub struct Bailingmoe2Params {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/bailingmoe2.cpp:90-211 — RMS attn_norm → QKV (fused
+/// verify against src/models/bailingmoe2.cpp:90-211 — RMS attn_norm → QKV (fused
 /// `attn_qkv` {n_embd, n_embd + 2*n_embd_gqa} accepted) → **per-head RMS
 /// Q/K norms before rope** (bailingmoe2.cpp:120-130) → MHA → residual
 /// (`sa_out`) → RMS ffn_norm → dense SwiGLU on the lead layers, else MoE
@@ -16990,7 +16990,7 @@ pub struct Glm4MoeParams {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/glm4-moe.cpp:291-444 — RMS attn_norm → QKV → optional
+/// verify against src/models/glm4-moe.cpp:291-444 — RMS attn_norm → QKV → optional
 /// per-head Q/K norms (GLM-4.5 355B variant) → rope (the plain `rope_ext`
 /// form; the `rope_multi` branch of glm4-moe.cpp:340-347 needs the mrope
 /// sections of the vision models, not ported) → MHA → residual →
@@ -17188,7 +17188,7 @@ pub struct MinimaxM2Params {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/minimax-m2.cpp:47-168 — RMS attn_norm → QKV with
+/// verify against src/models/minimax-m2.cpp:47-168 — RMS attn_norm → QKV with
 /// `reshape = false` (minimax-m2.cpp:74-78, the olmoe pattern: 2D
 /// projections) → **full-width RMS Q/K norms on the 2D tensors**
 /// (minimax-m2.cpp:83-89) → explicit 3D reshape → **partial rope**
@@ -17515,7 +17515,7 @@ pub struct Cohere2MoeParams {
     pub logit_scale: f32,
 }
 
-/// 对照 src/models/cohere2moe.cpp:152-289 — the cohere2 skeleton with the FFN
+/// verify against src/models/cohere2moe.cpp:152-289 — the cohere2 skeleton with the FFN
 /// swapped for MoE:
 ///   * norm type: RMS when the file carries the RMS eps, else LLM_NORM
 ///     (cohere2moe.cpp:158);
@@ -17735,7 +17735,7 @@ pub struct ExaoneMoeParams {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/exaone-moe.cpp:108-239 — RMS attn_norm → QKV → per-head
+/// verify against src/models/exaone-moe.cpp:108-239 — RMS attn_norm → QKV → per-head
 /// RMS Q/K norms before rope → **rope only on the SWA layers**
 /// (exaone-moe.cpp:130-156 — the every-4th full-attention layers skip rope
 /// entirely) → MHA → residual → RMS ffn_norm → dense SwiGLU on the lead
@@ -17895,7 +17895,7 @@ pub fn build_exaone_moe_forward(
 // ======================================================================
 
 // ----------------------------------------------------------------------
-// plamo3 — 对照 src/models/plamo3.cpp (SWA hybrid + post-norms + swiglu FFN)
+// plamo3 — verify against src/models/plamo3.cpp (SWA hybrid + post-norms + swiglu FFN)
 // ----------------------------------------------------------------------
 
 pub struct Plamo3LayerWeights {
@@ -17942,7 +17942,7 @@ pub struct Plamo3Params {
     pub n_head_kv: Vec<i64>,
 }
 
-/// 对照 src/models/plamo3.cpp:68-191 `graph<iswa>::graph` — per layer:
+/// verify against src/models/plamo3.cpp:68-191 `graph<iswa>::graph` — per layer:
 /// rms attn_norm → fused qkv views (q [head_q, H, T] / k [head_q, HKV, T] /
 /// v [head_v, HKV, T]) → per-head q/k RMS norms → NEOX rope (the SWA layers
 /// at the *_swa frequencies) → kv-cache MHA (kq_scale = 1/sqrt(head_dim_q))
@@ -18107,7 +18107,7 @@ pub fn build_plamo3_forward(
 }
 
 // ----------------------------------------------------------------------
-// qwen3next — 对照 src/models/qwen3next.cpp (gated delta net + gated
+// qwen3next — verify against src/models/qwen3next.cpp (gated delta net + gated
 // full attention + MoE + gated shared expert)
 // ----------------------------------------------------------------------
 
@@ -18186,7 +18186,7 @@ pub struct Qwen3NextParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/qwen3next.cpp:138-223 `graph::graph` — per layer:
+/// verify against src/models/qwen3next.cpp:138-223 `graph::graph` — per layer:
 /// rms attn_norm → (gated delta net | gated full attention) → residual →
 /// rms attn_post_norm → MoE (+ the sigmoid-gated shared expert) → residual →
 /// final norm → lm_head. The GDN runs the fused operator exactly like
@@ -18748,7 +18748,7 @@ fn build_qwen3next_ffn(
 }
 
 // ----------------------------------------------------------------------
-// kimi-linear — 对照 src/models/kimi-linear.cpp (KDA delta net + no-rope MLA
+// kimi-linear — verify against src/models/kimi-linear.cpp (KDA delta net + no-rope MLA
 // + MoE with shared experts)
 // ----------------------------------------------------------------------
 
@@ -18938,7 +18938,7 @@ fn kimi_causal_conv1d(
     ctx.reshape_4d(xcur, head_dim, n_head, n_seq_tokens, n_seqs)
 }
 
-/// 对照 src/models/kimi-linear.cpp:234-562 `graph::graph` — per layer:
+/// verify against src/models/kimi-linear.cpp:234-562 `graph::graph` — per layer:
 /// rms attn_norm → (KDA layer | no-rope MLA layer) → residual → rms ffn_norm
 /// → (dense FFN | MoE + shared experts) → residual → final norm → lm_head.
 ///
@@ -19339,7 +19339,7 @@ pub fn build_kimi_linear_forward(
 }
 
 // ----------------------------------------------------------------------
-// bailingmoe3 — 对照 src/models/bailingmoe3.cpp (KDA delta net with the safe
+// bailingmoe3 — verify against src/models/bailingmoe3.cpp (KDA delta net with the safe
 // gate + MLA with the output gate + swiglu_clamp FFNs)
 // ----------------------------------------------------------------------
 
@@ -19520,7 +19520,7 @@ fn bailingmoe3_causal_conv1d(
     ctx.reshape_4d(out, head_dim, n_head, n_seq_tokens, n_seqs)
 }
 
-/// 对照 src/models/bailingmoe3.cpp:218-410 `graph::graph` — per layer:
+/// verify against src/models/bailingmoe3.cpp:218-410 `graph::graph` — per layer:
 /// rms attn_norm → (KDA layer | gated MLA layer) → residual → rms ffn_norm →
 /// (dense FFN | MoE + shared expert, the swiglu_clamp limits where set) →
 /// residual → final norm → lm_head.
@@ -19991,7 +19991,7 @@ fn build_bailingmoe3_moe(
 // ======================================================================
 
 // ----------------------------------------------------------------------
-// smallthinker — 对照 src/models/smallthinker.cpp:66-189
+// smallthinker — verify against src/models/smallthinker.cpp:66-189
 // ----------------------------------------------------------------------
 
 pub struct SmallthinkerLayerWeights {
@@ -20044,7 +20044,7 @@ pub struct SmallthinkerParams {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/smallthinker.cpp:74-189 `graph<iswa>::graph` — the qwen2
+/// verify against src/models/smallthinker.cpp:74-189 `graph<iswa>::graph` — the qwen2
 /// skeleton with the MoE router **before** the attention norm: `probs` is
 /// computed from the raw `inpL` (smallthinker.cpp:109) and handed to the MoE
 /// as `probs_in`, so the FFN never multiplies the input by the router again.
@@ -20264,7 +20264,7 @@ fn build_moe_ffn_relu_probs(
 }
 
 // ----------------------------------------------------------------------
-// llada-moe — 对照 src/models/llada-moe.cpp:54-163
+// llada-moe — verify against src/models/llada-moe.cpp:54-163
 // ----------------------------------------------------------------------
 
 pub struct LladaMoeLayerWeights {
@@ -20304,7 +20304,7 @@ pub struct LladaMoeParams {
     pub n_expert_used: i64,
 }
 
-/// 对照 src/models/llada-moe.cpp:54-163 — the LLaMA skeleton with
+/// verify against src/models/llada-moe.cpp:54-163 — the LLaMA skeleton with
 /// `build_attn_inp_no_cache` instead of a KV cache (llada-moe.cpp:68): the
 /// KQ mask spans the *ubatch* only ([n_tokens, n_tokens],
 /// llm_graph_input_attn_no_cache::set_input, llama-graph.cpp:409-468), filled
@@ -20489,7 +20489,7 @@ fn attn_no_cache_fa(
 }
 
 // ----------------------------------------------------------------------
-// minimax-01 — 对照 src/models/minimax-01.cpp:192-484 (lightning attention)
+// minimax-01 — verify against src/models/minimax-01.cpp:192-484 (lightning attention)
 // ----------------------------------------------------------------------
 
 pub struct Minimax01LayerWeights {
@@ -20542,7 +20542,7 @@ pub struct Minimax01Params {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/minimax-01.cpp:192-484 `graph::graph` — every-8th-full
+/// verify against src/models/minimax-01.cpp:192-484 `graph::graph` — every-8th-full
 /// hybrid: the softmax layers are plain GQA + rope through the (filtered) KV
 /// cache, the lightning layers run the linear-attention recurrence
 /// (minimax-01.cpp:277-420):
@@ -20815,7 +20815,7 @@ pub fn build_minimax01_forward(
 }
 
 // ----------------------------------------------------------------------
-// graniteswitch — 对照 src/models/granite-switch.cpp:221-427
+// graniteswitch — verify against src/models/granite-switch.cpp:221-427
 // ----------------------------------------------------------------------
 
 /// The per-layer switched-LoRA deltas (granite-switch.cpp:113-130) — the
@@ -20871,7 +20871,7 @@ pub struct GraniteSwitchParams {
     pub router_gain: f32,
 }
 
-/// 对照 src/models/granite-switch.cpp:221-329 `graph::graph` — the granite
+/// verify against src/models/granite-switch.cpp:221-329 `graph::graph` — the granite
 /// skeleton where every projection carries a per-token switched LoRA delta:
 ///
 ///   * the substitution happens at the embedding lookup: `sub_tokens` indexes
@@ -21149,11 +21149,11 @@ pub fn build_graniteswitch_forward(
 // arch batch 11a (2026-10) — the long-tail queue, first half:
 //   apertus / grovemoe / qwen35moe / kimi-k3 / dots3note / minimax-m3 /
 //   qwen4exp
-// (llama.cpp bd4f514db1; queue in FILE_MAP.md 批次 11)
+// (llama.cpp bd4f514db1; queue in FILE_MAP.md batch 11)
 // ======================================================================
 
 // ----------------------------------------------------------------------
-// apertus — 对照 src/models/apertus.cpp (per-head q/k RMS norm + rope with
+// apertus — verify against src/models/apertus.cpp (per-head q/k RMS norm + rope with
 // longrope factors + the xIELU FFN activation)
 // ----------------------------------------------------------------------
 
@@ -21204,7 +21204,7 @@ pub struct ApertusParams {
     pub use_longrope_factors: bool,
 }
 
-/// 对照 src/models/apertus.cpp:60-170 `graph::graph` — per layer: rms
+/// verify against src/models/apertus.cpp:60-170 `graph::graph` — per layer: rms
 /// attn_norm → qkv (fused or separate) → per-head q/k RMS norms → rope →
 /// MHA over the unified cache (optional wo bias) → residual → rms ffn_norm →
 /// up → **xielu** → down → residual → final norm → lm_head.
@@ -21358,7 +21358,7 @@ pub fn build_apertus_forward(
 }
 
 // ----------------------------------------------------------------------
-// grovemoe — 对照 src/models/grovemoe.cpp (softmax-gated MoE over the
+// grovemoe — verify against src/models/grovemoe.cpp (softmax-gated MoE over the
 // experts AND a second "chunk expert" MoE scaled by expert_group_scale)
 // ----------------------------------------------------------------------
 
@@ -21443,7 +21443,7 @@ fn build_moe_ffn_silu_probs(
     // (afmoe/hy-v3/mimo2/step35/hy-v4) previously folded it into the logits
     // pre-gating — sigmoid(l+b) vs sigmoid(l)+b — which perturbed the weights
     // (~2e-3 rel) and drifted every downstream node (the mimo2/step35 iswa
-    // kq ~3e-3 divergence, PARITY.md 批次 15).
+    // kq ~3e-3 divergence, PARITY.md batch 15).
     exp_probs_b: Option<TensorId>,
 ) -> TensorId {
     let n_embd = ctx.ne(cur)[0];
@@ -21523,7 +21523,7 @@ fn build_moe_ffn_silu_probs(
     moe_out
 }
 
-/// 对照 src/models/grovemoe.cpp:67-193 `graph::graph` — per layer: rms
+/// verify against src/models/grovemoe.cpp:67-193 `graph::graph` — per layer: rms
 /// attn_norm → qkv → per-head q/k RMS norms → rope → MHA → residual → rms
 /// ffn_norm → **two** softmax MoEs over the same router logits (the experts
 /// and the chunk experts, the second scaled by `expert_group_scale`) →
@@ -21681,7 +21681,7 @@ pub fn build_grovemoe_forward(
 }
 
 // ----------------------------------------------------------------------
-// qwen35moe — 对照 src/models/qwen35moe.cpp (the qwen3next graph with the
+// qwen35moe — verify against src/models/qwen35moe.cpp (the qwen3next graph with the
 // IMRoPE sections, the attn_post_norm MoE FFN and the t_h_nextn tap)
 // ----------------------------------------------------------------------
 
@@ -21759,7 +21759,7 @@ pub struct Qwen35MoeParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/qwen35moe.cpp:156-249 `graph::graph` — per layer:
+/// verify against src/models/qwen35moe.cpp:156-249 `graph::graph` — per layer:
 /// rms attn_norm → (gated delta net | gated IMRoPE full attention) → residual
 /// → rms attn_post_norm → MoE (+ the sigmoid-gated shared expert) → residual →
 /// final norm (t_h_nextn) → lm_head.
@@ -22187,7 +22187,7 @@ fn build_qwen35moe_ffn(
 }
 
 // ----------------------------------------------------------------------
-// kimi-k3 — 对照 src/models/kimi-k3.cpp (hybrid KDA + nope-MLA + latent MoE
+// kimi-k3 — verify against src/models/kimi-k3.cpp (hybrid KDA + nope-MLA + latent MoE
 // with the SITU activation + the cross-layer residual attention)
 // ----------------------------------------------------------------------
 
@@ -22323,7 +22323,7 @@ fn kimi_k3_situ(
     ctx.mul(a, up)
 }
 
-/// 对照 src/models/kimi-k3.cpp:192-234 — the cross-layer residual attention.
+/// verify against src/models/kimi-k3.cpp:192-234 — the cross-layer residual attention.
 ///
 /// `res_push` banks the RAW layer input as a `[n_embd, n_ckpt, n_tokens]`
 /// stack (append-only); `res_mix` scores every banked checkpoint plus the
@@ -22397,7 +22397,7 @@ impl KimiK3ResStack {
     }
 }
 
-/// 对照 src/models/kimi-k3.cpp:236-351 `graph::graph` — the trunk loop with
+/// verify against src/models/kimi-k3.cpp:236-351 `graph::graph` — the trunk loop with
 /// the residual-bank flow:
 ///
 ///   prefix = res_mix(inpL, attn_res_score) → [bank] → attn_norm →
@@ -22410,7 +22410,7 @@ impl KimiK3ResStack {
 /// PARTIAL (reported): single sequence, K = 1 recurrent snapshots
 /// (`cparams.n_rs_seq == 0` — the K>1 rollback-snapshot arms of
 /// delta-net-base.cpp:497-522/:546-606 need the memory-side slot fan-out the
-/// port's RecurrentState does not model; see PARITY.md 批次 11a).
+/// port's RecurrentState does not model; see PARITY.md batch 11a).
 pub fn build_kimi_k3_forward(
     ctx: &mut Context,
     w: &KimiK3ModelWeights,
@@ -22575,7 +22575,7 @@ pub fn build_kimi_k3_forward(
     }
 }
 
-/// 对照 kimi-k3.cpp:357-479 — the KDA layer: three per-stream causal convs
+/// verify against kimi-k3.cpp:357-479 — the KDA layer: three per-stream causal convs
 /// (Q/K/V slices of the packed conv cell), the two-stage decay gate with the
 /// `kda_gate_lower_bound` safe form, the single full-rank output gate.
 #[allow(clippy::too_many_arguments)]
@@ -22722,7 +22722,7 @@ fn build_kimi_k3_kda_layer(
     ctx.mul_mat(lw.wo.expect("wo"), gated)
 }
 
-/// 对照 kimi-k3.cpp:485-563 — the nope-MLA layer: optional q compression, the
+/// verify against kimi-k3.cpp:485-563 — the nope-MLA layer: optional q compression, the
 /// [kv_lora|rope] split, **no RoPE** (mla_use_nope is asserted at conversion),
 /// the absorbed wk_b path (K-only cache, wv_b decompression) or the legacy
 /// wkv_b MHA, then the sigmoid output gate before o_proj.
@@ -22877,7 +22877,7 @@ fn build_kimi_k3_mla_layer(
     ctx.mul_mat(lw.wo.expect("wo"), out)
 }
 
-/// 对照 kimi-k3.cpp:570-618 `build_latent_moe` — down-project into the latent
+/// verify against kimi-k3.cpp:570-618 `build_latent_moe` — down-project into the latent
 /// space, run the routed experts there (the router scores the FULL-width
 /// input, so its logits are computed here and passed in), norm + up-project
 /// back, then the full-width situ shared experts.
@@ -23011,7 +23011,7 @@ fn build_kimi_k3_latent_moe(
 }
 
 // ----------------------------------------------------------------------
-// dots3note — 对照 src/models/dots3note.cpp (deepseek32's DSA indexer +
+// dots3note — verify against src/models/dots3note.cpp (deepseek32's DSA indexer +
 // absorbed MLA over an iswa pair with DIFFERENT geometry per side, plus the
 // head-wise sigmoid output gate of step35)
 // ----------------------------------------------------------------------
@@ -23282,7 +23282,7 @@ fn attn_k_cached_mla_iswa(
     ctx.cont_2d(kqv, ne[0] * ne[1], ne[2] * ne[3])
 }
 
-/// 对照 src/models/dots3note.cpp:152-476 `graph::graph` — per layer: rms
+/// verify against src/models/dots3note.cpp:152-476 `graph::graph` — per layer: rms
 /// attn_norm → q_lora compression → (full: DSA lightning indexer + top_k) →
 /// absorbed MLA over the layer's side of the iswa pair (norm on the shared
 /// rope key before rope; the SWA layers rope at freq_base_swa) → the
@@ -23608,7 +23608,7 @@ pub fn build_dots3note_forward(
 }
 
 // ----------------------------------------------------------------------
-// minimax-m3 — 对照 src/models/minimax-m3.cpp (M2-style partial-rope GQA +
+// minimax-m3 — verify against src/models/minimax-m3.cpp (M2-style partial-rope GQA +
 // swigluoai MoE + MiniMax Sparse Attention over block-selected cells)
 // ----------------------------------------------------------------------
 
@@ -23750,7 +23750,7 @@ fn build_attn_msa_fa(
     ctx.reshape_2d(o, d * hq, t)
 }
 
-/// 对照 src/models/minimax-m3.cpp:210-608 `graph::graph` — per layer: rms
+/// verify against src/models/minimax-m3.cpp:210-608 `graph::graph` — per layer: rms
 /// attn_norm → qkv → per-head q/k norms → partial rope → (dense MHA | the
 /// MSA sparse path) → wo → residual → rms ffn_norm → (swigluoai dense FFN |
 /// swigluoai MoE + shared expert) → residual → final norm → lm_head.
@@ -24272,7 +24272,7 @@ fn build_moe_ffn_silu_swigluoai(
 }
 
 // ----------------------------------------------------------------------
-// qwen4exp — 对照 src/models/qwen4exp.cpp (the hyper-connection residual
+// qwen4exp — verify against src/models/qwen4exp.cpp (the hyper-connection residual
 // streams of deepseek4 + the qwen3next GDN/gated-attention pair + the MoE
 // with the sigmoid-gated shared expert)
 //
@@ -24281,7 +24281,7 @@ fn build_moe_ffn_silu_swigluoai(
 // reference".
 //
 // def4d406a deltas in the un-ported QSA/PLE halves (no port action, both
-// stay on the 批次 11a skip): `llm_graph_input_qsa` gained a causal_attn
+// stay on the batch 11a skip): `llm_graph_input_qsa` gained a causal_attn
 // member (the non-causal cache keeps future cells too now,
 // qwen4exp.cpp:494-545), `llm_graph_input_ple` was renamed
 // `llm_graph_input_qwen4exp_ple` and takes the generic model (:1050-1146),
@@ -24294,7 +24294,7 @@ fn build_moe_ffn_silu_swigluoai(
 // (`dsv4_compress_ratios > 0`, build_qsa_top_k qwen4exp.cpp:542-691 +
 // build_attn_qsa :695-773 + the `llm_graph_input_qsa` /
 // `llama_memory_hybrid_idx` inputs) and the PLE n-gram hash embeddings
-// (:1042-1294) are NOT ported — see PARITY.md 批次 11a. The verified
+// (:1042-1294) are NOT ported — see PARITY.md batch 11a. The verified
 // configuration is the legal file without the optional
 // attention.compress_ratios / PLE keys: the reference then runs every
 // full-attention layer dense and never builds the PLE module
@@ -24533,7 +24533,7 @@ fn build_qwen4exp_hc_combine(
     cur
 }
 
-/// 对照 src/models/qwen4exp.cpp:353-458 `graph::graph` — the hc-wide residual
+/// verify against src/models/qwen4exp.cpp:353-458 `graph::graph` — the hc-wide residual
 /// (hc identical copies of the embedding) flows through
 /// mix → (GDN | gated IMRoPE attention) → combine → mix → MoE(+gated shexp) →
 /// combine, per layer; the final mixer IS the output norm.
@@ -25102,7 +25102,7 @@ pub struct ArceeParams {
     pub f_attention_scale: f32,
 }
 
-/// 对照 src/models/arcee.cpp:48-157 `llama_model_arcee::graph::graph` — the
+/// verify against src/models/arcee.cpp:48-157 `llama_model_arcee::graph::graph` — the
 /// llama body (RMS norms, NORM rope, sequential residuals) with
 /// LLM_FFN_RELU_SQR + LLM_FFN_SEQ instead of SwiGLU (arcee.cpp:123-128) and
 /// `model.get_rope_factors(cparams, il)` feeding ggml_rope_ext (:80/:86).
@@ -25256,7 +25256,7 @@ pub struct Jais2Params {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/jais2.cpp:54-155 `llama_model_jais2::graph::graph` —
+/// verify against src/models/jais2.cpp:54-155 `llama_model_jais2::graph::graph` —
 /// LayerNorm (not RMSNorm) with biases everywhere, separate Q/K/V + RoPE,
 /// `1/sqrt(n_embd_head)` attention scale, relu² MLP (no gate) with up/down
 /// biases. Same pieces as nemotron's LN layout plus the rope and the MLP
@@ -25412,7 +25412,7 @@ pub struct TalkieParams {
     pub logit_scale: f32,
 }
 
-/// 对照 src/models/talkie.cpp:40-149 `llama_model_talkie::graph::graph` —
+/// verify against src/models/talkie.cpp:40-149 `llama_model_talkie::graph::graph` —
 /// every norm is the weightless RMS (`build_norm(x, nullptr, nullptr,
 /// LLM_NORM_RMS)`), the per-head q-norm `[1, n_head]` applies AFTER rope
 /// (:87), each layer adds `embd_skip * layer_out_scale` on top of the FFN
@@ -25581,7 +25581,7 @@ pub struct NanbeigeParams {
     pub f_attention_scale: f32,
 }
 
-/// 对照 src/models/nanbeige.cpp:80-185 `llama_model_nanbeige::graph::graph` —
+/// verify against src/models/nanbeige.cpp:80-185 `llama_model_nanbeige::graph::graph` —
 /// the llama body over `n_layer = n_layer_phys * n_loops` *logical* layers:
 /// the physical weights are shared across loops (the loader aliases the
 /// layer structs, nanbeige.cpp:67-73) and each loop boundary folds in the
@@ -25753,7 +25753,7 @@ pub struct DreamParams {
     pub attn: AttnParams,
 }
 
-/// 对照 src/models/dream.cpp:52-138 `llama_model_dream::graph::graph` —
+/// verify against src/models/dream.cpp:52-138 `llama_model_dream::graph::graph` —
 /// "copied from qwen2" over `build_attn_inp_no_cache` (:68): the diffusion
 /// attention attends the tokens of its own ubatch through the all-visible
 /// [n_tokens, n_tokens] mask, exactly like llada-moe's. The pinned reference
@@ -25900,7 +25900,7 @@ pub struct Rnd1Params {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/rnd1.cpp:65-177 `llama_model_rnd1::graph::graph` — the
+/// verify against src/models/rnd1.cpp:65-177 `llama_model_rnd1::graph::graph` — the
 /// qwen3moe body (per-head q/k norms BEFORE rope, softmax MoE with norm_w
 /// and expert_weights_scale) over `build_attn_inp_no_cache` (:80). Like
 /// dream, the reference has no generation path (memory = nullptr) — verified
@@ -26062,7 +26062,7 @@ pub struct EurobertRope {
     pub beta_slow: f32,
 }
 
-/// 对照 src/models/eurobert.cpp:38-124 `llama_model_eurobert::graph::graph` —
+/// verify against src/models/eurobert.cpp:38-124 `llama_model_eurobert::graph::graph` —
 /// the bert-shaped encoder loop with RMS norms, rope'd Q/K (NEOX, the arch's
 /// rope-type table entry) and a gated SwiGLU FFN; `res->t_embd` only (no
 /// logits, no output head). Like bert, the non-FA branch of build_attn_mha
@@ -26297,7 +26297,7 @@ pub struct HrmTextParams {
     pub f_embedding_scale: f32,
 }
 
-/// 对照 src/models/hrm-text.cpp:88-213 `llama_model_hrm_text::graph` —
+/// verify against src/models/hrm-text.cpp:88-213 `llama_model_hrm_text::graph` —
 /// `build_stack` (hrm-text.cpp:93-166) runs lps pre-norm decoder layers with
 /// the **weightless** RMS norms (build_norm(cur, nullptr, …), the qwen3next
 /// sigmoid-gated attention over the slot's own cache row) and closes with the
@@ -26548,7 +26548,7 @@ pub struct LagunaParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/laguna.cpp:152-331 `llama_model_laguna::graph` — the
+/// verify against src/models/laguna.cpp:152-331 `llama_model_laguna::graph` — the
 /// pre-norm MoE body with: the **softplus** attention output gate computed
 /// from the pre-attention hidden state (:209, g_proj on the same input as
 /// q/k/v), the QK RMSNorms at head_dim level before rope (:213-214), the
@@ -26824,7 +26824,7 @@ pub struct MapleParams {
     pub n_expert_used: i64,
 }
 
-/// 对照 src/models/maple.cpp:65-150 `llama_model_maple::graph` — the
+/// verify against src/models/maple.cpp:65-150 `llama_model_maple::graph` — the
 /// softmax-MoE body over the iswa pair: per-head q/k RMSNorms **before**
 /// rope (:85-86), rope **only on the SWA layers** (:90-99, with
 /// n_rot(il) = n_rot_swa and the *_swa frequencies — the full-attention
@@ -27058,7 +27058,7 @@ pub struct Eagle3Params {
     pub n_embd_tgt: i64,
 }
 
-/// 对照 src/models/eagle3.cpp:103-146 — the encoder graph
+/// verify against src/models/eagle3.cpp:103-146 — the encoder graph
 /// (`llama_model_eagle3::graph<true>`, driven by llama_encode of the draft
 /// context, speculative.cpp:627-652): RMSNorm(norm_before_fc only) → fc
 /// projection; the output IS `res->t_h_nextn` (:142-143) — one g_embd row per
@@ -27105,7 +27105,7 @@ pub fn build_eagle3_encoder_forward(
     }
 }
 
-/// 对照 src/models/eagle3.cpp:151-326 — the decoder graph
+/// verify against src/models/eagle3.cpp:151-326 — the decoder graph
 /// (`llama_model_eagle3::graph<false>`): one llama-shaped layer whose
 /// attention input is `concat(rms(token_embd), rms(g))` and whose residual
 /// base is the raw (or normed) g stream; the pre-norm output IS `t_h_nextn`
@@ -27439,7 +27439,7 @@ pub struct Cohere2Params {
     pub freq_scale_swa: f32,
 }
 
-/// 对照 src/models/cohere2.cpp:50-159. The norm is LLM_NORM (:76/:143), the
+/// verify against src/models/cohere2.cpp:50-159. The norm is LLM_NORM (:76/:143), the
 /// FFN reads the **normed** input (ffn_inp = attn_norm(inpL), :78), rope only
 /// on the SWA layers (:89-101 — the every-4th full-attention layers carry no
 /// rope at all), and the block output is `ffn + inpL + attn_out` (:131-132).
@@ -27590,7 +27590,7 @@ pub struct ChatglmParams {
     pub norm_rms_eps: f32,
 }
 
-/// 对照 src/models/chatglm.cpp:58-161 — plain RMS decoder with the SWIGLU-SEQ
+/// verify against src/models/chatglm.cpp:58-161 — plain RMS decoder with the SWIGLU-SEQ
 /// FFN (build_ffn LLM_FFN_SWIGLU + LLM_FFN_SEQ, ffn_up {n_embd, 2*n_ff}).
 pub fn build_chatglm_forward(
     ctx: &mut Context,
@@ -27713,7 +27713,7 @@ pub struct BitnetParams {
     pub norm_rms_eps: f32,
 }
 
-/// 对照 src/models/bitnet.cpp:51-170 — build_attn with wo == NULL then
+/// verify against src/models/bitnet.cpp:51-170 — build_attn with wo == NULL then
 /// attn_sub_norm + lora_mm(wo, wo_s) (:97-110); the FFN is up+gate (silu par)
 /// → ffn_sub_norm {n_ff} → lora_mm(down) (:127-141); the lm_head is
 /// build_lora_mm(model.tok_embd, cur) — the model has NO output tensor
@@ -27831,7 +27831,7 @@ pub struct DbrxParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/dbrx.cpp:47-154 — the clamped fused QKV, plain rope, the
+/// verify against src/models/dbrx.cpp:47-154 — the clamped fused QKV, plain rope, the
 /// attn_out_norm LayerNorm over the residual sum, then the softmax-gated MoE
 /// (norm_w = true) on the normed input.
 pub fn build_dbrx_forward(
@@ -27990,7 +27990,7 @@ pub struct Mistral3Params {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/mistral3.cpp:93-235 — the llama body with the optional
+/// verify against src/models/mistral3.cpp:93-235 — the llama body with the optional
 /// post-rope temperature scaling (:153-157), the optional MoE tail (:186-209)
 /// and the dense tail's optional MLP biases (:179-185).
 pub fn build_mistral3_forward(
@@ -28190,7 +28190,7 @@ pub struct Minicpm3Params {
     pub n_embd_base: i64,
 }
 
-/// 对照 src/models/minicpm3.cpp:63-252. The attention caches the
+/// verify against src/models/minicpm3.cpp:63-252. The attention caches the
 /// **decompressed** per-head K (concat of the nope segment and the repeated
 /// shared rope segment) and V — an MHA cache (n_head_kv == n_head), unlike
 /// deepseek2's absorbed form. The K/Q rope runs over the trailing n_rot dims
@@ -28419,7 +28419,7 @@ pub struct Glm4Params {
     pub rope_sections: [i32; 4],
 }
 
-/// 对照 src/models/glm4.cpp:68-186 — the mrope branch when the file carries
+/// verify against src/models/glm4.cpp:68-186 — the mrope branch when the file carries
 /// rope sections (use_mrope), else plain rope (:108-125); post-attention norm
 /// BEFORE the residual add (:139-145) and the SWIGLU-SEQ FFN between the
 /// ffn_norm and the ffn_post_norm (:147-165). The GGML_ABORT at :82-85 is the
@@ -28583,7 +28583,7 @@ pub struct Exaone4Params {
     pub freq_scale_swa: f32,
 }
 
-/// 对照 src/models/exaone4.cpp:81-186 — `use_rope = is_swa(il) || swa_type ==
+/// verify against src/models/exaone4.cpp:81-186 — `use_rope = is_swa(il) || swa_type ==
 /// NONE` (:111), QK RMS-norm before the rope (:122-125), the attention output
 /// goes through attn_post_norm (:147) and the FFN through ffn_post_norm
 /// (:161) with plain residuals on both sides. There is no attn_norm — build_qkv
@@ -28782,7 +28782,7 @@ pub struct Llama4Params {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/llama4.cpp:104-268 — the iswa template: `use_rope` layers
+/// verify against src/models/llama4.cpp:104-268 — the iswa template: `use_rope` layers
 /// rope Q/K and then apply the post-rope rms_norm pair when use_kq_norm
 /// (:180-186); the no-rope layers multiply Q by the temperature scale instead
 /// (:173-175). The MoE layers gate with sigmoid, norm_w false, and always add
@@ -29024,7 +29024,7 @@ pub struct Qwen2VlParams {
     pub rope_sections: [i32; 4],
 }
 
-/// 对照 src/models/qwen2vl.cpp:42-143 — ggml_rope_multi on every layer
+/// verify against src/models/qwen2vl.cpp:42-143 — ggml_rope_multi on every layer
 /// (:78-88). Text-only batches carry the 4-per-token position ids of the
 /// temporal block repeated (llama-batch n_pos_per_embd) — what the reference
 /// does without a vision stream. output_b is loaded but unused by the graph
@@ -29191,7 +29191,7 @@ pub struct Qwen3VlParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/qwen3vl.cpp:60-197 / qwen3vlmoe.cpp:64-190 — one builder
+/// verify against src/models/qwen3vl.cpp:60-197 / qwen3vlmoe.cpp:64-190 — one builder
 /// for both: the dense arm (qwen3vl.cpp:140-146) vs the softmax-gated MoE arm
 /// (qwen3vlmoe.cpp:144-157), keyed on ffn_gate_inp like the C's two graphs
 /// key on their loaders. The deepstack injection (:153-157 / :164-168) adds
@@ -29441,7 +29441,7 @@ pub struct GlmDsaParams {
     pub is_indexer_full: Vec<bool>,
 }
 
-/// 对照 src/models/glm-dsa.cpp:196-530 — the deepseek32 graph with:
+/// verify against src/models/glm-dsa.cpp:196-530 — the deepseek32 graph with:
 ///   * the shared-indexer layers (is_indexer_full == false) reusing the
 ///     previous full layer's top_k (:243-245, :362-367);
 ///   * the sigmoid-by-default MoE + the wide shared expert (:467-498);
@@ -29847,7 +29847,7 @@ pub struct GlmDsaMtpWeights {
     pub layer: GlmDsaLayerWeights,
 }
 
-/// 对照 src/models/glm-dsa.cpp:539-769 `graph_mtp` — the deepseek2-style MLA
+/// verify against src/models/glm-dsa.cpp:539-769 `graph_mtp` — the deepseek2-style MLA
 /// MTP head over the glm-dsa block: eh_proj(concat(enorm(embd), hnorm(h))) →
 /// attn_norm → dense MLA attention (build_attn_inp_k, no DSA indexer — "The
 /// DSA indexer is not used at runtime (same as the trunk graph)", :538) →
@@ -30778,7 +30778,7 @@ mod tests {
             all.push(tok);
             let got2 = h.decode(&weights, &attn, &[tok], &[p], build_llama_forward);
             let want = naive(&all);
-            // decode 口径照抄 toy_qwen2: max(|b|,1.0) 分母, 5e-2
+            // decode convention verbatim from toy_qwen2: max(|b|,1.0) denominator, 5e-2
             let err = got2
                 .iter()
                 .zip(&want)
@@ -31212,7 +31212,7 @@ mod tests {
                     let mut prod = vec![0f32; n_ff];
                     for i in 0..n_ff {
                         // gelu: the op reads the f16 table (vec.h:987), NOT the
-                        // polynomial — 对照 ops.rs ggml_vec_gelu_f32
+                        // polynomial — verify against ops.rs ggml_vec_gelu_f32
                         prod[i] = ggml::ops::ggml_vec_gelu_f32(g[i]) * u[i];
                     }
                     let dwn = dot(&d.down, &prod, n_ff);
@@ -31267,7 +31267,7 @@ mod tests {
             all.push(tok);
             let got2 = h.decode(&weights, &gparams.attn, &[tok], &[p], build);
             let want = naive(&all);
-            // decode 口径照抄 toy_qwen2: max(|b|,1.0) 分母, 5e-2
+            // decode convention verbatim from toy_qwen2: max(|b|,1.0) denominator, 5e-2
             let err = got2
                 .iter()
                 .zip(&want)
@@ -31438,7 +31438,7 @@ mod tests {
                     let res: Vec<f32> = xt.iter().zip(&a).map(|(p, q)| p + q).collect();
                     let xn = rms(&res, &d.ffn_norm, eps, false);
                     // ffn_up emits 2*n_ff: first half gate, second half up
-                    // (对照 ops.cpp:3176 vec_swiglu)
+                    // (verify against ops.cpp:3176 vec_swiglu)
                     let up2 = dot(&d.ffn_up, &xn, n_embd);
                     let mut prod = vec![0f32; n_ff];
                     for i in 0..n_ff {
@@ -31469,7 +31469,7 @@ mod tests {
             all.push(tok);
             let got2 = h.decode(&weights, &attn, &[tok], &[p], build_phi3_forward);
             let want = naive(&all);
-            // decode 口径照抄 toy_qwen2: max(|b|,1.0) 分母, 5e-2
+            // decode convention verbatim from toy_qwen2: max(|b|,1.0) denominator, 5e-2
             let err = got2
                 .iter()
                 .zip(&want)
@@ -32120,7 +32120,7 @@ mod tests {
 
     // ==============================================================
     // granite-hybrid toy: graph vs naive (mamba2 mixer + attention)
-    // (方法照抄 toy_gpt_oss_matches_naive / context.rs toy_qwen2_matches_naive)
+    // (method verbatim from toy_gpt_oss_matches_naive / context.rs toy_qwen2_matches_naive)
     // ==============================================================
 
     /// Toy granite-hybrid model driven through `DecodeContext` +
@@ -32843,7 +32843,7 @@ mod tests {
                 let mut outs = Vec::new();
                 for (t, _xt) in x.iter().enumerate() {
                     // attn_out[t] already carries the attention residual +
-                    // wo_b (`inpSA + attn + wo_b`), 对照 openai-moe.cpp:115-122
+                    // wo_b (`inpSA + attn + wo_b`), verify against openai-moe.cpp:115-122
                     let res: Vec<f32> = attn_out[t].clone();
                     let xn = rms(&res, &l[1]);
                     // router: raw logits -> top-k -> softmax over the k
@@ -34300,7 +34300,7 @@ fn build_rwkv6_channel_mix(
     ctx.mul(r, v)
 }
 
-/// 对照 src/models/rwkv6.cpp:94-185 `llama_model_rwkv6::graph::graph` —
+/// verify against src/models/rwkv6.cpp:94-185 `llama_model_rwkv6::graph::graph` —
 /// LN0 → per layer (LLM_NORM attn_norm → token-shifted time mix → +residual →
 /// LLM_NORM attn_norm_2 → token-shifted channel mix → +residual → optional
 /// rescale) → final LLM_NORM → lm_head. Token-shift state in/out per layer.
@@ -34451,7 +34451,7 @@ pub fn build_rwkv6_forward(
     }
 }
 
-/// 对照 src/models/rwkv6qwen2.cpp:84-167 — the "qwen2-style" rwkv6: RMS
+/// verify against src/models/rwkv6qwen2.cpp:84-167 — the "qwen2-style" rwkv6: RMS
 /// norms, sigmoid-gated GLA time mix (token_shift_count == 1) and a SwiGLU
 /// FFN instead of the channel mix.
 pub fn build_rwkv6qwen2_forward(
@@ -34784,7 +34784,7 @@ fn build_rwkv7_time_mix(
     ctx.reshape_3d(cur, n_embd, t, 1)
 }
 
-/// 对照 src/models/rwkv7.cpp:124-211 — LN0 → per layer (LLM_NORM attn_norm →
+/// verify against src/models/rwkv7.cpp:124-211 — LN0 → per layer (LLM_NORM attn_norm →
 /// token-shifted wkv7 time mix (v_first threading) → +residual → LLM_NORM
 /// attn_norm_2 → token-shifted channel mix → +residual) → final LLM_NORM →
 /// lm_head.
@@ -34934,7 +34934,7 @@ pub fn build_rwkv7_forward(
     }
 }
 
-/// 对照 src/models/arwkv7.cpp:120-202 — the RMS-norm rwkv7 ("a"rwkv7): no
+/// verify against src/models/arwkv7.cpp:120-202 — the RMS-norm rwkv7 ("a"rwkv7): no
 /// LN0, RMS attn_norm, one token-shift plane (token_shift_count == 1) and a
 /// SwiGLU FFN instead of the channel mix. Optional gating pair + optional
 /// ln/ln_b and a 6-or-5-plane lerp_fused (the loader's try/catch,
@@ -35264,7 +35264,7 @@ fn gemma3n_altup_correct(
     corrected
 }
 
-/// 对照 src/models/gemma3n.cpp:89-316 `graph::graph` —
+/// verify against src/models/gemma3n.cpp:89-316 `graph::graph` —
 /// scaled embeddings → altup stack projection → per layer (altup_predict →
 /// attention (own KV | reused KV) + laurel → altup-correct → per-layer
 /// embedding gate) → altup un-embedding merge → final RMS norm → soft-capped
@@ -35706,7 +35706,7 @@ fn gemma3n_attn(
 // / llada / hunyuan-vl(+dense) / granite-swa / afmoe / mellum / paddleocr /
 // gemma-embedding / llama-embed / mistral4 / hy-v3 / hy-v4 / mimo2 / step35
 // (+ gemma4-assistant, the ctx_other draft — documented-skip, see PARITY.md
-// 批次 15). Every builder is a 1:1 port of its src/models/<arch>.cpp graph;
+// batch 15). Every builder is a 1:1 port of its src/models/<arch>.cpp graph;
 // the iswa members (spark2-5 / muse-glimmer / granite-swa / afmoe / mellum /
 // mimo2 / step35) ride the port's per-layer cache selection like batch 8+.
 // ===========================================================================
@@ -35742,7 +35742,7 @@ pub struct Qwen1Params {
     pub norm_rms_eps: f32,
 }
 
-/// 对照 src/models/qwen.cpp:43-140. Plain pre-norm decoder: fused wqkv (+bias)
+/// verify against src/models/qwen.cpp:43-140. Plain pre-norm decoder: fused wqkv (+bias)
 /// → NEOX rope → MHA → SwiGLU at n_ff/2 (gate/up {n_embd, n_ff/2}, down
 /// {n_ff/2, n_embd}); head is separate (qwen.cpp:20, required).
 pub fn build_qwen1_forward(
@@ -35857,7 +35857,7 @@ pub struct MaincoderParams {
     pub norm_rms_eps: f32,
 }
 
-/// 对照 src/models/maincoder.cpp:47-151. The Q/K RMS norms run AFTER the
+/// verify against src/models/maincoder.cpp:47-151. The Q/K RMS norms run AFTER the
 /// rope (:92-96), on the per-head [n_embd_head_k] weights; FFN is plain
 /// SwiGLU at full width.
 pub fn build_maincoder_forward(
@@ -35994,7 +35994,7 @@ pub struct PanguEmbedParams {
     pub norm_rms_eps: f32,
 }
 
-/// 对照 src/models/pangu-embed.cpp:58-162. The FFN passes
+/// verify against src/models/pangu-embed.cpp:58-162. The FFN passes
 /// `model.layers[il].ffn_up_b` etc. (:126-128) but the loader never creates
 /// those tensors — the C reads nullptrs, so no FFN bias exists (the
 /// `output_b` of :154-156 is the same nullptr). Only wo_b is real.
@@ -36126,7 +36126,7 @@ pub struct CogvlmParams {
     pub norm_rms_eps: f32,
 }
 
-/// 对照 src/models/cogvlm.cpp:53-158. The QKV split views the fused tensor
+/// verify against src/models/cogvlm.cpp:53-158. The QKV split views the fused tensor
 /// with the **plain** `ggml_rope` (not rope_ext — :115-116: default
 /// freq_base 10000 / freq_scale 1 / no yarn), and the layer weights are
 /// picked per batch: `is_text = ubatch.token != nullptr` (:73-77) — the
@@ -36304,7 +36304,7 @@ pub struct Spark25Params {
     pub freq_scale: Vec<f32>,
 }
 
-/// 对照 src/models/spark2-5.cpp:56-146. SDPA runs with NO wo; the gate is
+/// verify against src/models/spark2-5.cpp:56-146. SDPA runs with NO wo; the gate is
 /// `sigmoid(wqkv_gate @ attn_inp)` [n_head, T], multiplied head-wise
 /// (attn [hd, n_head, T] × gate [1, n_head, T], :97-105), THEN wo. FFN is
 /// GELU-parallel; iswa cache pair (build_attn_inp_kv_iswa, :64).
@@ -36459,7 +36459,7 @@ pub struct MuseGlimmerParams {
     pub final_logit_softcapping: f32,
 }
 
-/// 对照 src/models/muse-glimmer.cpp:57-199. The embedding runs a weightless
+/// verify against src/models/muse-glimmer.cpp:57-199. The embedding runs a weightless
 /// RMS norm first (:69); per layer: pre-norm → QKV → QK-norm → rope ONLY on
 /// the SWA layers (:112-124) → SDPA (no wo) → sigmoid(wide gate)·attn → wo →
 /// post-norm at eps 1e-8 (:141-143) → residual → pre-FFN norm → SwiGLU →
@@ -36646,7 +36646,7 @@ pub struct LladaParams {
     pub norm_rms_eps: f32,
 }
 
-/// 对照 src/models/llada.cpp:66-153. hparams.causal_attn = false (:16) +
+/// verify against src/models/llada.cpp:66-153. hparams.causal_attn = false (:16) +
 /// build_attn_inp_no_cache (:82) — the same non-causal [T, T] mask family
 /// dream/rnd1 run. The FFN bias tensors are loaded (NOT_REQUIRED) but the
 /// graph's build_ffn call passes nullptrs (:124-128), so they stay unused.
@@ -36783,7 +36783,7 @@ pub struct PlmParams {
     pub kv_lora_rank: i64,
 }
 
-/// 对照 src/models/plm.cpp:48-206. The K rows are the concat of the
+/// verify against src/models/plm.cpp:48-206. The K rows are the concat of the
 /// per-head k_nope and the shared roped k_pe repeated over heads
 /// (:155-157); V is the decompressed [n_embd_head_v*n_head, T] 2D view —
 /// reshaped to the [hd, n_head, T] layout the cache scatter expects (same
@@ -36988,7 +36988,7 @@ pub struct HunyuanVlParams {
     pub rope_sections: [i32; 4],
 }
 
-/// 对照 src/models/hunyuan-vl.cpp:60-191. Q/K run rope FIRST (ext or multi
+/// verify against src/models/hunyuan-vl.cpp:60-191. Q/K run rope FIRST (ext or multi
 /// by use_mrope, with the resolved rope factors) and the Q/K RMS norms run
 /// AFTER the rope (:134-142). The XDRoPE alpha re-basing of
 /// rope_freq_base_train happens at hparams-load (meta.rs, :8-12).
@@ -37196,7 +37196,7 @@ pub struct GraniteSwaParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/granite-swa.cpp:121-319 — build_attention_layer (:200-239)
+/// verify against src/models/granite-swa.cpp:121-319 — build_attention_layer (:200-239)
 /// + build_layer_ffn (:241-319). The granite scales ride the embedding /
 /// residual / logits; the attention carries the per-layer sinks (:236) over
 /// the iswa pair; the FFN is the dense SwiGLU or the softmax MoE (+ the
@@ -37436,7 +37436,7 @@ pub struct AfmoeParams {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/afmoe.cpp:107-283. MuP: the embeddings scale by
+/// verify against src/models/afmoe.cpp:107-283. MuP: the embeddings scale by
 /// sqrt(n_embd) (:118); per layer: pre-norm → QKV → QK-norm → rope when
 /// `(il+1) % n_no_rope_layer_step != 0` (:135-136 — the step is 0 for every
 /// real file, so NoPE) → SDPA (no wo) → sigmoid(gate)·attn → wo → post-norm
@@ -37646,7 +37646,7 @@ pub struct MellumParams {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/mellum.cpp:74-216. Every layer is MoE (softmax, norm_w =
+/// verify against src/models/mellum.cpp:74-216. Every layer is MoE (softmax, norm_w =
 /// true); the SWA layers rope with `freq_scale = 1.0, ext_factor = 0.0,
 /// attn_factor = 1.0` (:126-136 — the no-yarn plain rope) while the
 /// full-attention layers keep the global pair (:138-149).
@@ -37810,7 +37810,7 @@ pub struct PaddleOcrParams {
     pub rope_sections: [i32; 4],
 }
 
-/// 对照 src/models/paddleocr.cpp:7-107 — the qwen2vl text-side graph (the
+/// verify against src/models/paddleocr.cpp:7-107 — the qwen2vl text-side graph (the
 /// M-RoPE sections ride `ggml_rope_multi` with the same pos id in all 4
 /// blocks for text batches). NOTE the C gathers inp_out_ids at EVERY layer's
 /// end unconditionally (:65-69) — value-identical to the port's single
@@ -38054,7 +38054,7 @@ pub struct GemmaEmbeddingModelWeights {
     pub layers: Vec<GemmaEmbeddingLayerWeights>,
 }
 
-/// 对照 src/models/gemma-embedding.cpp:73-176 — encoder graph over
+/// verify against src/models/gemma-embedding.cpp:73-176 — encoder graph over
 /// `build_attn_inp_no_cache` (the [T, T] non-causal pair: the SWA layers
 /// read the symmetric-window mask). Q runs its RMS norm then rope then the
 /// `f_attention_scale` pre-scale (:107-124) with kq_scale = 1.0; the block
@@ -38170,7 +38170,7 @@ pub fn build_gemma_embedding_forward(
 // `res->t_embd` only)
 // ----------------------------------------------------------------------
 
-/// 对照 src/models/llama.cpp graph<embed=true> — the llama layer body over
+/// verify against src/models/llama.cpp graph<embed=true> — the llama layer body over
 /// the causal no-cache [T, T] mask; the rope runs like the decoder's
 /// (rope_ext, the resolved factors are None on plain files — see the module
 /// header's rope_factors note), and the result is the final-norm hidden
@@ -38265,7 +38265,7 @@ pub fn build_llama_embed_encoder(
 // ----------------------------------------------------------------------
 // hy-v3 — src/models/hy-v3.cpp:106-231 (the sigmoid-MoE Hunyuan trunk with
 // the shared expert + the routed bias; the MTP tensors load but graph_mtp is
-// the documented batch-15 skip, PARITY.md 批次 15)
+// the documented batch-15 skip, PARITY.md batch 15)
 // ----------------------------------------------------------------------
 
 pub struct HyV3LayerWeights {
@@ -38318,7 +38318,7 @@ pub struct HyV3Params {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/hy-v3.cpp:106-231. QK-norm BEFORE rope; sigmoid-gated MoE
+/// verify against src/models/hy-v3.cpp:106-231. QK-norm BEFORE rope; sigmoid-gated MoE
 /// with the expert-selection bias + the fused gate_up variant when the file
 /// carries it, plus the always-on shared expert. `res->t_h_nextn` is the
 /// POST-final-norm hidden (:211-217) — the port's `embd` (the MTP consumer's
@@ -38504,7 +38504,7 @@ pub struct Mimo2Params {
     pub expert_weights_scale: f32,
 }
 
-/// 对照 src/models/mimo2.cpp:91-256. The fused-qkv path splits the Q/K/V
+/// verify against src/models/mimo2.cpp:91-256. The fused-qkv path splits the Q/K/V
 /// thirds with the row_k/row_v strides (:129-137 — Q/K share head_dim_k, V
 /// uses head_dim_v); the optional sinks ride build_attn (:170-174); the
 /// attn output scales by f_attn_value_scale AFTER wo (:177-180); the FFN is
@@ -38691,7 +38691,7 @@ pub fn build_mimo2_forward(
 // step35 — src/models/step35.cpp:191-365 (iswa MoE with the halved
 // full-attention rope dims, the optional Q/K norms and the optional
 // per-head attention gate; MTP tensors load, graph_mtp is the documented
-// batch-15 skip, PARITY.md 批次 15)
+// batch-15 skip, PARITY.md batch 15)
 // ----------------------------------------------------------------------
 
 pub struct Step35LayerWeights {
@@ -38752,7 +38752,7 @@ pub struct Step35Params {
     pub expert_gating_func: i32,
 }
 
-/// 对照 src/models/step35.cpp:191-365. build_qkv runs with `reshape ==
+/// verify against src/models/step35.cpp:191-365. build_qkv runs with `reshape ==
 /// false` and the graph reshapes itself (:229-231 — same values as the
 /// port's fused/separate helpers); Q/K norms are optional (:234-241); the
 /// rope is per-layer `n_rot_l` with the freqs factors only on the
@@ -39291,7 +39291,7 @@ fn hy_v4_attn_mla(
     ctx.cont_2d(kqv, ne[0] * ne[1], ne[2] * ne[3])
 }
 
-/// 对照 src/models/hy-v4.cpp:497-601 `graph::graph`. The embedding expands
+/// verify against src/models/hy-v4.cpp:497-601 `graph::graph`. The embedding expands
 /// to hc parallel residual streams (:517-519); each block runs the iHC
 /// pre-reduce → norm → (gated, sinked, optionally DSA-indexed) MLA → iHC
 /// post-distribute round trip, twice (attention + FFN); the streams collapse
@@ -39816,7 +39816,7 @@ pub struct WavtokenizerDecResult {
     pub graph: Graph,
 }
 
-/// 对照 src/models/wavtokenizer-dec.cpp:118-264
+/// verify against src/models/wavtokenizer-dec.cpp:118-264
 /// `llama_model_wavtokenizer_dec::graph::graph` — token embeddings →
 /// transposed T-first stem conv → posnet (4×resnet / 1×attention /
 /// 1×groupnorm) → convnext stack with GELU-seq FFN → lm_head + bias.
@@ -40002,7 +40002,7 @@ pub struct PocketttsModelWeights {
     pub layers: Vec<PocketttsLayerWeights>,
 }
 
-/// 对照 src/models/pockettts.cpp:48-146
+/// verify against src/models/pockettts.cpp:48-146
 /// `llama_model_pockettts::graph::graph` — LayerNorm attention blocks with
 /// rope NORM and a GELU-seq FFN, the last layer pruning to `inp_out_ids`
 /// (:98-101), `res->t_embd` the final-norm hidden state (:137-138) and the
@@ -40227,7 +40227,7 @@ pub struct Qwen35MtpWeights {
     pub n_rot: i32,
 }
 
-/// 对照 src/models/qwen35.cpp:519-644 — the dense-series MTP head. The
+/// verify against src/models/qwen35.cpp:519-644 — the dense-series MTP head. The
 /// attention (:563-613) is the trunk `build_layer_attn` shape (the Q
 /// projection carries a per-head sigmoid gate, IMRoPE via rope_multi with the
 /// hparams sections, kq_scale from f_attention_scale); the FFN (:615-624) is
@@ -40346,7 +40346,7 @@ pub struct Qwen35MoeMtpWeights {
     pub n_rot: i32,
 }
 
-/// 对照 src/models/qwen35moe.cpp:551-741 — identical to the qwen35 head
+/// verify against src/models/qwen35moe.cpp:551-741 — identical to the qwen35 head
 /// through the attention (rope_multi + the per-head Q gate), then the trunk
 /// `build_layer_ffn` shape (:695-726): the softmax MoE plus the shared expert
 /// gated by `sigmoid(ffn_gate_inp_shexp @ cur)`.
@@ -40456,7 +40456,7 @@ pub struct Qwen3NextMtpWeights {
     pub n_embd_head: i64,
 }
 
-/// 对照 src/models/qwen3next.cpp:628-822. Three deltas vs the qwen35moe head:
+/// verify against src/models/qwen3next.cpp:628-822. Three deltas vs the qwen35moe head:
 ///   * plain `ggml_rope_ext` (no sections, :704-709);
 ///   * the gate view is taken AFTER the attention and made contiguous
 ///     (:711-716 — same values, the cont the CUDA TODO asks for);
@@ -40571,7 +40571,7 @@ pub struct Glm4MoeMtpWeights {
     pub layer: Glm4MoeLayerWeights,
 }
 
-/// 对照 src/models/glm4-moe.cpp:132-289 — the eh_proj trio → the trunk block
+/// verify against src/models/glm4-moe.cpp:132-289 — the eh_proj trio → the trunk block
 /// (QKV with optional per-head Q/K norms, plain rope, wo INSIDE build_attn,
 /// attn_post_norm as the FFN norm, the routed+shared MoE) → the shared head.
 /// `nextn_layer_offset` is asserted 0-able at the driver (single block,
@@ -40701,7 +40701,7 @@ pub struct Cohere2MoeMtpWeights {
     pub layer: Cohere2MoeLayerWeights,
 }
 
-/// 对照 src/models/cohere2moe.cpp:291-439 — the cohere2 skeleton: the normed
+/// verify against src/models/cohere2moe.cpp:291-439 — the cohere2 skeleton: the normed
 /// attn output feeds the FFN (not the residual), rope on this layer per
 /// get_rope_factors (the port passes None — no rope_freqs tensor, the same
 /// convention as the trunk), the shared expert added then scaled 0.5, the
@@ -40836,7 +40836,7 @@ pub struct BailingMoe3MtpWeights {
     pub layer: BailingMoe3LayerWeights,
 }
 
-/// 对照 src/models/bailingmoe3.cpp:412-617. Deltas vs the GLM4 skeleton:
+/// verify against src/models/bailingmoe3.cpp:412-617. Deltas vs the GLM4 skeleton:
 ///   * `llm_graph_input_embd` with **model.tok_embd** (no nextn.embed_tokens
 ///     fallback — the loader has none) and a plain mul_mat eh_proj (:444-452);
 ///   * the gated-MLA attention of the trunk (:455-508 — wq_a path, rope on the
@@ -41044,7 +41044,7 @@ pub struct HyV3MtpWeights {
     pub layer: HyV3LayerWeights,
 }
 
-/// 对照 src/models/hy-v3.cpp:239-390 — the eh_proj trio → a full hy_v3
+/// verify against src/models/hy-v3.cpp:239-390 — the eh_proj trio → a full hy_v3
 /// decoder layer (QK-norm BEFORE rope, `build_attn` with wo inside, dense or
 /// sigmoid-MoE+shexp FFN) → the final norm (the vLLM final_layernorm
 /// semantics — the POST-norm state seeds the next step) → the shared head.
@@ -41187,7 +41187,7 @@ pub struct Mimo2MtpWeights {
     pub freq_scale: f32,
 }
 
-/// 对照 src/models/mimo2.cpp:261-396 — the fused-qkv split (wqkv REQUIRED,
+/// verify against src/models/mimo2.cpp:261-396 — the fused-qkv split (wqkv REQUIRED,
 /// :276), the sinks riding build_attn (:344-347), the value scale after wo
 /// (:349-352), the REQUIRED dense FFN (:356-368) and the **gathered**
 /// h_nextn: `inp_out_ids` gathers BEFORE the head norm (:370-374), and the
@@ -41303,7 +41303,7 @@ pub struct Step35MtpWeights {
     pub freq_scale: f32,
 }
 
-/// 对照 src/models/step35.cpp:368-560 — the eh_proj trio → a full Step3p5
+/// verify against src/models/step35.cpp:368-560 — the eh_proj trio → a full Step3p5
 /// decoder layer (build_qkv with `reshape == false` + self-reshaped 3D, the
 /// optional Q/K norms, rope at n_rot_l with factors only on the full side,
 /// `build_attn` wo==nullptr, the optional sigmoid per-head gate, then wo),
@@ -41506,7 +41506,7 @@ pub struct T5CrossInputs {
     pub pos_bucket_dec: TensorId,
 }
 
-/// 对照 src/models/t5.cpp:110-262 — per decoder layer: rms attn_norm →
+/// verify against src/models/t5.cpp:110-262 — per decoder layer: rms attn_norm →
 /// self-attention (the causal relative-position bias over the KV cells, wo
 /// inside build_attn) → residual → rms attn_norm_cross → cross-attention over
 /// the encoder state (Q from the normed input, K/V from embd_enc, wo_cross
@@ -41700,7 +41700,7 @@ fn attn_kv_cached_bias(
 // same way, against parity/ref_dnet_ch_dump.c (GDA + KDA cases, bit-identical).
 // ===========================================================================
 
-/// 对照 src/models/delta-net-base.cpp:289-374 — the one-token delta rule:
+/// verify against src/models/delta-net-base.cpp:289-374 — the one-token delta rule:
 /// `s = exp(g)*s; sk = sum_rows(s*k); d = (v - sk^T)*b; s += repeat(k, s)*d^T;
 /// o = permute(sum_rows(s*q))`. All inputs/outputs follow the C shapes:
 /// q/k [S_k, H_k, 1, n_seqs], v [S_v, H_v, 1, n_seqs], g [1|S_v, H_v, 1, B],
@@ -41791,7 +41791,7 @@ fn dnet_get_slice_2d(ctx: &mut Context, t: TensorId, c: i64) -> TensorId {
     )
 }
 
-/// 对照 src/models/delta-net-base.cpp:17-287 `build_delta_net_chunking` —
+/// verify against src/models/delta-net-base.cpp:17-287 `build_delta_net_chunking` —
 /// the chunkwise (WY/UT-transform) delta rule: pad to a multiple of CS=64
 /// (GDA; 16 for the KDA g layout), build the intra-chunk decay masks from
 /// cumsum(g), solve `(I + tril(kβkᵀ))⁻¹ · (-tril(kβkᵀ))` per chunk
@@ -43025,7 +43025,7 @@ fn build_glm5_dsa_layer(
     out
 }
 
-/// 对照 src/models/glm5-next.cpp:549-682 `graph::graph` — the mHC residual
+/// verify against src/models/glm5-next.cpp:549-682 `graph::graph` — the mHC residual
 /// stream through KDA / k-pool DSA layers and the DeepSeek-style MoE, the
 /// hc_mean + output_norm head.
 #[allow(clippy::too_many_arguments)]
