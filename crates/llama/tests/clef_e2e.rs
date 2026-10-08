@@ -23,7 +23,7 @@ use llama::graph::AttnParams;
 use llama::model::{load_model, LlamaModel};
 use memmap2::Mmap;
 
-const VOCAB_SPM: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_VOCAB: i64 = 32000;
 const OUT: &str = "/tmp/clef-synth/clef-synth.gguf";
 const REF_BIN: &str = "parity/clef_scores_ref.bin";

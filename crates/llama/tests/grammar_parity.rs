@@ -1376,7 +1376,10 @@ fn reference_matcher_replay() {
 // ---------------------------------------------------------------------------
 
 fn qwen2_vocab_path() -> &'static str {
-    "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-qwen2.gguf"
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/tokenizer_fixtures/vocab/ggml-vocab-qwen2.gguf"
+    )
 }
 
 #[test]

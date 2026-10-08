@@ -79,9 +79,9 @@ use llama::model::{load_model, LlamaModel};
 // ---------------------------------------------------------------------------
 
 /// llama.cpp's own vocab fixtures (tokenizer KV, no tensors).
-const VOCAB_GPT2: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-gpt-2.gguf";
-const VOCAB_SPM: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
-const VOCAB_PHI3: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-phi-3.gguf";
+const VOCAB_GPT2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-gpt-2.gguf");
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
+const VOCAB_PHI3: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-phi-3.gguf");
 
 /// Where the synthetic files live (also what the parity runs point at).
 const OUT_DIR: &str = "/tmp/arch-batch";

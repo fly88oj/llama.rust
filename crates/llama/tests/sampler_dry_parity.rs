@@ -17,7 +17,7 @@ use llama::sampling::{
 };
 use llama::vocab::Vocab;
 
-const VOCAB_PATH: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-qwen2.gguf";
+const VOCAB_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-qwen2.gguf");
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../parity/sampler_dry_ref.txt"

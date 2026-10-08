@@ -25,7 +25,7 @@ use llama::clip::{clip_init_from_file, ClipContextParams, ClipModality, Projecto
 use llama::mtmd::{MtmdChunk, MtmdContext, MtmdContextParams};
 use llama::vocab::Vocab;
 
-const VOCAB_SPM: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 
 const OUT_DIR: &str = "/tmp/mtmd-audio-synth";
 const N_MEL: i64 = 80;

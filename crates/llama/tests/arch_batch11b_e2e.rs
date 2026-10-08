@@ -53,7 +53,7 @@ use llama::graph::AttnParams;
 use llama::graph_arch;
 use llama::model::{load_model, LlamaModel};
 
-const VOCAB_SPM: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_VOCAB: i64 = 32000;
 const OUT_DIR: &str = "/tmp/arch-batch11b";
 

@@ -27,7 +27,7 @@ use llama::clip::{
 use llama::mtmd::{MtmdChunk, MtmdContext, MtmdContextParams};
 use llama::vocab::Vocab;
 
-const VOCAB_SPM: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 
 const OUT_DIR: &str = "/tmp/mtmd-audio-synth";
 /// must match the text model used by parity/audio_mtmd_parity3.sh

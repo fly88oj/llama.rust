@@ -49,7 +49,7 @@ use llama::model::{load_model, LlamaModel};
 /// of this batch reads it fine: the reference's pre-tokenizer selection has no
 /// arch-dependent default for any of the eight (`llama-vocab.cpp` switches on
 /// the arch only for the bpe/spm *model* key, which the fixture carries).
-const VOCAB_SPM: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_VOCAB: i64 = 32000;
 
 /// Where the synthetic files live (also what the parity runs point at).

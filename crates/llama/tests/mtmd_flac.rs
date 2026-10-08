@@ -204,7 +204,8 @@ fn flac_decode_bit_exact_and_loud_errors() {
 
         let mmproj = "/tmp/mtmd-audio-synth/mmproj-audio-synth-gemma4ua.gguf";
         const VOCAB_SPM: &str =
-            "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+            concat!(env!("CARGO_MANIFEST_DIR"),
+            "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
         if std::fs::read(mmproj).is_err() || std::fs::read(VOCAB_SPM).is_err() {
             eprintln!("gemma4ua mmproj or vocab missing — skipping embedding dumps");
             return;
