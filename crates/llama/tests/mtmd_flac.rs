@@ -203,16 +203,14 @@ fn flac_decode_bit_exact_and_loud_errors() {
         use llama::vocab::Vocab;
 
         let mmproj = "/tmp/mtmd-audio-synth/mmproj-audio-synth-gemma4ua.gguf";
-        /// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-        #[allow(non_snake_case)]
-        fn VOCAB_SPM() -> &'static str {
-            crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-        }
-        if std::fs::read(mmproj).is_err() || std::fs::read(VOCAB_SPM()).is_err() {
+        const VOCAB_SPM: &str =
+            concat!(env!("CARGO_MANIFEST_DIR"),
+            "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
+        if std::fs::read(mmproj).is_err() || std::fs::read(VOCAB_SPM).is_err() {
             eprintln!("gemma4ua mmproj or vocab missing — skipping embedding dumps");
             return;
         }
-        let vgguf = Gguf::open(VOCAB_SPM()).expect("vocab fixture");
+        let vgguf = Gguf::open(VOCAB_SPM).expect("vocab fixture");
         let vocab = Vocab::load(&vgguf).expect("vocab");
         let mut mctx = MtmdContext::init_from_file(
             mmproj,
@@ -246,14 +244,4 @@ fn flac_decode_bit_exact_and_loud_errors() {
             eprintln!("{tag}: dumped {} embedding values", embd.len());
         }
     }
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

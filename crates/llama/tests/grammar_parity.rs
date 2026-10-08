@@ -1376,7 +1376,10 @@ fn reference_matcher_replay() {
 // ---------------------------------------------------------------------------
 
 fn qwen2_vocab_path() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-qwen2.gguf")
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/tokenizer_fixtures/vocab/ggml-vocab-qwen2.gguf"
+    )
 }
 
 #[test]
@@ -1808,14 +1811,4 @@ fn parser_print_round_trip() {
         "parser print round-trip: {} hand-written cases + {checked} artifact grammars re-parse identically",
         cases.len()
     );
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

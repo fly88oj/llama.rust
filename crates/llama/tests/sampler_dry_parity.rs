@@ -17,11 +17,7 @@ use llama::sampling::{
 };
 use llama::vocab::Vocab;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-qwen2.gguf
-#[allow(non_snake_case)]
-fn VOCAB_PATH() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-qwen2.gguf")
-}
+const VOCAB_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-qwen2.gguf");
 const FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../parity/sampler_dry_ref.txt"
@@ -62,10 +58,10 @@ fn dry_adaptive_infill_parity() {
         return;
     }
 
-    let gguf = match ggml::Gguf::open(VOCAB_PATH()) {
+    let gguf = match ggml::Gguf::open(VOCAB_PATH) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("SKIP: cannot open {}: {}", VOCAB_PATH(), e);
+            eprintln!("SKIP: cannot open {VOCAB_PATH}: {e}");
             return;
         }
     };
@@ -654,14 +650,4 @@ fn dry_testing_and_disabled_paths() {
     cur2.data[1].id = 2;
     s.apply(&mut cur2);
     assert_eq!(cur2.data[0].logit, 0.5); // no history -> no penalty
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

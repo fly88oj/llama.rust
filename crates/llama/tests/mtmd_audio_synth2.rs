@@ -21,11 +21,7 @@ use llama::clip::{
 use llama::mtmd::{MtmdChunk, MtmdContext, MtmdContextParams};
 use llama::vocab::Vocab;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 
 const OUT_DIR: &str = "/tmp/mtmd-audio-synth";
 /// must match the text model used by parity/audio_mtmd_parity2.sh
@@ -757,7 +753,7 @@ fn run_synthetic_arch(arch: &str, proj: ProjectorType) -> (u32, Vec<f32>, Vec<f3
     assert_eq!(clip.n_mmproj_embd() as i64, want_embd);
 
     // ---- 2. mtmd audio path -------------------------------------------------
-    let vgguf = Gguf::open(VOCAB_SPM()).expect("vocab fixture");
+    let vgguf = Gguf::open(VOCAB_SPM).expect("vocab fixture");
     let vocab = Vocab::load(&vgguf).expect("vocab");
     let mut mctx = MtmdContext::init_from_file(
         &path,
@@ -948,14 +944,4 @@ fn mp3_flac_fail_loudly() {
     assert!(!llama::mtmd::is_mp3_file(b"RIFFxxxxWAVE"));
     assert!(llama::mtmd::is_flac_file(b"fLaC++++"));
     assert!(!llama::mtmd::is_flac_file(b"RIFFxxxxWAVE"));
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

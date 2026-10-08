@@ -23,11 +23,7 @@ use llama::graph::AttnParams;
 use llama::model::{load_model, LlamaModel};
 use memmap2::Mmap;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_VOCAB: i64 = 32000;
 const OUT: &str = "/tmp/clef-synth/clef-synth.gguf";
 const REF_BIN: &str = "parity/clef_scores_ref.bin";
@@ -185,7 +181,7 @@ fn build_file(path: &str) {
         std::fs::create_dir_all(dir).expect("mkdir");
     }
 
-    let src = Gguf::open(VOCAB_SPM()).expect("open vocab fixture");
+    let src = Gguf::open(VOCAB_SPM).expect("open vocab fixture");
     let mut w = GgufWriter::new(32);
     for (k, val) in &src.kv {
         if k.starts_with("tokenizer.") && k != "tokenizer.chat_template" {
@@ -411,14 +407,4 @@ fn clef_synth_smoke() {
     assert_eq!(scores.len(), 12);
     assert!(scores.iter().all(|s| s.is_finite()), "all scores finite");
     assert!(scores[0] != scores[1], "the two options differ");
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

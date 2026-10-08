@@ -42,11 +42,7 @@ use llama::kv_cache::{KvCache, SlotInfo};
 use llama::model::{load_model, LlamaModel};
 use llama::vocab::Vocab;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_VOCAB: i64 = 32000;
 const OUT_DIR: &str = "/tmp/arch-batch5";
 const N_EXPERT: i64 = 4;
@@ -731,7 +727,7 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 fn build_file(spec: &SynthSpec) -> (usize, u64) {
     std::fs::create_dir_all(OUT_DIR).expect("mkdir /tmp/arch-batch5");
 
-    let src = Gguf::open(VOCAB_SPM()).expect("open vocab fixture");
+    let src = Gguf::open(VOCAB_SPM).expect("open vocab fixture");
     let mut w = GgufWriter::new(32);
     for (k, v) in &src.kv {
         if k.starts_with("tokenizer.") && k != "tokenizer.chat_template" {
@@ -1796,14 +1792,4 @@ fn arch5_cli_driver() {
         cur_pos += 1;
     }
     println!("gen tokens: {:?}", out_tokens);
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

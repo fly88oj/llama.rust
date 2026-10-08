@@ -55,11 +55,7 @@ use llama::mtmd::{
 };
 use llama::vocab::Vocab;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const SPM_N_VOCAB: i64 = 32000;
 const OUT_DIR: &str = "/tmp/tts2-pipe";
 const SEED: u32 = 42;
@@ -498,7 +494,7 @@ impl Rng {
 /// tokens / scores / token_type arrays extended in lockstep so both loaders'
 /// `n_tokens == scores.size()` checks hold (llama-vocab.cpp:3020-3044).
 fn start_trunk_writer(name: &str) -> GgufWriter {
-    let src = Gguf::open(VOCAB_SPM()).expect("open vocab fixture");
+    let src = Gguf::open(VOCAB_SPM).expect("open vocab fixture");
     let mut w = GgufWriter::new(32);
     for (k, val) in &src.kv {
         if !k.starts_with("tokenizer.") || k == "tokenizer.chat_template" {
@@ -1285,14 +1281,4 @@ fn gen_talker_embd_rows_match_token_path() {
 fn file_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

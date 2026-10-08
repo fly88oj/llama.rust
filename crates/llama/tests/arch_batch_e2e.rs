@@ -79,21 +79,9 @@ use llama::model::{load_model, LlamaModel};
 // ---------------------------------------------------------------------------
 
 /// llama.cpp's own vocab fixtures (tokenizer KV, no tensors).
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-gpt-2.gguf
-#[allow(non_snake_case)]
-fn VOCAB_GPT2() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-gpt-2.gguf")
-}
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-phi-3.gguf
-#[allow(non_snake_case)]
-fn VOCAB_PHI3() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-phi-3.gguf")
-}
+const VOCAB_GPT2: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-gpt-2.gguf");
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
+const VOCAB_PHI3: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-phi-3.gguf");
 
 /// Where the synthetic files live (also what the parity runs point at).
 const OUT_DIR: &str = "/tmp/arch-batch";
@@ -159,7 +147,7 @@ fn spec_gpt2() -> SynthSpec {
     SynthSpec {
         arch: "gpt2",
         suffix: "",
-        vocab_src: VOCAB_GPT2(),
+        vocab_src: VOCAB_GPT2,
         n_layer: 2,
         n_embd: 64,
         n_head: 4,
@@ -179,7 +167,7 @@ fn spec_phi2() -> SynthSpec {
     SynthSpec {
         arch: "phi2",
         suffix: "",
-        vocab_src: VOCAB_PHI3(),
+        vocab_src: VOCAB_PHI3,
         n_layer: 2,
         n_embd: 64,
         n_head: 4,
@@ -199,7 +187,7 @@ fn spec_starcoder2() -> SynthSpec {
     SynthSpec {
         arch: "starcoder2",
         suffix: "",
-        vocab_src: VOCAB_SPM(),
+        vocab_src: VOCAB_SPM,
         n_layer: 2,
         n_embd: 64,
         n_head: 4,
@@ -221,7 +209,7 @@ fn spec_command_r() -> SynthSpec {
     SynthSpec {
         arch: "command-r",
         suffix: "",
-        vocab_src: VOCAB_SPM(),
+        vocab_src: VOCAB_SPM,
         n_layer: 64,
         n_embd: 64,
         n_head: 4,
@@ -242,7 +230,7 @@ fn spec_gptneox() -> SynthSpec {
     SynthSpec {
         arch: "gptneox",
         suffix: "",
-        vocab_src: VOCAB_SPM(),
+        vocab_src: VOCAB_SPM,
         n_layer: 2,
         n_embd: 64,
         n_head: 4,
@@ -263,7 +251,7 @@ fn spec_olmo2() -> SynthSpec {
     SynthSpec {
         arch: "olmo2",
         suffix: "",
-        vocab_src: VOCAB_SPM(),
+        vocab_src: VOCAB_SPM,
         n_layer: 2,
         n_embd: 64,
         n_head: 4,
@@ -1428,14 +1416,4 @@ fn synth_metadata_roundtrip() {
     );
     // the fixture's own arch keys must NOT travel into an arch file
     assert_eq!(g.get_u32("gpt2.attention.head_count"), Some(4));
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

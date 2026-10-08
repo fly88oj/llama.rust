@@ -18,11 +18,7 @@ use ggml::{Gguf, GgufType, Value};
 use llama::arch::LlmArch;
 use llama::model::load_model;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const OUT_DIR: &str = "/tmp/syncm-glm5";
 
 // the synthetic geometry (loader-level; the graph never runs)
@@ -161,7 +157,7 @@ fn tensors_for(n_vocab: i64) -> Vec<(String, Vec<i64>, bool)> {
 fn build_file(path: &str) -> (usize, u64) {
     std::fs::create_dir_all(OUT_DIR).expect("mkdir /tmp/syncm-glm5");
 
-    let src = Gguf::open(VOCAB_SPM()).expect("open vocab fixture");
+    let src = Gguf::open(VOCAB_SPM).expect("open vocab fixture");
     let n_vocab = src.kv.iter()
         .find(|(k, _)| k == "tokenizer.ggml.tokens")
         .and_then(|(_, v)| v.as_array().map(|a| a.1.len()))
@@ -365,12 +361,3 @@ fn glm5_synth_loader_parity() {
     std::fs::remove_file(&path).ok();
 }
 
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
-}

@@ -44,11 +44,7 @@ use llama::speculative::{
 };
 use llama::vocab::Vocab;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_VOCAB: i64 = 32000;
 const OUT_DIR: &str = "/tmp/arch-eagle";
 
@@ -120,7 +116,7 @@ fn f32_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 fn start_writer(name: &str) -> GgufWriter {
-    let src = Gguf::open(VOCAB_SPM()).expect("open vocab fixture");
+    let src = Gguf::open(VOCAB_SPM).expect("open vocab fixture");
     let mut w = GgufWriter::new(32);
     for (k, val) in &src.kv {
         if k.starts_with("tokenizer.") && k != "tokenizer.chat_template" {
