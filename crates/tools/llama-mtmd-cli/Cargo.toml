@@ -1,0 +1,15 @@
+[package]
+name = "llama-mtmd-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llama-mtmd-cli"
+path = "src/main.rs"
+
+[dependencies]
+ggml = { path = "../../ggml" }
+llama = { path = "../../llama" }
+common = { path = "../../common" }
+memmap2 = { workspace = true }
