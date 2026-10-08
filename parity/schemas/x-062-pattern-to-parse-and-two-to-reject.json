@@ -1,0 +1,21 @@
+{
+ "type": "object",
+ "properties": {
+  "date": {
+   "type": "string",
+   "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
+  },
+  "time": {
+   "type": "string",
+   "pattern": "^[0-9]{2}:[0-9]{2}$"
+  },
+  "note": {
+   "type": "string"
+  }
+ },
+ "required": [
+  "date",
+  "time"
+ ],
+ "additionalProperties": false
+}

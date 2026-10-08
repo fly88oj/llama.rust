@@ -1,0 +1,5 @@
+llama-server: loading draft model '/tmp/arch-eagle/eagle3-synth-own.gguf'
+llama-server: draft: arch = eagle3, extract_layers = [1, 2, 3], n_embd = 64, target_hidden_size = 64
+llama-server: model loaded in 30.968451ms (n_ctx = 512, n_parallel = 4 -> slot n_ctx = 512, n_batch = 2048, n_ubatch = 512, threads = 8, fa = false, embeddings = false, pooling = none)
+llama-server: listening on http://127.0.0.1:8885
+slot print_timing: id  3 | task 1 | draft acceptance = 0.00000 (    0 accepted /    39 generated), mean len =  1.00

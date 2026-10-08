@@ -1,0 +1,6 @@
+model     /home/jeffrey/localai/models/t5-v1_1-xxl-encoder-Q5_K_S.gguf
+prompt    The quick brown fox jumps over the lazy dog
+n_tokens  1  n_embd_out 4096  n_rows 1  pooling 0
+tokens    0
+stats     n=4096 mean=0.000564164575 rms=0.0252636306 min=-0.117596231 max=1.16058242
+row[0]    -0.01119571 -0.001560209 -0.01802208 -0.01848187 0.01668961 -0.006137994 -0.007752128 0.0006636015

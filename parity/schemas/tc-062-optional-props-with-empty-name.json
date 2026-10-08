@@ -1,0 +1,7 @@
+{
+            "properties": {
+                "": {"type": "integer"},
+                "a": {"type": "integer"}
+            },
+            "additionalProperties": {"type": "integer"}
+        }

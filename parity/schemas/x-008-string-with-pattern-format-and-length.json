@@ -1,0 +1,7 @@
+{
+ "type": "string",
+ "pattern": "^[a-z]+$",
+ "format": "date",
+ "minLength": 2,
+ "maxLength": 4
+}

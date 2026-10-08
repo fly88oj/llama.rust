@@ -1,0 +1,6 @@
+model     /home/jeffrey/localai/models/t5-v1_1-xxl-encoder-Q5_K_S.gguf
+prompt    translate English to German: The quick brown fox jumps over the lazy dog
+n_tokens  17  n_embd_out 4096  n_rows 1  pooling 1
+tokens    13959 1566 12 2968 10 37 1704 4216 3 20400 4418 7 147 8 19743 1782 1
+stats     n=4096 mean=-0.000615368949 rms=0.047324655 min=-1.54931366 max=0.365908653
+row[0]    -0.0477204 0.002447913 -0.04826761 -0.04715541 0.02521241 0.0009843741 0.02127058 0.02480326

@@ -1,0 +1,572 @@
+[
+ {
+  "name": "format email is not supported",
+  "schema": { "type": "string", "format": "email" }
+ },
+ {
+  "name": "format byte is not supported",
+  "schema": { "type": "string", "format": "byte" }
+ },
+ {
+  "name": "format uuid1",
+  "schema": { "type": "string", "format": "uuid1" }
+ },
+ {
+  "name": "format uuid5",
+  "schema": { "type": "string", "format": "uuid5" }
+ },
+ {
+  "name": "format uuid6 is not supported",
+  "schema": { "type": "string", "format": "uuid6" }
+ },
+ {
+  "name": "format uuid on a non-string type",
+  "schema": { "type": "integer", "format": "date" }
+ },
+ {
+  "name": "format on an untyped schema",
+  "schema": { "format": "date-time" }
+ },
+ {
+  "name": "string with pattern, format and length",
+  "schema": { "type": "string", "pattern": "^[a-z]+$", "format": "date", "minLength": 2, "maxLength": 4 }
+ },
+ {
+  "name": "string with an empty pattern",
+  "schema": { "type": "string", "pattern": "" }
+ },
+ {
+  "name": "string with a single character pattern",
+  "schema": { "type": "string", "pattern": "a" }
+ },
+ {
+  "name": "string with minLength only",
+  "schema": { "type": "string", "minLength": 3 }
+ },
+ {
+  "name": "string with maxLength only",
+  "schema": { "type": "string", "maxLength": 3 }
+ },
+ {
+  "name": "integer with float bounds",
+  "schema": { "type": "integer", "minimum": -1.5, "maximum": 2.7 }
+ },
+ {
+  "name": "integer with exclusive float bounds",
+  "schema": { "type": "integer", "exclusiveMinimum": 0.5, "exclusiveMaximum": 10.5 }
+ },
+ {
+  "name": "integer with the full int64 range",
+  "schema": { "type": "integer", "minimum": -9223372036854775808, "maximum": 9223372036854775807 }
+ },
+ {
+  "name": "integer with a 19 digit minimum",
+  "schema": { "type": "integer", "minimum": 1000000000000000000 }
+ },
+ {
+  "name": "integer with a 19 digit minimum and a 19 digit maximum",
+  "schema": { "type": "integer", "minimum": 1000000000000000000, "maximum": 1999999999999999999 }
+ },
+ {
+  "name": "integer with a negative 18 digit range",
+  "schema": { "type": "integer", "minimum": -999999999999999999, "maximum": -1 }
+ },
+ {
+  "name": "integer with only a negative maximum",
+  "schema": { "type": "integer", "maximum": -1 }
+ },
+ {
+  "name": "integer with only a negative minimum",
+  "schema": { "type": "integer", "minimum": -1 }
+ },
+ {
+  "name": "integer with int64 min and max -1",
+  "schema": { "type": "integer", "minimum": -9223372036854775808, "maximum": -1 }
+ },
+ {
+  "name": "integer with multipleOf and minimum",
+  "schema": { "type": "integer", "minimum": 3, "multipleOf": 5 }
+ },
+ {
+  "name": "integer with min and max values across zero",
+  "schema": { "type": "integer", "minimum": -1, "maximum": 1 }
+ },
+ {
+  "name": "number with bounds ignores them",
+  "schema": { "type": "number", "minimum": 0, "maximum": 10 }
+ },
+ {
+  "name": "object with propertyNames minProperties and maxProperties",
+  "schema": {
+   "type": "object",
+   "properties": { "a": { "type": "string" } },
+   "required": ["a"],
+   "propertyNames": { "pattern": "^[a-z]+$" },
+   "minProperties": 1,
+   "maxProperties": 3,
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "object with an additionalProperties schema",
+  "schema": {
+   "type": "object",
+   "properties": { "a": { "type": "string" } },
+   "additionalProperties": { "type": "number" }
+  }
+ },
+ {
+  "name": "object with an additionalProperties schema and no properties",
+  "schema": { "type": "object", "additionalProperties": { "type": "string" } }
+ },
+ {
+  "name": "object with additionalProperties false and no properties",
+  "schema": { "type": "object", "additionalProperties": false }
+ },
+ {
+  "name": "nested objects and arrays",
+  "schema": {
+   "type": "object",
+   "properties": {
+    "list": {
+     "type": "array",
+     "items": {
+      "type": "object",
+      "properties": { "id": { "type": "integer", "minimum": 1 }, "tags": { "type": "array", "items": { "type": "string" }, "minItems": 1 } },
+      "required": ["id"],
+      "additionalProperties": false
+     },
+     "minItems": 0,
+     "maxItems": 2
+    }
+   },
+   "required": ["list"],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "typed array of tuples",
+  "schema": { "type": "array", "prefixItems": [{ "type": "string" }, { "type": "integer" }], "items": { "type": "boolean" } }
+ },
+ {
+  "name": "prefixItems without items",
+  "schema": { "type": "array", "prefixItems": [{ "type": "string" }, { "type": "object", "properties": { "a": { "type": "string" } }, "additionalProperties": false }] }
+ },
+ {
+  "name": "array with uniqueItems and contains",
+  "schema": { "type": "array", "items": { "type": "string" }, "uniqueItems": true, "contains": { "type": "string" }, "minItems": 1 }
+ },
+ {
+  "name": "array with min and max items around zero",
+  "schema": { "type": "array", "items": { "type": "integer" }, "minItems": 2, "maxItems": 4 }
+ },
+ {
+  "name": "enum with mixed value types",
+  "schema": { "enum": ["a", 1, true, null, 1.5, [1, 2], { "k": "v" }] }
+ },
+ {
+  "name": "const with a float",
+  "schema": { "const": 1.5 }
+ },
+ {
+  "name": "const with a large float",
+  "schema": { "const": 1.0e100 }
+ },
+ {
+  "name": "const with a small float",
+  "schema": { "const": 1.0e-7 }
+ },
+ {
+  "name": "const with an array",
+  "schema": { "const": [1, 2, { "a": "b" }] }
+ },
+ {
+  "name": "const with control characters",
+  "schema": { "const": "a\u0001b\tc\nd" }
+ },
+ {
+  "name": "type array with null",
+  "schema": { "type": ["string", "null"] }
+ },
+ {
+  "name": "type array with three types",
+  "schema": { "type": ["string", "integer"] }
+ },
+ {
+  "name": "type array with an object alternative",
+  "schema": { "type": ["object", "null"], "properties": { "a": { "type": "string" } }, "required": ["a"], "additionalProperties": false }
+ },
+ {
+  "name": "allOf merges property requirements",
+  "schema": {
+   "allOf": [
+    { "type": "object", "properties": { "a": { "type": "string" } } },
+    { "type": "object", "properties": { "b": { "type": "integer" } }, "required": ["b"] }
+   ]
+  }
+ },
+ {
+  "name": "allOf with a ref and an anyOf child",
+  "schema": {
+   "allOf": [
+    { "$ref": "#/$defs/base" },
+    { "type": "object", "properties": { "b": { "type": "integer" } } }
+   ],
+   "$defs": { "base": { "type": "object", "properties": { "a": { "type": "string" } }, "required": ["a"], "additionalProperties": false } }
+  }
+ },
+ {
+  "name": "allOf with anyOf alternatives",
+  "schema": {
+   "allOf": [
+    { "anyOf": [{ "type": "string" }, { "type": "integer" }] },
+    { "type": "object", "properties": { "a": { "type": "string" } }, "required": ["a"], "additionalProperties": false }
+   ]
+  }
+ },
+ {
+  "name": "definitions refs",
+  "schema": {
+   "$ref": "#/definitions/foo",
+   "definitions": {
+    "foo": { "type": "object", "properties": { "bar": { "$ref": "#/definitions/bar" } }, "required": ["bar"], "additionalProperties": false },
+    "bar": { "type": "string", "minLength": 1 }
+   }
+  }
+ },
+ {
+  "name": "recursive defs ref",
+  "schema": {
+   "$ref": "#/$defs/tree",
+   "$defs": {
+    "tree": {
+     "type": "object",
+     "properties": { "value": { "type": "integer" }, "kids": { "type": "array", "items": { "$ref": "#/$defs/tree" } } },
+     "required": ["value"],
+     "additionalProperties": false
+    }
+   }
+  }
+ },
+ {
+  "name": "ref to a scalar definition",
+  "schema": {
+   "type": "object",
+   "properties": { "when": { "$ref": "#/$defs/timestamp" }, "id": { "$ref": "#/$defs/timestamp" } },
+   "required": ["when"],
+   "additionalProperties": false,
+   "$defs": { "timestamp": { "type": "string", "format": "date-time" } }
+  }
+ },
+ {
+  "name": "description only is unconstrained",
+  "schema": { "description": "anything at all" }
+ },
+ {
+  "name": "untyped array with prefixItems",
+  "schema": { "prefixItems": [{ "type": "string" }] }
+ },
+ {
+  "name": "untyped object with properties",
+  "schema": { "properties": { "a": { "type": "string" } }, "required": ["a"], "additionalProperties": false }
+ },
+ {
+  "name": "boolean schema is a failure",
+  "schema": true
+ },
+ {
+  "name": "pattern with hex escapes in a character class",
+  "schema": { "type": "string", "pattern": "^[\\x41-\\x5A\\u00e9\\-\\]]+$" }
+ },
+ {
+  "name": "pattern with nested groups and quantifiers",
+  "schema": { "type": "string", "pattern": "^((a|b)(c?d{2,3}))*$" }
+ },
+ {
+  "name": "pattern with an anchor inside",
+  "schema": { "type": "string", "pattern": "^a$b$" }
+ },
+ {
+  "name": "pattern with a dot",
+  "schema": { "type": "string", "pattern": "^a.c$" }
+ },
+ {
+  "name": "pattern with an escaped dot",
+  "schema": { "type": "string", "pattern": "^a\\.c$" }
+ },
+ {
+  "name": "pattern with a repetition of a group",
+  "schema": { "type": "string", "pattern": "^(ab){2,3}$" }
+ },
+ {
+  "name": "pattern with an alternation",
+  "schema": { "type": "string", "pattern": "^(foo|bar|baz)$" }
+ },
+ {
+  "name": "pattern with a class and a star",
+  "schema": { "type": "string", "pattern": "^[a-z0-9_]*$" }
+ },
+ {
+  "name": "pattern with a non-capturing group and a plus",
+  "schema": { "type": "string", "pattern": "^(?:ab)+$" }
+ },
+ {
+  "name": "pattern to parse and two to reject",
+  "schema": {
+   "type": "object",
+   "properties": {
+    "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "time": { "type": "string", "pattern": "^[0-9]{2}:[0-9]{2}$" },
+    "note": { "type": "string" }
+   },
+   "required": ["date", "time"],
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "dotall pattern with dots",
+  "dotall": true,
+  "schema": { "type": "object", "properties": { "a": { "type": "string", "pattern": "^a.c$" }, "b": { "type": "string", "pattern": "^.*$" } }, "required": ["a"], "additionalProperties": false }
+ },
+ {
+  "name": "dotall pattern with classes",
+  "dotall": true,
+  "schema": { "type": "string", "pattern": "^[^abc]+$" }
+ },
+ {
+  "name": "dotall with a property pattern and a fallback",
+  "dotall": true,
+  "schema": { "type": "object", "properties": { "a": { "type": "string", "pattern": "^(?=a)a$" }, "b": { "type": "string", "pattern": "^b$" } }, "required": ["a"], "additionalProperties": false }
+ },
+ {
+  "name": "dotall with no patterns at all",
+  "dotall": true,
+  "schema": { "type": "integer", "minimum": 0, "maximum": 5 }
+ },
+ {
+  "name": "property names that sanitise to the same rule",
+  "schema": {
+   "type": "object",
+   "properties": { "a b": { "type": "string" }, "a-b": { "type": "number" }, "a.b": { "type": "boolean" } },
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "properties named after reserved rules",
+  "schema": {
+   "type": "object",
+   "properties": {
+    "array": { "type": "array", "items": { "type": "integer" } },
+    "object": { "type": "object" },
+    "root": { "type": "string" },
+    "string": { "type": "string" },
+    "value": { "type": "number" },
+    "space": { "type": "boolean" }
+   },
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "property names with quotes and non ascii",
+  "schema": {
+   "type": "object",
+   "properties": { "a\"b": { "type": "string" }, "a\\b": { "type": "integer" }, "日本": { "type": "boolean" }, "a\nb": { "type": "number" } },
+   "required": ["a\"b"],
+   "additionalProperties": { "type": "string" }
+  }
+ },
+ {
+  "name": "enum with non ascii and duplicate values",
+  "schema": { "enum": ["é", "é", "日", "", "a"] }
+ },
+ {
+  "name": "enum with a single value",
+  "schema": { "enum": ["only"] }
+ },
+ {
+  "name": "enum must not be empty",
+  "schema": { "enum": [] }
+ },
+ {
+  "name": "type must not be empty",
+  "schema": { "type": [] }
+ },
+ {
+  "name": "pattern with a repeated group reuses its sub rule",
+  "schema": { "type": "string", "pattern": "^((ab){2}(ab){3}){1,2}$" }
+ },
+ {
+  "name": "pattern with unicode escapes",
+  "schema": { "type": "string", "pattern": "^\\u00e9\\U0001F600$" }
+ },
+ {
+  "name": "pattern with a repeated alternation",
+  "schema": { "type": "string", "pattern": "^(a|b)*$" }
+ },
+ {
+  "name": "pattern with a double quantifier",
+  "schema": { "type": "string", "pattern": "^a**$" }
+ },
+ {
+  "name": "pattern with a stray closing bracket",
+  "schema": { "type": "string", "pattern": "^a]b$" }
+ },
+ {
+  "name": "pattern with an unclosed character class",
+  "schema": { "type": "string", "pattern": "^[abc$" }
+ },
+ {
+  "name": "pattern with a trailing backslash",
+  "schema": { "type": "string", "pattern": "^ab\\" }
+ },
+ {
+  "name": "pattern with too many curly values",
+  "schema": { "type": "string", "pattern": "^a{1,2,3}$" }
+ },
+ {
+  "name": "pattern with an open ended curly range",
+  "schema": { "type": "string", "pattern": "^a{2,}$" }
+ },
+ {
+  "name": "pattern with a zero repetition",
+  "schema": { "type": "string", "pattern": "^a{0}$" }
+ },
+ {
+  "name": "pattern with a single repetition",
+  "schema": { "type": "string", "pattern": "^a{1}$" }
+ },
+ {
+  "name": "pattern with an empty repetition",
+  "schema": { "type": "string", "pattern": "^a{,}$" }
+ },
+ {
+  "name": "pattern that repeats nothing",
+  "schema": { "type": "string", "pattern": "^*$" }
+ },
+ {
+  "name": "integer with minimum above maximum",
+  "schema": { "type": "integer", "minimum": 10, "maximum": 5 }
+ },
+ {
+  "name": "integer with exclusive bounds at the extremes",
+  "schema": { "type": "integer", "exclusiveMinimum": -1, "exclusiveMaximum": 1 }
+ },
+ {
+  "name": "oneOf alternatives",
+  "schema": { "oneOf": [{ "type": "string" }, { "type": "integer" }, { "type": "null" }] }
+ },
+ {
+  "name": "anyOf with a single alternative",
+  "schema": { "anyOf": [{ "type": "string", "minLength": 1 }] }
+ },
+ {
+  "name": "allOf of consts",
+  "schema": { "allOf": [{ "const": 1 }, { "const": 2 }] }
+ },
+ {
+  "name": "allOf with enum and object children",
+  "schema": {
+   "allOf": [
+    { "enum": ["a", "b"] },
+    { "type": "object", "properties": { "x": { "type": "string" } }, "required": ["x"], "additionalProperties": false }
+   ]
+  }
+ },
+ {
+  "name": "ignored keywords are ignored",
+  "schema": {
+   "type": "object",
+   "properties": { "a": { "type": "string" } },
+   "patternProperties": { "^x": { "type": "number" } },
+   "dependencies": { "a": ["b"] },
+   "if": { "properties": { "a": { "const": "x" } } },
+   "then": { "required": ["a"] },
+   "else": { "required": [] },
+   "additionalProperties": false
+  }
+ },
+ {
+  "name": "unresolvable ref pointer",
+  "schema": { "type": "object", "properties": { "a": { "$ref": "#/$defs/missing" } }, "$defs": { "other": { "type": "string" } } }
+ },
+ {
+  "name": "external ref is unsupported",
+  "schema": { "$ref": "https://example.com/schema.json" }
+ },
+ {
+  "name": "ref without the document prefix",
+  "schema": { "$ref": "#" }
+ },
+ {
+  "name": "empty tuple",
+  "schema": { "type": "array", "items": [] }
+ },
+ {
+  "name": "empty prefixItems with items",
+  "schema": { "type": "array", "prefixItems": [], "items": { "type": "string" } }
+ },
+ {
+  "name": "tuple with min and max items",
+  "schema": { "type": "array", "items": [{ "type": "integer" }], "minItems": 3, "maxItems": 5 }
+ },
+ {
+  "name": "array of arrays with min items",
+  "schema": { "type": "array", "items": { "type": "array", "items": { "type": "boolean" }, "minItems": 1 }, "minItems": 0 }
+ },
+ {
+  "name": "type array of integer and null with bounds",
+  "schema": { "type": ["integer", "null"], "minimum": 5 }
+ },
+ {
+  "name": "additionalProperties schema with no type",
+  "schema": { "additionalProperties": { "type": "boolean" } }
+ },
+ {
+  "name": "additionalProperties true is any object",
+  "schema": { "type": "object", "properties": { "a": { "type": "string" } }, "additionalProperties": true }
+ },
+ {
+  "name": "minLength with maxLength zero",
+  "schema": { "type": "string", "minLength": 0, "maxLength": 0 }
+ },
+ {
+  "name": "array with maxItems zero",
+  "schema": { "type": "array", "items": { "type": "integer" }, "maxItems": 0 }
+ },
+ {
+  "name": "array items with maxItems one",
+  "schema": { "type": "array", "items": { "type": "integer" }, "maxItems": 1 }
+ },
+ {
+  "name": "min and max items with a separator",
+  "schema": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 1 }
+ },
+ {
+  "name": "pattern with whitespace in the curly brackets",
+  "schema": { "type": "string", "pattern": "^a{ 2}$" }
+ },
+ {
+  "name": "pattern with an out of range curly value",
+  "schema": { "type": "string", "pattern": "^a{99999999999999}$" }
+ },
+ {
+  "name": "pattern with a negative curly value",
+  "schema": { "type": "string", "pattern": "^a{-1}$" }
+ },
+ {
+  "name": "exclusiveMinimum as a boolean is not a number",
+  "schema": { "type": "integer", "exclusiveMinimum": true }
+ },
+ {
+  "name": "minimum wins over a draft 4 exclusiveMinimum",
+  "schema": { "type": "integer", "minimum": 5, "exclusiveMinimum": true }
+ },
+ {
+  "name": "minimum must be a number",
+  "schema": { "type": "integer", "minimum": "5" }
+ },
+ {
+  "name": "maxLength must be a non-negative integer",
+  "schema": { "type": "string", "maxLength": -1 }
+ }
+]

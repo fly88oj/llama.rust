@@ -1,0 +1,10 @@
+{
+            "$ref": "#/$defs/node",
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {"next": {"$ref": "#/$defs/node"}, "leaf": {}},
+                    "additionalProperties": false
+                }
+            }
+        }

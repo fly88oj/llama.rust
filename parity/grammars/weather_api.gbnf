@@ -1,0 +1,7 @@
+# constrained tool-call style payload: tests alternation + repetition + escapes
+root        ::= "{\"tool\":" ws tool ws ",\"args\":" ws args ws "}"
+tool        ::= "\"get_" ("weather" | "forecast" | "time") "\""
+args        ::= "{" ws "\"city\":" ws string (ws "," ws "\"days\":" ws number)? ws "}"
+string      ::= "\"" [A-Za-z ]+ "\""
+number      ::= [1-9] [0-9]?
+ws          ::= [ \n]*

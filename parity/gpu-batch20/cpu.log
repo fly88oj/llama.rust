@@ -1,0 +1,2 @@
+llama-server: model loaded in 535.547388ms (n_ctx = 512, n_parallel = 4 -> slot n_ctx = 512, n_batch = 2048, n_ubatch = 512, threads = 8, fa = false, embeddings = false, pooling = none)
+llama-server: listening on http://127.0.0.1:8881

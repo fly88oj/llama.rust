@@ -1,0 +1,5 @@
+prompt tokens: [785, 6722, 315, 9625, 374]
+The capital of France is [prompt: 5 tokens in 17.315129ms = 288.8 t/s]
+ Paris. It is the largest city in Europe and the second largest in the world
+ [gen: 16 tokens in 0.3s = 57.4 t/s]
+gen tokens: [12095, 13, 1084, 374, 279, 7772, 3283, 304, 4505, 323, 279, 2086, 7772, 304, 279, 1879]

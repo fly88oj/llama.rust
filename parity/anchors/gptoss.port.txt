@@ -1,0 +1,8 @@
+prompt tokens: [976, 9029, 328, 10128, 382]
+The capital of France is [prompt: 5 tokens in 2.202510993s = 2.3 t/s]
+ Paris."
+    ]
+    # Process the documents
+    processed_docs = process_documents
+ [gen: 16 tokens in 0.7s = 24.0 t/s]
+gen tokens: [12650, 14396, 271, 10213, 271, 1069, 12482, 290, 13427, 198, 271, 23478, 125774, 314, 2273, 192800]

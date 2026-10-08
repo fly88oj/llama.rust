@@ -1,0 +1,21 @@
+{
+ "type": "object",
+ "properties": {
+  "when": {
+   "$ref": "#/$defs/timestamp"
+  },
+  "id": {
+   "$ref": "#/$defs/timestamp"
+  }
+ },
+ "required": [
+  "when"
+ ],
+ "additionalProperties": false,
+ "$defs": {
+  "timestamp": {
+   "type": "string",
+   "format": "date-time"
+  }
+ }
+}

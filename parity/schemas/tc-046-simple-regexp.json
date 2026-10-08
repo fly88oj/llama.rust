@@ -1,0 +1,4 @@
+{
+            "type": "string",
+            "pattern": "^abc?d*efg+(hij)?kl$"
+        }

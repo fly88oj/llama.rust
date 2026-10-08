@@ -1,0 +1,4 @@
+{
+            "type": ["array", "null"],
+            "prefixItems": { "type": "string" }
+        }

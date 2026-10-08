@@ -1,0 +1,23 @@
+{
+ "$ref": "#/$defs/tree",
+ "$defs": {
+  "tree": {
+   "type": "object",
+   "properties": {
+    "value": {
+     "type": "integer"
+    },
+    "kids": {
+     "type": "array",
+     "items": {
+      "$ref": "#/$defs/tree"
+     }
+    }
+   },
+   "required": [
+    "value"
+   ],
+   "additionalProperties": false
+  }
+ }
+}

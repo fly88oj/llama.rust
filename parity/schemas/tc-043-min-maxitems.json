@@ -1,0 +1,7 @@
+{
+            "items": {
+                "type": ["number", "integer"]
+            },
+            "minItems": 3,
+            "maxItems": 5
+        }

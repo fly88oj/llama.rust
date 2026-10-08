@@ -1,0 +1,759 @@
+[
+ {
+  "name": "min 0",
+  "schema": {
+   "type": "integer",
+   "minimum": 0
+  },
+  "passing": [
+   "0",
+   "10",
+   "12",
+   "10000"
+  ],
+  "failing": [
+   "-1",
+   "-10",
+   "-10000",
+   "-100000000000000000000000000000000",
+   "100000000000000000000000000000000",
+   "00",
+   "01",
+   "-0"
+  ]
+ },
+ {
+  "name": "min 2",
+  "schema": {
+   "type": "integer",
+   "minimum": 2
+  },
+  "passing": [
+   "2",
+   "3",
+   "4",
+   "10",
+   "20",
+   "1234567890000000"
+  ],
+  "failing": [
+   "0",
+   "1",
+   "-1",
+   "-100",
+   "0",
+   "1",
+   "01",
+   "02",
+   "12345678900000000"
+  ]
+ },
+ {
+  "name": "min 456",
+  "schema": {
+   "type": "integer",
+   "minimum": 456
+  },
+  "passing": [
+   "456",
+   "4560",
+   "457",
+   "460",
+   "500"
+  ],
+  "failing": [
+   "455",
+   "356",
+   "50",
+   "050",
+   "-1",
+   "-456"
+  ]
+ },
+ {
+  "name": "min -123",
+  "schema": {
+   "type": "integer",
+   "minimum": -123
+  },
+  "passing": [
+   "-123",
+   "-122",
+   "-11",
+   "-1",
+   "0",
+   "1",
+   "123",
+   "1234",
+   "2345"
+  ],
+  "failing": [
+   "-1234",
+   "-124"
+  ]
+ },
+ {
+  "name": "max 9999",
+  "schema": {
+   "type": "integer",
+   "maximum": 9999
+  },
+  "passing": [
+   "-99999",
+   "0",
+   "9999"
+  ],
+  "failing": [
+   "10000",
+   "99991"
+  ]
+ },
+ {
+  "name": "max -9999",
+  "schema": {
+   "type": "integer",
+   "maximum": -9999
+  },
+  "passing": [
+   "-10000",
+   "-9999"
+  ],
+  "failing": [
+   "-9998",
+   "0",
+   "9999"
+  ]
+ },
+ {
+  "name": "min 5 max 30",
+  "schema": {
+   "type": "integer",
+   "minimum": 5,
+   "maximum": 30
+  },
+  "passing": [
+   "5",
+   "10",
+   "30"
+  ],
+  "failing": [
+   "05",
+   "4",
+   "-1",
+   "31",
+   "123",
+   "0123"
+  ]
+ },
+ {
+  "name": "min 1 max 900719925474091",
+  "schema": {
+   "type": "integer",
+   "exclusiveMinimum": 0,
+   "maximum": 900719925474091
+  },
+  "passing": [
+   "1",
+   "2",
+   "10",
+   "900719925474090",
+   "900719925474091"
+  ],
+  "failing": [
+   "0",
+   "01",
+   "900719925474092",
+   "9007199254740910"
+  ]
+ },
+ {
+  "name": "min -1 max 1",
+  "schema": {
+   "type": "integer",
+   "minimum": -1,
+   "maximum": 1
+  },
+  "passing": [
+   "-1",
+   "0",
+   "1"
+  ],
+  "failing": [
+   "-11",
+   "-10",
+   "-2",
+   "2",
+   "10",
+   "11"
+  ]
+ },
+ {
+  "name": "min -123 max 42",
+  "schema": {
+   "type": "integer",
+   "minimum": -123,
+   "maximum": 42
+  },
+  "passing": [
+   "-123",
+   "-122",
+   "-13",
+   "-11",
+   "-2",
+   "-1",
+   "0",
+   "1",
+   "5",
+   "10",
+   "39",
+   "40",
+   "42"
+  ],
+  "failing": [
+   "-0123",
+   "-124",
+   "-1123",
+   "-200",
+   "43",
+   "123",
+   "0123"
+  ]
+ },
+ {
+  "name": "exclusive min / max",
+  "schema": {
+   "type": "integer",
+   "exclusiveMinimum": 0,
+   "exclusiveMaximum": 10000
+  },
+  "passing": [
+   "1",
+   "9999"
+  ],
+  "failing": [
+   "0",
+   "01",
+   "10000",
+   "99999"
+  ]
+ },
+ {
+  "name": "empty schema (any value)",
+  "schema": {},
+  "passing": [
+   "{}",
+   "{\"foo\": \"bar\"}",
+   "[]",
+   "null",
+   "\"\"",
+   "true"
+  ],
+  "failing": [
+   "",
+   "{\"foo\"}",
+   "foo"
+  ]
+ },
+ {
+  "name": "exotic formats (list)",
+  "schema": {
+   "items": [
+    {
+     "format": "date"
+    },
+    {
+     "format": "uuid"
+    },
+    {
+     "format": "time"
+    },
+    {
+     "format": "date-time"
+    }
+   ]
+  },
+  "passing": [
+   "[\"2012-04-23\", \"12345678-1234-1234-1234-1234567890ab\", \"18:25:43.511Z\", \"2012-04-23T18:25:43.511Z\"]"
+  ],
+  "failing": [
+   "[\"foo\", \"bar\"]",
+   "[\"12345678-1234-1234-1234-1234567890ab\"]"
+  ]
+ },
+ {
+  "name": "string",
+  "schema": {
+   "type": "string"
+  },
+  "passing": [
+   "\"foo\"",
+   "\"bar\"",
+   "\"\""
+  ],
+  "failing": [
+   "{}",
+   "\"foo\": \"bar\""
+  ]
+ },
+ {
+  "name": "string w/ min length 1",
+  "schema": {
+   "type": "string",
+   "minLength": 1
+  },
+  "passing": [
+   "\"foo\"",
+   "\"bar\""
+  ],
+  "failing": [
+   "\"\"",
+   "{}",
+   "\"foo\": \"bar\""
+  ]
+ },
+ {
+  "name": "string w/ min length 3",
+  "schema": {
+   "type": "string",
+   "minLength": 3
+  },
+  "passing": [
+   "\"foo\"",
+   "\"bar\"",
+   "\"foobar\""
+  ],
+  "failing": [
+   "\"\"",
+   "\"f\"",
+   "\"fo\""
+  ]
+ },
+ {
+  "name": "string w/ max length",
+  "schema": {
+   "type": "string",
+   "maxLength": 3
+  },
+  "passing": [
+   "\"foo\"",
+   "\"bar\"",
+   "\"\"",
+   "\"f\"",
+   "\"fo\""
+  ],
+  "failing": [
+   "\"foobar\""
+  ]
+ },
+ {
+  "name": "string w/ min & max length",
+  "schema": {
+   "type": "string",
+   "minLength": 1,
+   "maxLength": 4
+  },
+  "passing": [
+   "\"foo\"",
+   "\"bar\"",
+   "\"f\"",
+   "\"barf\""
+  ],
+  "failing": [
+   "\"\"",
+   "\"barfo\"",
+   "\"foobar\""
+  ]
+ },
+ {
+  "name": "boolean",
+  "schema": {
+   "type": "boolean"
+  },
+  "passing": [
+   "true",
+   "false"
+  ],
+  "failing": [
+   "\"\"",
+   "\"true\"",
+   "True",
+   "FALSE"
+  ]
+ },
+ {
+  "name": "integer",
+  "schema": {
+   "type": "integer"
+  },
+  "passing": [
+   "0",
+   "12345",
+   "1234567890123456"
+  ],
+  "failing": [
+   "",
+   "01",
+   "007",
+   "12345678901234567  "
+  ]
+ },
+ {
+  "name": "string const",
+  "schema": {
+   "const": "foo"
+  },
+  "passing": [
+   "\"foo\""
+  ],
+  "failing": [
+   "foo",
+   "\"bar\""
+  ]
+ },
+ {
+  "name": "non-string const",
+  "schema": {
+   "const": true
+  },
+  "passing": [
+   "true"
+  ],
+  "failing": [
+   "",
+   "foo",
+   "\"true\""
+  ]
+ },
+ {
+  "name": "non-string const",
+  "schema": {
+   "enum": [
+    "red",
+    "amber",
+    "green",
+    null,
+    42,
+    [
+     "foo"
+    ]
+   ]
+  },
+  "passing": [
+   "\"red\"",
+   "null",
+   "42",
+   "[\"foo\"]"
+  ],
+  "failing": [
+   "",
+   "420",
+   "true",
+   "foo"
+  ]
+ },
+ {
+  "name": "simple pattern",
+  "schema": {
+   "pattern": "^[a-zA-Z0-9_-]*$"
+  },
+  "passing": [
+   "\"\"",
+   "\"He_llo-12\""
+  ],
+  "failing": [
+   "\"!\"",
+   "\"Hello World\""
+  ]
+ },
+ {
+  "name": "pattern with escapes",
+  "schema": {
+   "pattern": "^a\\^\\$\\.\\[\\]\\(\\)\\|\\{\\}\\*\\+\\?b$"
+  },
+  "passing": [
+   "\"a^$.[]()|{}*+?b\""
+  ],
+  "failing": [
+   "\"ab\""
+  ]
+ },
+ {
+  "name": "",
+  "schema": {
+   "type": [
+    "array",
+    "null"
+   ],
+   "items": {
+    "type": "string"
+   }
+  },
+  "passing": [
+   "null",
+   "[]",
+   "[\"123\"]",
+   "[\"foo\", \"bar\"]"
+  ],
+  "failing": [
+   "",
+   "[123]",
+   "\"foo\"",
+   "[\"foo\", 42]"
+  ]
+ },
+ {
+  "name": "min+max items",
+  "schema": {
+   "items": {
+    "type": [
+     "number",
+     "integer"
+    ]
+   },
+   "minItems": 3,
+   "maxItems": 5
+  },
+  "passing": [
+   "[1, 2, 3]",
+   "[1, 2, 3, 4]",
+   "[1, 2, 3, 4, 5]"
+  ],
+  "failing": [
+   "[1, 2]",
+   "[1, 2, 3, 4, 5, 6]",
+   "1"
+  ]
+ },
+ {
+  "name": "object properties",
+  "schema": {
+   "type": "object",
+   "properties": {
+    "number": {
+     "type": "number"
+    },
+    "street_name": {
+     "type": "string"
+    },
+    "street_type": {
+     "enum": [
+      "Street",
+      "Avenue",
+      "Boulevard"
+     ]
+    }
+   }
+  },
+  "passing": [
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+   "{ \"street_name\": \"Pennsylvania\" }",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\" }",
+   "{}",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\" }"
+  ],
+  "failing": [
+   "{ \"number\": \"1600\", \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+   "{ \"street_name\": \"Pennsylvania\", \"number\": 1600 }",
+   "{ \"number\": \"1600\", \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\", \"direction\":\"NW\"}"
+  ]
+ },
+ {
+  "name": "additional properties can't override other properties",
+  "schema": {
+   "properties": {
+    "a": {
+     "type": "integer"
+    },
+    "b": {
+     "type": "integer"
+    }
+   },
+   "additionalProperties": true
+  },
+  "passing": [
+   "{\"a\": 42}",
+   "{\"c\": \"\"}",
+   "{\"a\": 42, \"c\": \"\"}",
+   "{\"a_\": \"\"}"
+  ],
+  "failing": [
+   "",
+   "{\"a\": \"\"}",
+   "{\"a\": \"\", \"b\": \"\"}"
+  ]
+ },
+ {
+  "name": "object properties, additionalProperties: true",
+  "schema": {
+   "type": "object",
+   "properties": {
+    "number": {
+     "type": "number"
+    },
+    "street_name": {
+     "type": "string"
+    },
+    "street_type": {
+     "enum": [
+      "Street",
+      "Avenue",
+      "Boulevard"
+     ]
+    }
+   },
+   "additionalProperties": true
+  },
+  "passing": [
+   "{}",
+   "{\"number\":1600,\"street_name\":\"Pennsylvania\",\"street_type\":\"Avenue\"}",
+   "{ \"street_name\": \"Pennsylvania\" }",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\" }",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\", \"direction\":\"NW\"}",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\" }"
+  ],
+  "failing": [
+   "{ \"number\": \"1600\", \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+   "{ \"street_name\": \"Pennsylvania\", \"number\": 1600, \"street_type\":\"Avenue\"}"
+  ]
+ },
+ {
+  "name": "required + optional props each in original order",
+  "schema": {
+   "type": "object",
+   "properties": {
+    "number": {
+     "type": "number"
+    },
+    "street_name": {
+     "type": "string"
+    },
+    "street_type": {
+     "enum": [
+      "Street",
+      "Avenue",
+      "Boulevard"
+     ]
+    }
+   },
+   "additionalProperties": false
+  },
+  "passing": [
+   "{ \"street_name\": \"Pennsylvania\" }",
+   "{ \"number\": 1600, \"street_type\":\"Avenue\"}",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\" }",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\":\"Avenue\"}",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\" }"
+  ],
+  "failing": [
+   "{ \"street_type\": \"Avenue\", \"number\": 1600 }",
+   "{ \"number\": 1600, \"street_name\": \"Pennsylvania\", \"street_type\": \"Avenue\", \"direction\": \"NW\" }"
+  ]
+ },
+ {
+  "name": "required + optional props each in original order",
+  "schema": {
+   "properties": {
+    "b": {
+     "type": "string"
+    },
+    "a": {
+     "type": "string"
+    },
+    "d": {
+     "type": "string"
+    },
+    "c": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "a",
+    "b"
+   ],
+   "additionalProperties": false
+  },
+  "passing": [
+   "{\"b\": \"foo\", \"a\": \"bar\"}",
+   "{\"b\":\"foo\",\"a\":\"bar\",\"d\":\"qux\"}",
+   "{\"b\":\"foo\", \"a\":\"bar\", \"d\":\"qux\", \"c\":\"baz\"}"
+  ],
+  "failing": [
+   "{\"a\": \"foo\", \"b\": \"bar\"}",
+   "{\"b\": \"bar\"}",
+   "{\"a\": \"foo\", \"c\": \"baz\"}",
+   "{\"a\":\"foo\", \"b\":\"bar\", \"c\":\"baz\", \"d\":\"qux\"}"
+  ]
+ },
+ {
+  "name": "required props",
+  "schema": {
+   "$schema": "https://json-schema.org/draft/2020-12/schema",
+   "$id": "https://example.com/product.schema.json",
+   "title": "Product",
+   "description": "A product from Acme's catalog",
+   "type": "object",
+   "properties": {
+    "productId": {
+     "description": "The unique identifier for a product",
+     "type": "integer"
+    },
+    "productName": {
+     "description": "Name of the product",
+     "type": "string"
+    },
+    "price": {
+     "description": "The price of the product",
+     "type": "number",
+     "exclusiveMinimum": 0
+    },
+    "tags": {
+     "description": "Tags for the product",
+     "type": "array",
+     "items": {
+      "type": "string"
+     },
+     "minItems": 1,
+     "uniqueItems": true
+    },
+    "dimensions": {
+     "type": "object",
+     "properties": {
+      "length": {
+       "type": "number"
+      },
+      "width": {
+       "type": "number"
+      },
+      "height": {
+       "type": "number"
+      }
+     },
+     "required": [
+      "length",
+      "width",
+      "height"
+     ]
+    }
+   },
+   "required": [
+    "productId",
+    "productName",
+    "price"
+   ]
+  },
+  "passing": [
+   "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50}",
+   "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"tags\": [\"home\", \"green\"]}",
+   "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"tags\": [\"home\", \"green\"], \"dimensions\": {\"length\": 785, \"width\": 250.5, \"height\": -0.359}}"
+  ],
+  "failing": [
+   "{}",
+   "{\"productName\": \"A green door\", \"price\": 12.50, \"productId\": 1}",
+   "{\"productId\": 1, \"productName\": \"A green door\"}",
+   "{\"productName\": \"A green door\", \"price\": 12.50}",
+   "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"tags\": []}",
+   "{\"productId\": 1, \"productName\": \"A green door\", \"price\": 12.50, \"dimensions\": {\"length\": 785, \"width\": 250.5, \"height\": -0.359}, \"tags\": [\"home\", \"green\"]}"
+  ]
+ }
+]

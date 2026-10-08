@@ -1,0 +1,13 @@
+{
+ "type": "object",
+ "properties": {
+  "a": {
+   "$ref": "#/$defs/missing"
+  }
+ },
+ "$defs": {
+  "other": {
+   "type": "string"
+  }
+ }
+}

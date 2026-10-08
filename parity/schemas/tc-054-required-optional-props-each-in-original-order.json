@@ -1,0 +1,10 @@
+{
+            "properties": {
+                "b": {"type": "string"},
+                "a": {"type": "string"},
+                "d": {"type": "string"},
+                "c": {"type": "string"}
+            },
+            "required": ["a", "b"],
+            "additionalProperties": false
+        }

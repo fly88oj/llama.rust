@@ -1,0 +1,21 @@
+{
+ "$ref": "#/definitions/foo",
+ "definitions": {
+  "foo": {
+   "type": "object",
+   "properties": {
+    "bar": {
+     "$ref": "#/definitions/bar"
+    }
+   },
+   "required": [
+    "bar"
+   ],
+   "additionalProperties": false
+  },
+  "bar": {
+   "type": "string",
+   "minLength": 1
+  }
+ }
+}

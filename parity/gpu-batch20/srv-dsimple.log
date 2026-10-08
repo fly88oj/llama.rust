@@ -1,0 +1,11 @@
+llama-server: gpu mode: device Vulkan0, n_gpu_layers 99 (auto/all resolve to every layer, llama-model.cpp:2002-2004)
+ggml_vulkan: Found 1 Vulkan devices:
+ggml_vulkan: 0 = AMD Radeon 8060S (RADV GFX1151) (radv) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 64 | shared memory: 65536 | int dot: 1 | matrix cores: KHR_coopmat
+enable_gpu: device Vulkan0 — offloaded 25/25 layers (n_gpu_layers = 99)
+llama-server: loading draft model '/home/jeffrey/localai/models/qwen2.5-0.5b-instruct-q4_k_m.gguf'
+llama-server: draft: arch = qwen2, n_layer = 24, vocab = 151936
+llama-server: gpu mode (draft): device Vulkan0, n_gpu_layers 99 (the -ngld surface, arg.cpp:4221-4239)
+enable_gpu: device Vulkan0 — offloaded 25/25 layers (n_gpu_layers = 99)
+llama-server: model loaded in 1.165507673s (n_ctx = 512, n_parallel = 4 -> slot n_ctx = 512, n_batch = 2048, n_ubatch = 512, threads = 8, fa = false, embeddings = false, pooling = none)
+llama-server: listening on http://127.0.0.1:8888
+slot print_timing: id  3 | task 1 | draft acceptance = 1.00000 (   11 accepted /    11 generated), mean len =  3.75

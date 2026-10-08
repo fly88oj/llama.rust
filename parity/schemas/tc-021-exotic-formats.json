@@ -1,0 +1,8 @@
+{
+            "items": [
+                { "format": "date" },
+                { "format": "uuid" },
+                { "format": "time" },
+                { "format": "date-time" }
+            ]
+        }

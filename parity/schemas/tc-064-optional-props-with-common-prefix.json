@@ -1,0 +1,7 @@
+{
+            "properties": {
+                "ab": {"type": "integer"},
+                "ac": {"type": "integer"}
+            },
+            "additionalProperties": {"type": "integer"}
+        }

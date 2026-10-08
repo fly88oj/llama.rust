@@ -1,0 +1,5 @@
+root   ::= object
+object ::= "{" ws "\"name\"" ws ":" ws string ws "," ws "\"age\"" ws ":" ws number ws "}"
+string ::= "\"" [a-zA-Z ]* "\""
+number ::= [0-9]{1,3}
+ws     ::= [ ]*

@@ -1,0 +1,29 @@
+{
+ "allOf": [
+  {
+   "$ref": "#/$defs/base"
+  },
+  {
+   "type": "object",
+   "properties": {
+    "b": {
+     "type": "integer"
+    }
+   }
+  }
+ ],
+ "$defs": {
+  "base": {
+   "type": "object",
+   "properties": {
+    "a": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "a"
+   ],
+   "additionalProperties": false
+  }
+ }
+}

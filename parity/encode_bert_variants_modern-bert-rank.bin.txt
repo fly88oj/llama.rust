@@ -1,0 +1,6 @@
+model     /tmp/bert-variants/modern-bert-synth-rank.gguf
+prompt    The quick brown fox jumps over the lazy dog
+n_tokens  12  n_embd_out 2  n_rows 1  pooling 4
+tokens    1 2 3 4 5 6 7 8 9 10 11 12
+stats     n=2 mean=0.24552159 rms=0.620229921 min=-0.324043423 max=0.815086603
+row[0]    -0.3240434 0.8150866

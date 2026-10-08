@@ -1,0 +1,7 @@
+model     /home/jeffrey/localai/models/bge-m3-Q8_0.gguf
+prompt    The quick brown fox jumps over the lazy dog
+n_tokens  2  n_embd_out 1024  n_rows 2  pooling 0
+tokens    0 581
+stats     n=2048 mean=-0.02711643 rms=0.804303593 min=-4.6533308 max=16.442215
+row[0]    -0.7210838 0.3985021 0.1731832 0.4815837 0.4664528 0.5377638 1.156785 0.9340497
+row[1]    -0.7213362 0.2568095 -0.8163099 0.6012139 0.1803502 -0.2702166 0.8466099 0.6683003
