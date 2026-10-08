@@ -2749,6 +2749,17 @@ mod tests {
         load_hparams(&gguf).expect("load_hparams")
     }
 
+    /// Real-model hparams tests: skip (not fail) when the local model file
+    /// is not installed — the suite must stay green on clean checkouts.
+    macro_rules! skip_unless_present {
+        ($p:expr) => {
+            if Path::new($p).exists() == false {
+                eprintln!("skipping: model {} not present", $p);
+                return;
+            }
+        };
+    }
+
     /// minimal hand-rolled GGUF writer for error-path tests
     fn write_minimal_gguf(kvs: &[(&str, Value)]) -> std::path::PathBuf {
         let mut b: Vec<u8> = Vec::new();
@@ -2907,6 +2918,7 @@ mod tests {
 
     #[test]
     fn phi4_mini_values() {
+        skip_unless_present!(PHI4_MINI);
         // Reference: llama-cli load log for Phi-4-mini-instruct Q6_K:
         // arch = phi3, n_embd = 3072, n_layer = 32, n_head = 24, n_head_kv = 8,
         // n_ff = 8192 (ffn_up packs 2*n_ff), n_rot = 96 (partial rotary)
@@ -2933,6 +2945,7 @@ mod tests {
 
     #[test]
     fn gpt_oss_20b_values() {
+        skip_unless_present!(GPT_OSS_20B);
         // Reference: llama-cli load log for gpt-oss-20b MXFP4:
         // arch = gpt-oss, n_layer = 24, n_head = 64, n_head_kv = 8,
         // n_embd = 2880, key_length = 64, n_expert = 32, n_expert_used = 4,
@@ -2963,6 +2976,7 @@ mod tests {
 
     #[test]
     fn ernie45_moe_values() {
+        skip_unless_present!(ERNIE45);
         // Reference: llama-cli load log for ERNIE-4.5-21B-A3B-PT Q4_K_M:
         // arch = ernie4_5-moe (same class as ernie4_5), n_embd = 2560,
         // n_layer = 28, head_count = 20, head_count_kv = 4,
@@ -2993,6 +3007,7 @@ mod tests {
 
     #[test]
     fn lfm2_8b_a1b_values() {
+        skip_unless_present!(LFM2);
         // Reference: llama-cli load log for LFM2-8B-A1B Q4_K_M:
         // arch = lfm2moe (the -A1B models are MoE), n_layer = 24,
         // n_embd = 2048, hybrid conv/gated-attention with per-layer
@@ -3027,6 +3042,7 @@ mod tests {
 
     #[test]
     fn granitehybrid_tiny_values() {
+        skip_unless_present!(GRANITE_H_TINY);
         // Reference: llama-cli load log for granite-4.0-h-tiny Q4_K_M:
         // arch = granitehybrid, n_layer = 40, n_embd = 1536, n_head = 12,
         // per-layer head_count_kv = [0 x5, 4, 0 x9, 4, ...] (i32 array),
@@ -3084,6 +3100,7 @@ mod tests {
 
     #[test]
     fn qwen35_27b_values() {
+        skip_unless_present!(QWEN36_27B);
         // Reference: llama-cli load log for Qwen3.6-27B Q4_K_M:
         // arch = qwen35, n_layer = 64, n_embd = 5120, n_head = 24,
         // head_count_kv = 4, key_length = 256, n_ff = 17408,
@@ -3131,6 +3148,7 @@ mod tests {
 
     #[test]
     fn qwen35_mtp_values() {
+        skip_unless_present!(QWEN38_27B_MTP);
         // Same arch with nextn_predict_layers = 1: n_layer() excludes the MTP
         // block, and the MTP block itself is a dense attention layer.
         let (arch, h) = load(QWEN38_27B_MTP);
@@ -3146,6 +3164,7 @@ mod tests {
 
     #[test]
     fn bge_m3_bert_values() {
+        skip_unless_present!(BGE_M3);
         // Reference: llama-cli load log for bge-m3 Q8_0:
         // arch = bert, n_embd = 1024, n_layer = 24, n_head = 16,
         // layer_norm_epsilon = 1e-5, pooling_type = CLS, causal = false
@@ -3165,6 +3184,7 @@ mod tests {
 
     #[test]
     fn qwen3_embedding_values() {
+        skip_unless_present!(QWEN3_EMB);
         // Reference: Qwen3-Embedding-0.6B: arch = qwen3, n_embd = 1024,
         // n_layer = 28, n_head = 16, n_head_kv = 8, key_length = 128,
         // pooling_type = LAST (3)
