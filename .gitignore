@@ -1,0 +1,38 @@
+# build artifacts
+/target
+**/*.rs.bk
+
+# local tooling state
+/.mimosa
+echo.pid
+
+# parity: reference-model ground-truth dumps too large for git
+parity/ground-truth/
+parity/__pycache__/
+*.pyc
+parity/*.log
+parity/*.err
+
+# parity: compiled reference probes (build from the .c sources)
+parity/ref_*
+!parity/ref_*.c
+!parity/ref_*.cpp
+parity/logits_dump
+parity/gen_iq_tables
+parity/sampler_dry_ref
+parity/wkv7_oob_proof
+*.o
+
+# stray root-level artifact (the real one lives in parity/)
+/tiled_kernel_ref.bin
+
+# local corpus captures and run output (see README: LLAMA_RUST_DATA_HOME)
+/parity/bench_matrix/
+/parity/gpu-batch20/
+/parity/asm/
+/parity/.mimosa/
+/parity/qwen35_1ulp/
+/parity/imatrix_md/
+/parity/mtp_real/
+/parity/**/*.err
+/parity/**/*.log

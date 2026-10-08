@@ -1,0 +1,9 @@
+[package]
+name = "common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ggml = { path = "../ggml" }
+llama = { path = "../llama" }
