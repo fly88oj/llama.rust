@@ -1,0 +1,27 @@
+# build artifacts
+/target
+**/*.rs.bk
+
+# local tooling state
+/.mimosa
+echo.pid
+
+# parity: reference-model ground-truth dumps too large for git
+parity/ground-truth/
+parity/__pycache__/
+*.pyc
+parity/*.log
+parity/*.err
+
+# parity: compiled reference probes (build from the .c sources)
+parity/ref_*
+!parity/ref_*.c
+!parity/ref_*.cpp
+parity/logits_dump
+parity/gen_iq_tables
+parity/sampler_dry_ref
+parity/wkv7_oob_proof
+*.o
+
+# stray root-level artifact (the real one lives in parity/)
+/tiled_kernel_ref.bin

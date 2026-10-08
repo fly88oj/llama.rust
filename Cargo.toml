@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ggml",
+    "crates/llama",
+    "crates/common",
+    "crates/tools/llama-cli",
+    "crates/tools/quantize",
+    "crates/tools/imatrix",
+    "crates/tools/perplexity",
+    "crates/tools/tokenize",
+    "crates/tools/gguf",
+    "crates/tools/gguf-split",
+    "crates/tools/llama-bench",
+    "crates/tools/llama-server",
+    "crates/tools/llama-mtmd-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+half = { version = "2", features = ["bytemuck"] }
+memmap2 = "0.9"
+rayon = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+[profile.release]
+debug = true
+lto = "thin"
+codegen-units = 1
+
+[profile.release-fast]
+inherits = "release"
+debug = false
+lto = "fat"
