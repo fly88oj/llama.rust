@@ -1,0 +1,14 @@
+[package]
+name = "llama-imatrix"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llama-imatrix"
+path = "src/main.rs"
+
+[dependencies]
+ggml = { path = "../../ggml" }
+llama = { path = "../../llama" }
+memmap2 = { workspace = true }
