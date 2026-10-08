@@ -1,4 +1,4 @@
-# model: /home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-phi-3.gguf
+# model: ggml-vocab-phi-3.gguf
 # 'Hello world'
 48656c6c6f20776f726c64
 1 15043 3186

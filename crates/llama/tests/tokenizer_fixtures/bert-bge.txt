@@ -1,4 +1,4 @@
-# model: /home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-bert-bge.gguf
+# model: ggml-vocab-bert-bge.gguf
 # 'hello world'
 68656c6c6f20776f726c64
 101 7592 2088 102

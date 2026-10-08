@@ -1,4 +1,4 @@
-# model: /home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-gemma-4.gguf
+# model: ggml-vocab-gemma-4.gguf
 # 'Hello world'
 48656c6c6f20776f726c64
 2 9259 1902

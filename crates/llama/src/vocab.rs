@@ -3940,8 +3940,29 @@ fn bpe_pre_regexes(pre: PreType) -> (Vec<String>, bool) {
 mod tests {
     use super::*;
 
+    /// Vocab GGUFs mirrored from the llama.cpp test-model corpus (MIT) so the
+    /// suite runs on clean checkouts; the original tree is used as fallback.
     const MODELS_DIR: &str = "/home/jeffrey/llm/llama.cpp-pinned/models";
     const FIXTURES_DIR: &str = "tests/tokenizer_fixtures";
+
+    /// Resolve a vocab GGUF by name: vendored copy first, original tree second.
+    fn vocab_model_path(name: &str) -> String {
+        let vendored = format!("{FIXTURES_DIR}/vocab/{name}");
+        if std::fs::metadata(&vendored).is_ok() {
+            return vendored;
+        }
+        format!("{MODELS_DIR}/{name}")
+    }
+
+    /// Resolve a fixture "# model:" entry: bare names go through the vendored
+    /// vocab dir; absolute paths are kept as-is (machine-local models).
+    fn resolve_fixture_model(model: &str) -> String {
+        if model.starts_with('/') {
+            model.to_string()
+        } else {
+            vocab_model_path(model)
+        }
+    }
 
     fn load_vocab(path: &str) -> Vocab {
         let g = ggml::Gguf::open(path).unwrap_or_else(|e| panic!("open {path}: {e}"));
@@ -3995,6 +4016,11 @@ mod tests {
     /// defaults: add_special == model add_bos, parse_special == true
     fn check_fixture(fixture: &str) {
         let (model, cases) = load_fixture(fixture);
+        let model = resolve_fixture_model(&model);
+        if std::fs::metadata(&model).is_err() {
+            eprintln!("skipping {fixture}: model {model} not present");
+            return;
+        }
         let v = load_vocab(&model);
         let add_special = v.get_add_bos();
         let mut n = 0;
@@ -4081,7 +4107,7 @@ mod tests {
 
     #[test]
     fn test_load_qwen2_vocab_basic() {
-        let v = load_vocab(&format!("{MODELS_DIR}/ggml-vocab-qwen2.gguf"));
+        let v = load_vocab(&vocab_model_path("ggml-vocab-qwen2.gguf"));
         assert_eq!(v.get_type(), VocabType::Bpe);
         assert_eq!(v.tokenizer_pre, "qwen2");
         assert_eq!(v.pre_type, PreType::Qwen2);
@@ -4101,7 +4127,7 @@ mod tests {
 
     #[test]
     fn test_load_llama_spm_vocab_basic() {
-        let v = load_vocab(&format!("{MODELS_DIR}/ggml-vocab-llama-spm.gguf"));
+        let v = load_vocab(&vocab_model_path("ggml-vocab-llama-spm.gguf"));
         assert_eq!(v.get_type(), VocabType::Spm);
         assert_eq!(v.n_tokens(), 32000);
         assert_eq!(v.token_bos(), 1);
@@ -4119,7 +4145,7 @@ mod tests {
 
     #[test]
     fn test_load_llama_bpe_vocab_basic() {
-        let v = load_vocab(&format!("{MODELS_DIR}/ggml-vocab-llama-bpe.gguf"));
+        let v = load_vocab(&vocab_model_path("ggml-vocab-llama-bpe.gguf"));
         assert_eq!(v.get_type(), VocabType::Bpe);
         assert_eq!(v.pre_type, PreType::Llama3);
         assert!(v.ignore_merges);
@@ -4167,7 +4193,7 @@ mod tests {
     /// `llama-tokenize -m ggml-vocab-qwen2.gguf`.
     #[test]
     fn test_st_partition_repeated_special() {
-        let v = load_vocab(&format!("{MODELS_DIR}/ggml-vocab-qwen2.gguf"));
+        let v = load_vocab(&vocab_model_path("ggml-vocab-qwen2.gguf"));
         assert_eq!(
             v.tokenize("<|endoftext|>A<|endoftext|>B", false, true),
             vec![151643, 32, 151643, 33]
@@ -4182,7 +4208,7 @@ mod tests {
     /// Expected ids are from the reference llama-tokenize on the same vocab.
     #[test]
     fn test_invalid_utf8_ugm_normalization() {
-        let path = format!("{MODELS_DIR}/ggml-vocab-llama-spm.gguf");
+        let path = vocab_model_path("ggml-vocab-llama-spm.gguf");
         if std::fs::metadata(&path).is_err() {
             eprintln!("skipping: {path} not present");
             return;
@@ -4207,7 +4233,7 @@ mod tests {
 
     #[test]
     fn test_special_token_partition() {
-        let v = load_vocab(&format!("{MODELS_DIR}/ggml-vocab-qwen2.gguf"));
+        let v = load_vocab(&vocab_model_path("ggml-vocab-qwen2.gguf"));
         // parse_special=true splits the special token out
         let toks = v.tokenize("a<|endoftext|>b", false, true);
         let pieces: Vec<String> = toks

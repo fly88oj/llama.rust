@@ -1,4 +1,4 @@
-# model: /home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-falcon.gguf
+# model: ggml-vocab-falcon.gguf
 # 'Hello world'
 48656c6c6f20776f726c64
 9856 1079
