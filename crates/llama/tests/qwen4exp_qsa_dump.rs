@@ -27,11 +27,7 @@ use llama::model::{load_model, LlamaModel};
 use llama::vocab::Vocab;
 use memmap2::Mmap;
 
-/// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-#[allow(non_snake_case)]
-fn VOCAB_SPM() -> &'static str {
-    crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-}
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_LAYER: i64 = 4;
 const N_EMBD: i64 = 64;
 const N_HEAD: i64 = 4;
@@ -299,7 +295,7 @@ fn tensors_for(n_vocab: i64) -> Vec<(String, Vec<i64>, f32)> {
 pub fn build_file(path: &str) {
     std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap())
         .expect("mkdir synth dir");
-    let src = Gguf::open(VOCAB_SPM()).expect("open vocab fixture");
+    let src = Gguf::open(VOCAB_SPM).expect("open vocab fixture");
     let n_vocab = src
         .kv
         .iter()
@@ -715,6 +711,10 @@ fn run_port_stream(synth: &str, fa: bool) -> Vec<u8> {
 /// bit-identical to the NEW reference's (the no-embeddings probe arm)
 #[test]
 fn qwen4exp_qsa_ple_nodes_bit_exact_vs_reference() {
+    if !ggml::simd_x86::avx512() {
+        eprintln!("skip: node dump captured on AVX512 hardware");
+        return;
+    }
     // the static DUMP/ACTIVE globals serialize all dump-driven tests
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ref_path = concat!(
@@ -747,6 +747,10 @@ fn qwen4exp_qsa_ple_nodes_bit_exact_vs_reference() {
 /// (parity/qwen4exp_qsa_nodes_fa_ref.bin).
 #[test]
 fn qwen4exp_qsa_fa_nodes_bit_exact_vs_reference() {
+    if !ggml::simd_x86::avx512() {
+        eprintln!("skip: node dump captured on AVX512 hardware");
+        return;
+    }
     // the static DUMP/ACTIVE globals serialize all dump-driven tests
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ref_path = concat!(
@@ -819,14 +823,4 @@ fn compare_named_nodes(ref_bytes: &[u8], port_bytes: &[u8]) -> usize {
         compared += 1;
     }
     compared
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }

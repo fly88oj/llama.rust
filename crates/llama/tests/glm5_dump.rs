@@ -401,11 +401,9 @@ fn glm5_prefill_node_dump() {
 /// the synthetic geometry — the constants of tests/glm5_e2e.rs (must stay
 /// in lockstep with the fixture that produced nodes_ref.bin)
 mod synth {
-    /// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf
-    #[allow(non_snake_case)]
-    fn VOCAB_SPM() -> &'static str {
-        crate::__llama_rust_data_path("llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf")
-    }
+    pub const VOCAB_SPM: &str =
+        concat!(env!("CARGO_MANIFEST_DIR"),
+        "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
     pub const N_LAYER: usize = 3;
     pub const N_EMBD: i64 = 64;
     pub const N_HEAD: i64 = 4;
@@ -530,7 +528,7 @@ mod synth {
         std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap())
             .expect("mkdir synth dir");
 
-        let src = Gguf::open(VOCAB_SPM()).expect("open vocab fixture");
+        let src = Gguf::open(VOCAB_SPM).expect("open vocab fixture");
         let n_vocab = src
             .kv
             .iter()
@@ -720,6 +718,10 @@ fn run_port_stream(synth: &str) -> Vec<u8> {
 /// 13 graph builds must be bit-identical to the NEW reference's
 #[test]
 fn glm5_graph_nodes_bit_exact_vs_reference() {
+    if !ggml::simd_x86::avx512() {
+        eprintln!("skip: node dump captured on AVX512 hardware");
+        return;
+    }
     let ref_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/glm5/nodes_ref.bin");
     let Some(ref_bytes) = std::fs::read(ref_path).ok() else {
         panic!(
@@ -817,14 +819,4 @@ fn glm5_graph_nodes_bit_exact_vs_reference() {
         }
     }
     assert!(compared >= 70, "expected the kpool family's named nodes, got {compared}");
-}
-
-#[cfg(test)]
-// llama-rust-data-home: corpus paths resolve against $LLAMA_RUST_DATA_HOME (fallback: $HOME).
-fn __llama_rust_data_path(rel: &str) -> &'static str {
-    let root = std::env::var_os("LLAMA_RUST_DATA_HOME")
-        .or_else(|| std::env::var_os("HOME").map(std::ffi::OsString::from))
-        .unwrap_or_else(|| std::ffi::OsString::from("/var/lib/llama-rust"));
-    let joined = std::path::Path::new(&root).join(rel);
-    Box::leak(joined.to_string_lossy().into_owned().into_boxed_str())
 }
