@@ -1,0 +1,11 @@
+[package]
+name = "ggml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+half = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+rayon = { workspace = true }
