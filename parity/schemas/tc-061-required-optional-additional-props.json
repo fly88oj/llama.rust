@@ -1,0 +1,9 @@
+{
+            "type": "object",
+            "properties": {
+                "and": {"type": "number"},
+                "also": {"type": "number"}
+            },
+            "required": ["and"],
+            "additionalProperties": {"type": "number"}
+        }

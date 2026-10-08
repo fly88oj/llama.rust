@@ -1,0 +1,15 @@
+{
+ "type": "object",
+ "properties": {
+  "a b": {
+   "type": "string"
+  },
+  "a-b": {
+   "type": "number"
+  },
+  "a.b": {
+   "type": "boolean"
+  }
+ },
+ "additionalProperties": false
+}

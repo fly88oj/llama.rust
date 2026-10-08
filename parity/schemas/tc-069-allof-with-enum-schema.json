@@ -1,0 +1,11 @@
+{
+            "allOf": [
+                {"$ref": "#/definitions/foo"}
+            ],
+            "definitions": {
+                "foo": {
+                    "type": "string",
+                    "enum": ["a", "b"]
+                }
+            }
+        }

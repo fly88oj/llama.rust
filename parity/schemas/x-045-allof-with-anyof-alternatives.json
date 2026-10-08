@@ -1,0 +1,26 @@
+{
+ "allOf": [
+  {
+   "anyOf": [
+    {
+     "type": "string"
+    },
+    {
+     "type": "integer"
+    }
+   ]
+  },
+  {
+   "type": "object",
+   "properties": {
+    "a": {
+     "type": "string"
+    }
+   },
+   "required": [
+    "a"
+   ],
+   "additionalProperties": false
+  }
+ ]
+}

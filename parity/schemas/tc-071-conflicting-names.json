@@ -1,0 +1,31 @@
+{
+            "type": "object",
+            "properties": {
+                "number": {
+                "type": "object",
+                "properties": {
+                    "number": {
+                    "type": "object",
+                        "properties": {
+                            "root": {
+                                "type": "number"
+                            }
+                        },
+                        "required": [
+                            "root"
+                        ],
+                        "additionalProperties": false
+                    }
+                },
+                "required": [
+                    "number"
+                ],
+                "additionalProperties": false
+                }
+            },
+            "required": [
+                "number"
+            ],
+            "additionalProperties": false,
+            "definitions": {}
+        }

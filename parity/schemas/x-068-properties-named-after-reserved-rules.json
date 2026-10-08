@@ -1,0 +1,27 @@
+{
+ "type": "object",
+ "properties": {
+  "array": {
+   "type": "array",
+   "items": {
+    "type": "integer"
+   }
+  },
+  "object": {
+   "type": "object"
+  },
+  "root": {
+   "type": "string"
+  },
+  "string": {
+   "type": "string"
+  },
+  "value": {
+   "type": "number"
+  },
+  "space": {
+   "type": "boolean"
+  }
+ },
+ "additionalProperties": false
+}

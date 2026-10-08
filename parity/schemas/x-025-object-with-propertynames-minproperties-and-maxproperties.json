@@ -1,0 +1,17 @@
+{
+ "type": "object",
+ "properties": {
+  "a": {
+   "type": "string"
+  }
+ },
+ "required": [
+  "a"
+ ],
+ "propertyNames": {
+  "pattern": "^[a-z]+$"
+ },
+ "minProperties": 1,
+ "maxProperties": 3,
+ "additionalProperties": false
+}

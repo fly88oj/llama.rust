@@ -1,0 +1,27 @@
+{
+            "allOf": [
+                {"$ref": "#/definitions/foo"},
+                {"$ref": "#/definitions/bar"},
+                {
+                "anyOf": [
+                    {"$ref": "#/definitions/baz"},
+                    {"$ref": "#/definitions/bam"}
+                ]
+                }
+            ],
+            "definitions": {
+                "foo": {
+                    "properties": {"a": {"type": "number"}}
+                },
+                "bar": {
+                    "properties": {"b": {"type": "number"}}
+                },
+                "bam": {
+                    "properties": {"c": {"type": "number"}}
+                },
+                "baz": {
+                    "properties": {"d": {"type": "number"}}
+                }
+            },
+            "type": "object"
+        }

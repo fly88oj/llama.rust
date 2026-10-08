@@ -1,0 +1,1 @@
+{"description": "The 0-based index of the last line to be retrieved (inclusive). If None, read until the end of the file."}

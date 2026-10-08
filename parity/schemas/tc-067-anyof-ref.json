@@ -1,0 +1,17 @@
+{
+            "properties": {
+                "a": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "number"}
+                    ]
+                },
+                "b": {
+                    "anyOf": [
+                        {"$ref": "#/properties/a/anyOf/0"},
+                        {"type": "boolean"}
+                    ]
+                }
+            },
+            "type": "object"
+        }

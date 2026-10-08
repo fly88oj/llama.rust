@@ -1,0 +1,23 @@
+{
+ "type": "object",
+ "properties": {
+  "a\"b": {
+   "type": "string"
+  },
+  "a\\b": {
+   "type": "integer"
+  },
+  "日本": {
+   "type": "boolean"
+  },
+  "a\nb": {
+   "type": "number"
+  }
+ },
+ "required": [
+  "a\"b"
+ ],
+ "additionalProperties": {
+  "type": "string"
+ }
+}

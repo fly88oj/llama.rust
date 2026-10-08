@@ -1,0 +1,15 @@
+{
+            "anyOf": [
+                {"$ref": "#/definitions/foo"},
+                {"$ref": "#/definitions/bar"}
+            ],
+            "definitions": {
+                "foo": {
+                    "properties": {"a": {"type": "number"}}
+                },
+                "bar": {
+                    "properties": {"b": {"type": "number"}}
+                }
+            },
+            "type": "object"
+        }

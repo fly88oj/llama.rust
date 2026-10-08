@@ -1,0 +1,4 @@
+{
+ "type": "string",
+ "pattern": "^\\u00e9\\U0001F600$"
+}

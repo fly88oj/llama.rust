@@ -1,0 +1,5 @@
+{
+ "type": "integer",
+ "minimum": 3,
+ "multipleOf": 5
+}

@@ -1,0 +1,34 @@
+{
+ "type": "object",
+ "properties": {
+  "a": {
+   "type": "string"
+  }
+ },
+ "patternProperties": {
+  "^x": {
+   "type": "number"
+  }
+ },
+ "dependencies": {
+  "a": [
+   "b"
+  ]
+ },
+ "if": {
+  "properties": {
+   "a": {
+    "const": "x"
+   }
+  }
+ },
+ "then": {
+  "required": [
+   "a"
+  ]
+ },
+ "else": {
+  "required": []
+ },
+ "additionalProperties": false
+}

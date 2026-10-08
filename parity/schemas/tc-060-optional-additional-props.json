@@ -1,0 +1,7 @@
+{
+            "type": "object",
+            "properties": {
+                "a": {"type": "number"}
+            },
+            "additionalProperties": {"type": "number"}
+        }

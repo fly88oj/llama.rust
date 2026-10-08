@@ -1,0 +1,17 @@
+{
+ "type": "object",
+ "properties": {
+  "a": {
+   "type": "string",
+   "pattern": "^a.c$"
+  },
+  "b": {
+   "type": "string",
+   "pattern": "^.*$"
+  }
+ },
+ "required": [
+  "a"
+ ],
+ "additionalProperties": false
+}
