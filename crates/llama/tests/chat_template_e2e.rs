@@ -137,6 +137,11 @@ fn e2e_vendor_templates_match_reference_server() {
         // regenerate but need the reference server + the three real models.
         // Self-heal once; if regeneration is impossible (no REF binary), skip
         // with a loud note instead of failing a template-engine change.
+        let ref_server = "/home/jeffrey/llm/llama.cpp-next/build-rust-ref/bin/llama-server";
+        if !std::path::Path::new(ref_server).exists() {
+            eprintln!("SKIP: no captures under {ARTIFACTS} and reference server unavailable");
+            return;
+        }
         let rc = std::process::Command::new("bash")
             .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/chat_template_ref_render.sh"))
             .args(["gptoss", "gemma4", "qwen35"])
