@@ -1,0 +1,20 @@
+[package]
+name = "llama-quantize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "llama-quantize"
+path = "src/main.rs"
+
+[dependencies]
+ggml = { path = "../../ggml" }
+llama = { path = "../../llama" }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+rayon = { workspace = true }
+half = { workspace = true }
+# `--tensor-type` patterns (std::regex ECMAScript equivalent, same engine the
+# llama crate already uses for pre-tokenizers)
+fancy-regex = "0.14"
