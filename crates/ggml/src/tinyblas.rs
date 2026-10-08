@@ -1165,11 +1165,18 @@ mod dump_tests {
             bit(8)
         );
         // the KN=32 bf16 variant and the AVX512 float kernels are only the
-        // reference's choice when those macros are on
-        assert_eq!(avx512(), bit(1) && bit(2), "AVX512F/DQ mismatch with the artifact");
-        assert_eq!(avx512bf16(), bit(6), "AVX512BF16 mismatch with the artifact");
-        if !avx512() {
-            eprintln!("SKIP: host has no AVX512 — the port keeps the vec_dot path by design");
+        // reference's choice when those macros are on. The artifact encodes
+        // the capture host's ISA class (AVX512F/DQ + BF16); a host with a
+        // different capability mix (e.g. AVX512 without BF16) cannot replay
+        // it — skip rather than fail.
+        if avx512() != (bit(1) && bit(2)) || avx512bf16() != bit(6) {
+            eprintln!(
+                "SKIP: artifact captured with AVX512F/DQ={} BF16={} but this host has {} / {}",
+                bit(1) && bit(2),
+                bit(6),
+                avx512(),
+                avx512bf16()
+            );
             return;
         }
 
