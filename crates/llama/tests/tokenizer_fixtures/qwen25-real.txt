@@ -1,0 +1,13 @@
+# model: /home/jeffrey/localai/models/qwen2.5-0.5b-instruct-q4_k_m.gguf
+# 'The capital of France is'
+546865206361706974616c206f66204672616e6365206973
+785 6722 315 9625 374
+RT
+# 'Hello world'
+48656c6c6f20776f726c64
+9707 1879
+RT
+# '你好，世界！'
+e4bda0e5a5bdefbc8ce4b896e7958cefbc81
+108386 3837 99489 6313
+RT
