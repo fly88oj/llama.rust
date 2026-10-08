@@ -119,8 +119,8 @@ pub struct ForwardResult {
     pub graph: Graph,
 }
 
-/// build_inp_embd + per-layer loop + lm_head, 对照 src/models/qwen2.cpp graph()
-/// 和 llama-graph.cpp build_attn_mha 的非 FA 分支。
+/// build_inp_embd + per-layer loop + lm_head, verify against src/models/qwen2.cpp graph()
+/// and the non-FA branch of llama-graph.cpp build_attn_mha
 pub fn build_qwen2_forward(
     ctx: &mut Context,
     w: &ModelWeights,
@@ -159,7 +159,7 @@ pub fn build_qwen2_forward(
         let mut cur = ctx.rms_norm(inp_l, p.norm_eps);
         cur = ctx.mul(cur, lw.attn_norm);
 
-        // QKV projections (+ k/v bias for qwen2) — 对照 build_qkv
+        // QKV projections (+ k/v bias for qwen2) — verify against build_qkv
         // (build_lora_mm at llama-graph.cpp:1689/1703/1717)
         let mut q = crate::adapter::lora_mm(ctx, lw.wq, cur); // [n_embd, T]
         if let Some(b) = lw.wq_b {
@@ -224,7 +224,7 @@ pub fn build_qwen2_forward(
 
         let kq_scale = 1.0 / (p.n_embd_head_k as f32).sqrt();
         let kqv = if p.use_flash_attn {
-            // FA branch — 对照 llama-graph.cpp:2626-2669 (use_flash_attn &&
+            // FA branch — verify against llama-graph.cpp:2626-2669 (use_flash_attn &&
             // kq_b == nullptr; qwen2 has no KQ bias, so FA is always allowed).
             // max_bias = hparams.f_max_alibi_bias (0.0 — no ALiBi here, same as
             // the non-FA soft_max_ext call below); logit_softcap = 0
@@ -379,8 +379,8 @@ pub fn kq_mask_masked(p0: i32, p1: i32, n_swa: u32, swa_type: LlamaSwaType) -> b
 
 /// Fill a KQ mask row set for a decode step: rows = the cache's cell positions
 /// `kv_pos` in cell order, cols = the `q_pos` queries. 0 attend / -inf masked.
-/// 对照 llama_kv_cache::set_input_kq_mask 的 non-FA F32 填充，含 SWA 分支
-/// (`is_masked_swa`, llama-kv-cache.cpp:1688) 与空 cell 的 `goto skip` (:1640)。
+/// verify against llama_kv_cache::set_input_kq_mask the non-FA F32 fill with SWA branch
+/// (`is_masked_swa`, llama-kv-cache.cpp:1688) with the empty-cell `goto skip` (:1640)
 ///
 /// Mask tensor is [n_kv, n_tokens]: element (kv index s, query t) lives at
 /// `s + t*n_kv` — the softmax kernel reads row t = query, column s

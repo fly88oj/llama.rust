@@ -235,7 +235,7 @@ pub fn ggml_silu_scalar_f32(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// 对照 ggml_gelu_f32 (vec.h:968) — the *polynomial*. Its only consumer is the
+/// verify against ggml_gelu_f32 (vec.h:968) — the *polynomial*. Its only consumer is the
 /// f16 table build (ggml-cpu.c:3891); the GELU op itself reads the table.
 ///
 /// `1.0f + GELU_COEF_A*x*x` is contracted into an FMA: that is what the
@@ -275,7 +275,7 @@ pub fn ggml_table_gelu_f16() -> &'static [u16; 1 << 16] {
     })
 }
 
-/// 对照 ggml-impl.h:395 `ggml_compute_fp16_to_fp32` (= GGML_FP16_TO_FP32, and
+/// verify against ggml-impl.h:395 `ggml_compute_fp16_to_fp32` (= GGML_FP16_TO_FP32, and
 /// the values stored in ggml_table_f32_f16 by ggml-cpu.c:3889). Exact bit
 /// trick port; note it *preserves* the NaN payload.
 #[inline]
@@ -302,7 +302,7 @@ pub fn ggml_compute_fp16_to_fp32(h: u16) -> f32 {
     f32::from_bits(result)
 }
 
-/// 对照 ggml-impl.h:420 `ggml_compute_fp32_to_fp16` (= GGML_FP32_TO_FP16, and
+/// verify against ggml-impl.h:420 `ggml_compute_fp32_to_fp16` (= GGML_FP32_TO_FP16, and
 /// what GGML_CPU_FP32_TO_FP16 expands to in this build). NaN/overflow collapse
 /// to 0x7E00; denormals go through the 2^±112 scaling trick.
 #[inline]
@@ -327,7 +327,7 @@ pub fn ggml_compute_fp32_to_fp16(f: f32) -> u16 {
     ((sign >> 16) | if shl1_w > 0xFF00_0000 { 0x7E00 } else { nonsign }) as u16
 }
 
-/// 对照 ggml_vec_gelu_f32 (vec.h:987) — the path the reference actually runs:
+/// verify against ggml_vec_gelu_f32 (vec.h:987) — the path the reference actually runs:
 /// `#define GGML_GELU_FP16` is unconditional (vec.h:46), so F32 GELU goes
 /// through the f16 lookup table with a |x| <= 10 shortcut. The output is
 /// f16-quantised, so it differs from the polynomial by ~1e-3 relative.
@@ -345,7 +345,7 @@ pub fn ggml_vec_gelu_f32(x: f32) -> f32 {
     }
 }
 
-/// 对照 ggml_vec_gelu_f16 (vec.h:973) — direct bit-pattern table lookup.
+/// verify against ggml_vec_gelu_f16 (vec.h:973) — direct bit-pattern table lookup.
 #[inline]
 pub fn ggml_vec_gelu_f16(x: f16) -> f16 {
     f16::from_bits(ggml_table_gelu_f16()[x.to_bits() as usize])
@@ -358,40 +358,40 @@ pub fn ggml_vec_gelu_f16(x: f16) -> f16 {
 // crate's round-to-nearest-even bf16 conversion is the port's established
 // stand-in for GGML_FP32_TO_BF16 (verified on the wdata conversion path).
 
-/// 对照 ggml_vec_gelu_bf16 (vec.h:979): the *polynomial* gelu (not the f16
+/// verify against ggml_vec_gelu_bf16 (vec.h:979): the *polynomial* gelu (not the f16
 /// table the F32 path uses — the bf16 loop calls `ggml_gelu_f32` directly).
 #[inline]
 pub fn ggml_vec_gelu_bf16(x: half::bf16) -> half::bf16 {
     half::bf16::from_f32(ggml_gelu_f32(x.to_f32()))
 }
 
-/// 对照 ggml_vec_gelu_erf_bf16 (vec.h:993).
+/// verify against ggml_vec_gelu_erf_bf16 (vec.h:993).
 #[inline]
 pub fn ggml_vec_gelu_erf_bf16(x: half::bf16) -> half::bf16 {
     let xi = x.to_f32();
     half::bf16::from_f32(0.5 * xi * (1.0 + unsafe { erff(xi * SQRT_2_INV) }))
 }
 
-/// 对照 ggml_vec_silu_bf16 (vec.h:1397): libm-expf silu scalar.
+/// verify against ggml_vec_silu_bf16 (vec.h:1397): libm-expf silu scalar.
 #[inline]
 pub fn ggml_vec_silu_bf16(x: half::bf16) -> half::bf16 {
     half::bf16::from_f32(ggml_silu_scalar_f32(x.to_f32()))
 }
 
-/// 对照 ggml_vec_reglu_bf16 (vec.h:1439).
+/// verify against ggml_vec_reglu_bf16 (vec.h:1439).
 #[inline]
 pub fn ggml_vec_reglu_bf16(x: half::bf16, g: half::bf16) -> half::bf16 {
     let v = x.to_f32();
     half::bf16::from_f32(if v > 0.0 { v * g.to_f32() } else { 0.0 })
 }
 
-/// 对照 ggml_vec_geglu_bf16 (vec.h:1477).
+/// verify against ggml_vec_geglu_bf16 (vec.h:1477).
 #[inline]
 pub fn ggml_vec_geglu_bf16(x: half::bf16, g: half::bf16) -> half::bf16 {
     half::bf16::from_f32(ggml_gelu_f32(x.to_f32()) * g.to_f32())
 }
 
-/// 对照 ggml_vec_swiglu_bf16 (vec.h:1493).
+/// verify against ggml_vec_swiglu_bf16 (vec.h:1493).
 #[inline]
 pub fn ggml_vec_swiglu_bf16(x: half::bf16, g: half::bf16) -> half::bf16 {
     let xi = x.to_f32();
@@ -414,7 +414,7 @@ extern "C" {
 /// `SQRT_2_INV` (vec.h:967): `0.70710678118654752440084436210484f`.
 const SQRT_2_INV: f32 = 0.707_106_781_186_547_524_400_844_362_104_84f32;
 
-/// 对照 ggml_vec_gelu_erf_f32 (vec.h:1010): `0.5f*x*(1.0f + erff(x*SQRT_2_INV))`
+/// verify against ggml_vec_gelu_erf_f32 (vec.h:1010): `0.5f*x*(1.0f + erff(x*SQRT_2_INV))`
 /// — all plain f32 multiplies and one add off the erff result, so GCC's
 /// default -ffp-contract cannot fuse anything; the port reproduces the exact
 /// evaluation.
@@ -423,7 +423,7 @@ pub fn ggml_vec_gelu_erf_f32(x: f32) -> f32 {
     0.5 * x * (1.0 + unsafe { erff(x * SQRT_2_INV) })
 }
 
-/// 对照 ggml_vec_gelu_erf_f16 (vec.h:979):
+/// verify against ggml_vec_gelu_erf_f16 (vec.h:979):
 /// `res = 0.5f*xi*(1.0f + erff(xi*SQRT_2_INV)); y = FP32_TO_FP16(res)` with
 /// `xi = GGML_CPU_FP16_TO_FP32(x)` — the scalar conversion on the way out.
 #[inline]
@@ -432,7 +432,7 @@ pub fn ggml_vec_gelu_erf_f16(x: f16) -> f16 {
     f16::from_bits(ggml_compute_fp32_to_fp16(ggml_vec_gelu_erf_f32(xi)))
 }
 
-/// 对照 op_tanh (unary-ops.cpp:19) == `tanhf`. The reference has NO SIMD tanh
+/// verify against op_tanh (unary-ops.cpp:19) == `tanhf`. The reference has NO SIMD tanh
 /// at this commit: ggml_vec_tanh_f32 is a plain scalar loop (vec.h:909) and
 /// unary_op<op_tanh> calls tanhf directly (unary-ops.cpp:253). Verified
 /// bit-identical to the dumped op output (parity/tanh_ref.bin kinds 0 vs 3).
@@ -554,31 +554,31 @@ impl Context {
 
     // ===================== dup / add / mul =====================
 
-    /// 对照 ggml_dup_impl / ggml_dup (ggml.c:2032)
+    /// verify against ggml_dup_impl / ggml_dup (ggml.c:2032)
     pub fn dup(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Dup, [Some(a), None, None])
     }
-    /// 对照 ggml_dup_inplace (ggml.c:2050)
+    /// verify against ggml_dup_inplace (ggml.c:2050)
     pub fn dup_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Dup, [Some(a), None, None])
     }
 
-    /// 对照 ggml_add_impl / ggml_add (ggml.c:2058)
+    /// verify against ggml_add_impl / ggml_add (ggml.c:2058)
     pub fn add(&mut self, a: TensorId, b: TensorId) -> TensorId {
         assert!(can_repeat(self, b, a), "ggml_add: !can_repeat");
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Add, [Some(a), Some(b), None])
     }
-    /// 对照 ggml_add_inplace (ggml.c:2081)
+    /// verify against ggml_add_inplace (ggml.c:2081)
     pub fn add_inplace(&mut self, a: TensorId, b: TensorId) -> TensorId {
         assert!(can_repeat(self, b, a), "ggml_add_inplace: !can_repeat");
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Add, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_mul_impl / ggml_mul (ggml.c:2259)
+    /// verify against ggml_mul_impl / ggml_mul (ggml.c:2259)
     pub fn mul(&mut self, a: TensorId, b: TensorId) -> TensorId {
         assert!(
             can_repeat(self, b, a),
@@ -589,14 +589,14 @@ impl Context {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Mul, [Some(a), Some(b), None])
     }
-    /// 对照 ggml_mul_inplace (ggml.c:2282)
+    /// verify against ggml_mul_inplace (ggml.c:2282)
     pub fn mul_inplace(&mut self, a: TensorId, b: TensorId) -> TensorId {
         assert!(can_repeat(self, b, a), "ggml_mul_inplace: !can_repeat");
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Mul, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_div_impl / ggml_div (ggml.c:2291) — elementwise a / b with
+    /// verify against ggml_div_impl / ggml_div (ggml.c:2291) — elementwise a / b with
     /// repeat-broadcast of `b`. Used by the MoE weight normalization
     /// (llama-graph.cpp:2144).
     pub fn div(&mut self, a: TensorId, b: TensorId) -> TensorId {
@@ -610,7 +610,7 @@ impl Context {
         self.init_op(r, GgmlOp::Div, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_sub_impl / ggml_sub (ggml.c:2225-2246) — elementwise a - b
+    /// verify against ggml_sub_impl / ggml_sub (ggml.c:2225-2246) — elementwise a - b
     /// with repeat-broadcast of `b` (binary-ops.cpp:144
     /// `ggml_compute_forward_sub` → `op_sub`, vec.h:112 `z[i] = x[i] - y[i]`).
     /// Audio round 4: parakeet's folded batch-norm centers with it
@@ -627,7 +627,7 @@ impl Context {
         self.init_op(r, GgmlOp::Sub, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_clamp_impl / ggml_clamp (ggml.c:4110) — op_params[0]/[1] hold
+    /// verify against ggml_clamp_impl / ggml_clamp (ggml.c:4110) — op_params[0]/[1] hold
     /// the f32 bits of min/max; compute is `MAX(MIN(x, max), min)`
     /// (ops.cpp:5851).
     pub fn clamp(&mut self, a: TensorId, min: f32, max: f32) -> TensorId {
@@ -635,14 +635,14 @@ impl Context {
         self.params_f32(r, &[min, max]);
         self.init_op(r, GgmlOp::Clamp, [Some(a), None, None])
     }
-    /// 对照 ggml_clamp_inplace (ggml.c:4135)
+    /// verify against ggml_clamp_inplace (ggml.c:4135)
     pub fn clamp_inplace(&mut self, a: TensorId, min: f32, max: f32) -> TensorId {
         let r = self.view_tensor_of(a);
         self.params_f32(r, &[min, max]);
         self.init_op(r, GgmlOp::Clamp, [Some(a), None, None])
     }
 
-    /// 对照 ggml_set_rows (ggml.c:4000): scatter rows of `b` into `a` at row
+    /// verify against ggml_set_rows (ggml.c:4000): scatter rows of `b` into `a` at row
     /// indices `c` (I64/I32). src slots follow the C legacy order:
     /// src[0]=b (rows), src[1]=c (idx), src[2]=a (dst).
     pub fn set_rows(&mut self, a: TensorId, b: TensorId, c: TensorId) -> TensorId {
@@ -672,10 +672,10 @@ impl Context {
 
     // ===================== mul_mat =====================
 
-    /// 对照 ggml_mul_mat (ggml.c:3341)
+    /// verify against ggml_mul_mat (ggml.c:3341)
     // ===================== fill / lightning indexer (DSA, batch 6) =========
 
-    /// 对照 ggml_fill (ggml.c:5407, via ggml_fill_impl :5389): dst is a dup
+    /// verify against ggml_fill (ggml.c:5407, via ggml_fill_impl :5389): dst is a dup
     /// of `a` (F32/F16, contiguous required like C) whose every element the
     /// kernel sets to `c`.
     pub fn fill(&mut self, a: TensorId, c: f32) -> TensorId {
@@ -690,7 +690,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_lightning_indexer (ggml.c:6423-6451) — the DeepSeek DSA
+    /// verify against ggml_lightning_indexer (ggml.c:6423-6451) — the DeepSeek DSA
     /// fused indexer score. Shapes (C asserts, ggml.c:6429-6445):
     ///   q  [n_embd, n_head, n_tokens, n_stream] F32
     ///   k  [n_embd, 1, n_kv, n_stream] (the lid F16/F32 cache view)
@@ -733,7 +733,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_top_k (ggml.c:5459-5470): I32 `[k, ne1, ne2, ne3]` of the k
+    /// verify against ggml_top_k (ggml.c:5459-5470): I32 `[k, ne1, ne2, ne3]` of the k
     /// largest rows of `a` (per row of dims 1..3). NOT the same tie behavior
     /// as [`Context::argsort_top_k`] — the kernel ports the reference's
     /// `std::partial_sort` heap-select (ops.cpp:8550-8604) exactly, which is
@@ -749,7 +749,7 @@ impl Context {
 
     // ===================== sqrt / rope-back / swiglu-clamp (arch batch 7, dsv4) =====
 
-    /// 对照 ggml_sqrt (ggml.c:2347-2364, GGML_OP_SQRT): per-element `sqrtf`
+    /// verify against ggml_sqrt (ggml.c:2347-2364, GGML_OP_SQRT): per-element `sqrtf`
     /// (unary-ops.cpp:51 op_sqrt). Consumed by the deepseek4 SQRT_SOFTPLUS
     /// MoE gating (`sqrt(softplus(logits))`, llama-graph.cpp:2053).
     pub fn sqrt(&mut self, a: TensorId) -> TensorId {
@@ -758,7 +758,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_sin (ggml.c:2423-2441, GGML_OP_SIN): per-element `sinf`
+    /// verify against ggml_sin (ggml.c:2423-2441, GGML_OP_SIN): per-element `sinf`
     /// (unary-ops.cpp:289 `op_sin` → vec.h:878 `ggml_vec_sin_f32`, a plain
     /// scalar libm loop). Audio round 4: parakeet builds the sinusoidal RPE
     /// in-graph (parakeet.cpp:104).
@@ -768,7 +768,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_cos (ggml.c:2449-2467, GGML_OP_COS): per-element `cosf`
+    /// verify against ggml_cos (ggml.c:2449-2467, GGML_OP_COS): per-element `cosf`
     /// (unary-ops.cpp:293 `op_cos` → vec.h:884, scalar). parakeet.cpp:105.
     pub fn cos(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
@@ -776,7 +776,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_sqr (ggml.c:2321-2339, GGML_OP_SQR): per-element `x*x`
+    /// verify against ggml_sqr (ggml.c:2321-2339, GGML_OP_SQR): per-element `x*x`
     /// (unary-ops.cpp:281 `op_sqr` → vec.h:859 `y[i] = x[i]*x[i]`, scalar).
     /// mimo's RVQ codebook norms (mimo-audio.cpp:93) and the qwen3tts
     /// speaker variance (qwen3tts-spkenc.cpp:111).
@@ -786,7 +786,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_mean (ggml.c:2521-2531, GGML_OP_MEAN): row-wise mean over
+    /// verify against ggml_mean (ggml.c:2521-2531, GGML_OP_MEAN): row-wise mean over
     /// ne[0] — `ggml_vec_sum_f32` (double accumulator) then `/= ne00`
     /// (ops.cpp:1513-1543), single-threaded (ith==0 only, ggml-cpu.c). The
     /// qwen3tts speaker encoder's temporal means (qwen3tts-spkenc.cpp:76).
@@ -797,7 +797,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_pad_reflect_1d (ggml.c:5288-5315, GGML_OP_PAD_REFLECT_1D):
+    /// verify against ggml_pad_reflect_1d (ggml.c:5288-5315, GGML_OP_PAD_REFLECT_1D):
     /// reflect-pad dim0 by p0 (left) / p1 (right) — `left[-i] = left[i]`,
     /// `right[i] = right[-i]` (ops.cpp:8282-8318). F32 + contiguous input
     /// only. The qwen3tts speaker encoder's "same" convs (qwen3tts-spkenc.cpp:17).
@@ -819,7 +819,7 @@ impl Context {
     // qwen3tts-gen.cpp / pockettts-gen.cpp op surface: sum / cumsum / tri /
     // log / step / col2im_1d. Owner: agent GEN5.
 
-    /// 对照 ggml_step (ggml.c:2695 → ggml_unary(GGML_UNARY_OP_STEP)):
+    /// verify against ggml_step (ggml.c:2695 → ggml_unary(GGML_UNARY_OP_STEP)):
     /// per-element `(x > 0.f) ? 1.f : 0.f` (vec.h:903, no SIMD variant).
     pub fn step(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
@@ -828,7 +828,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_log (ggml.c:2387, GGML_OP_LOG — its own op in the pinned
+    /// verify against ggml_log (ggml.c:2387, GGML_OP_LOG — its own op in the pinned
     /// enum, not UNARY): per-element `logf` (unary-ops.cpp:297
     /// `unary_op<op_log>` → vec.h:872).
     pub fn log(&mut self, a: TensorId) -> TensorId {
@@ -837,7 +837,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_sum (ggml.c:2477, GGML_OP_SUM): reduce the whole tensor to
+    /// verify against ggml_sum (ggml.c:2477, GGML_OP_SUM): reduce the whole tensor to
     /// one scalar of the same type — f32 rows accumulated in ggml_float
     /// (double) then summed in double (ops.cpp:1282-1310), ith==0 only.
     pub fn sum(&mut self, a: TensorId) -> TensorId {
@@ -847,7 +847,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_cumsum (ggml.c:2508, GGML_OP_CUMSUM): running sum along
+    /// verify against ggml_cumsum (ggml.c:2508, GGML_OP_CUMSUM): running sum along
     /// dim 0 — `y[i] = y[i-1] + x[i]` in f32 (vec.h:1507), F32 only.
     pub fn cumsum(&mut self, a: TensorId) -> TensorId {
         assert_eq!(
@@ -860,7 +860,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_tri (ggml.c:5368, GGML_OP_TRI): keep the half of each row
+    /// verify against ggml_tri (ggml.c:5368, GGML_OP_TRI): keep the half of each row
     /// the tri-type predicate passes over the row index, zero the rest
     /// (ops.cpp:2289). F32 + contiguous + square only.
     pub fn tri(&mut self, a: TensorId, tri_type: i32) -> TensorId {
@@ -877,7 +877,7 @@ impl Context {
     // GGML_OP_NEG rides the UNARY arm above; SET / DIAG / SOLVE_TRI are their
     // own nodes. Owner: agent GDN.
 
-    /// 对照 ggml_neg (ggml.c:2681 → ggml_unary(GGML_UNARY_OP_NEG)):
+    /// verify against ggml_neg (ggml.c:2681 → ggml_unary(GGML_UNARY_OP_NEG)):
     /// per-element `-x` (unary-ops.cpp:11 `op_neg`, scalar — no SIMD variant).
     pub fn neg(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
@@ -886,7 +886,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_abs (unary-ops.cpp:3 `op_abs` → :238): per-element
+    /// verify against ggml_abs (unary-ops.cpp:3 `op_abs` → :238): per-element
     /// `fabsf(x)`, F32 only. The PLE gate magnitude (qwen4exp.cpp:1246).
     pub fn abs(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
@@ -895,7 +895,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_sgn (unary-ops.cpp:7 `op_sgn` → :242): per-element
+    /// verify against ggml_sgn (unary-ops.cpp:7 `op_sgn` → :242): per-element
     /// `(x > 0) ? 1 : ((x < 0) ? -1 : 0)`, F32 only. The PLE gate's signed
     /// square root (qwen4exp.cpp:1247).
     pub fn sgn(&mut self, a: TensorId) -> TensorId {
@@ -905,7 +905,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_set_impl / ggml_set_inplace (ggml.c:3505-3542): dst is a
+    /// verify against ggml_set_impl / ggml_set_inplace (ggml.c:3505-3542): dst is a
     /// view of `a` whose `b`-shaped region, viewed through the param strides
     /// at `offset`, is overwritten with `b`'s rows (F32, kernel
     /// ops.cpp:4769-4834 — n_tasks = 1, ggml-cpu.c:2379). `nb1/nb2/nb3` are
@@ -941,7 +941,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_diag (ggml.c:4027, GGML_OP_DIAG): scatter the single row of
+    /// verify against ggml_diag (ggml.c:4027, GGML_OP_DIAG): scatter the single row of
     /// `a` (ne1 == 1) onto the diagonal of an [n, n, ne2, ne3] square —
     /// `d[i][j] = (i == j) ? s[j] : 0`. F32 only (kernel ops.cpp:5434-5472,
     /// single-tasked). The chunked delta-net's `I + attn` identity
@@ -956,7 +956,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_solve_tri (ggml.c:6329, GGML_OP_SOLVE_TRI): dst = A⁻¹B by
+    /// verify against ggml_solve_tri (ggml.c:6329, GGML_OP_SOLVE_TRI): dst = A⁻¹B by
     /// forward substitution where A is a square lower-triangular F32 matrix
     /// and B packs the right-hand sides column-wise. The reference supports
     /// exactly `left && lower && !uni` (asserted in the builder, ggml.c:6350)
@@ -991,7 +991,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_col2im_1d (ggml.c:4679, GGML_OP_COL2IM_1D): scatter-add the
+    /// verify against ggml_col2im_1d (ggml.c:4679, GGML_OP_COL2IM_1D): scatter-add the
     /// columns `a` [K*OC, T_in] into a signal [T_out, OC] where
     /// `T_out = (T_in-1)*s0 + K - 2*p0` — the gather-form kernel ops.cpp:7017.
     /// The causal ConvTranspose1d core of both TTS generators.
@@ -1022,7 +1022,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_pad (ggml.c:5212 → ggml_pad_ext :5166): F32 tensor widened
+    /// verify against ggml_pad (ggml.c:5212 → ggml_pad_ext :5166): F32 tensor widened
     /// by `p0..p3` on dim 0..3 (right padding only through this constructor,
     /// exactly the graniteswitch router-lane use). op_params = the 8 pad
     /// widths + circular = 0.
@@ -1043,7 +1043,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_pad_ext (ggml.c:5166-5210): the full 8-width form of
+    /// verify against ggml_pad_ext (ggml.c:5166-5210): the full 8-width form of
     /// [`Context::pad`] — left/right pads on all four dims, F32, zero-filled
     /// margins (circular stays unported, asserted in compute). Audio round 4:
     /// parakeet's local-attention chunk padding pads dim2 on both sides
@@ -1083,7 +1083,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_rope_ext_back (ggml.c:4485-4502): builds ggml_rope_ext then
+    /// verify against ggml_rope_ext_back (ggml.c:4485-4502): builds ggml_rope_ext then
     /// flips the op to GGML_OP_ROPE_BACK — the kernel is the *same* rope_flt
     /// body with `sin_sign = -1` (ops.cpp:6264-6285), i.e. the inverse
     /// rotation. deepseek4 de-rotates the attention output through this
@@ -1112,7 +1112,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_swiglu_clamp (ggml.c:3123-3132 → ggml_glu_impl :2906 with
+    /// verify against ggml_swiglu_clamp (ggml.c:3123-3132 → ggml_glu_impl :2906 with
     /// b != NULL, GGML_GLU_OP_SWIGLU_CLAMP): op_params[0] = op, [1] =
     /// swapped (0), [3] = limit f32 bits. Kernel (ops.cpp:3408-3465):
     /// `min(gate, limit) / (1 + exp(-gate)) * clamp(up, -limit, limit)` — note
@@ -1131,7 +1131,7 @@ impl Context {
         self.init_op(r, GgmlOp::Glu, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_dsv4_hc_comb (ggml.c:6459-6505): F32 `[hc, hc, n_tokens]`
+    /// verify against ggml_dsv4_hc_comb (ggml.c:6459-6505): F32 `[hc, hc, n_tokens]`
     /// — the fused hyper-connection mixing matrix. `hc` is recovered from
     /// `hc_mix_dim = (2 + hc)*hc` exactly like the C (:6470-6476, asserted
     /// == 4); op_params[0] = eps (f32 bits), [1] = n_iter (the sinkhorn
@@ -1187,7 +1187,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_dsv4_hc_pre (ggml.c:6548-6553 → ggml_dsv4_hc_pre_impl :6510,
+    /// verify against ggml_dsv4_hc_pre (ggml.c:6548-6553 → ggml_dsv4_hc_pre_impl :6510,
     /// scale = 1.0, gated = false): F32 `[n_embd, n_tokens]` — the fused
     /// hyper-connection stream mix. x is `[n_embd, hc, n_tokens]`, weights
     /// `[hc, n_tokens]`; op_params[0] = scale (f32 bits), [1] = gated (0).
@@ -1213,7 +1213,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_dsv4_hc_pre_gated (ggml.c:6555-6586 → the `gated = true`
+    /// verify against ggml_dsv4_hc_pre_gated (ggml.c:6555-6586 → the `gated = true`
     /// arm of ggml_dsv4_hc_pre_impl, :6490-6540). The weights are the full
     /// `[n_embd, hc, n_tokens]` gate tensor and the kernel folds the sigmoid
     /// gate and the mean over the streams in one op (ops.cpp gated branch).
@@ -1246,7 +1246,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_dsv4_hc_post (ggml.c:6565-6607): F32
+    /// verify against ggml_dsv4_hc_post (ggml.c:6565-6607): F32
     /// `[n_embd, hc, n_tokens]` — the fused hyper-connection output mix.
     /// x `[n_embd, n_tokens]`, residual `[n_embd, hc, n_tokens]`, post
     /// `[hc, n_tokens]`, comb `[hc, hc, n_tokens]` (None = the NULL branch —
@@ -1305,7 +1305,7 @@ impl Context {
         self.init_op(r, GgmlOp::MulMat, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_mul_mat_set_hint(ctx, GGML_HINT_SRC0_IS_HADAMARD)
+    /// verify against ggml_mul_mat_set_hint(ctx, GGML_HINT_SRC0_IS_HADAMARD)
     /// (ggml.c:3368-3373): mark an existing MUL_MAT node's src0 as a Hadamard
     /// matrix — the CPU kernel then computes the fast Walsh-Hadamard
     /// transform (ggml-cpu.c:1263-1266), not the gemm dot. `llama_mul_mat_
@@ -1316,7 +1316,7 @@ impl Context {
         self.set_op_params_i32(r, &[0, GGML_HINT_SRC0_IS_HADAMARD]);
     }
 
-    /// 对照 ggml_mul_mat_id (ggml.c:3354) — MoE expert matmul: `as` is a stack of
+    /// verify against ggml_mul_mat_id (ggml.c:3354) — MoE expert matmul: `as` is a stack of
     /// n_expert matrices {ne00, ne01, ne02}, `b` the activations {ne00, ne11,
     /// n_tokens} and `ids` the per-(slot, token) expert indices {n_ids, n_tokens}
     /// (I32, may be a strided view — see ggml_argsort_top_k). Result
@@ -1341,7 +1341,7 @@ impl Context {
         self.init_op(r, GgmlOp::MulMatId, [Some(as_), Some(b), Some(ids)])
     }
 
-    /// 对照 ggml_add_id (ggml.c:2150): dst[i0, i1, i2] = a[...] + b[i0, ids[i1, i2]].
+    /// verify against ggml_add_id (ggml.c:2150): dst[i0, i1, i2] = a[...] + b[i0, ids[i1, i2]].
     /// `b` is the per-expert bias {ne0, n_expert}; a/dst are {ne0, n_ids, n_tokens}.
     pub fn add_id(&mut self, a: TensorId, b: TensorId, ids: TensorId) -> TensorId {
         let (ane, bne, ine) = (
@@ -1359,14 +1359,14 @@ impl Context {
 
     // ===================== norm / rms_norm / scale =====================
 
-    /// 对照 ggml_norm (ggml.c:3151). op_params[0] = eps (f32 bits), [1] = 0.
+    /// verify against ggml_norm (ggml.c:3151). op_params[0] = eps (f32 bits), [1] = 0.
     pub fn norm(&mut self, a: TensorId, eps: f32) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Norm, [Some(a), None, None]);
         self.set_op_params_i32(r, &[eps.to_bits() as i32, 0]); // [1] == 0 => plain norm
         r
     }
-    /// 对照 ggml_norm_inplace (ggml.c:3158)
+    /// verify against ggml_norm_inplace (ggml.c:3158)
     pub fn norm_inplace(&mut self, a: TensorId, eps: f32) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Norm, [Some(a), None, None]);
@@ -1374,7 +1374,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_rms_norm (ggml.c:3182). Encoded as Norm + params[1]==1 until
+    /// verify against ggml_rms_norm (ggml.c:3182). Encoded as Norm + params[1]==1 until
     /// tensor.rs grows a GgmlOp::RmsNorm variant.
     pub fn rms_norm(&mut self, a: TensorId, eps: f32) -> TensorId {
         let r = self.dup_tensor_of(a);
@@ -1382,7 +1382,7 @@ impl Context {
         self.set_op_params_i32(r, &[eps.to_bits() as i32, OP_FLAG_NORM_IS_RMS]);
         r
     }
-    /// 对照 ggml_rms_norm_inplace (ggml.c:3189)
+    /// verify against ggml_rms_norm_inplace (ggml.c:3189)
     pub fn rms_norm_inplace(&mut self, a: TensorId, eps: f32) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Norm, [Some(a), None, None]);
@@ -1390,7 +1390,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_l2_norm (ggml.c:3275): dst = x / max(||x||_2, eps), the
+    /// verify against ggml_l2_norm (ggml.c:3275): dst = x / max(||x||_2, eps), the
     /// row sum of squares accumulated in f64 like the CPU kernel
     /// (ggml-cpu/ops.cpp:4486). Encoded as Norm + params[1]==2 (the RMS
     /// precedent). F32 only, like the C.
@@ -1401,14 +1401,14 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_scale (ggml.c:3467). op_params = {s, b=0} f32 bits.
+    /// verify against ggml_scale (ggml.c:3467). op_params = {s, b=0} f32 bits.
     pub fn scale(&mut self, a: TensorId, s: f32) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Scale, [Some(a), None, None]);
         self.params_f32(r, &[s, 0.0]);
         r
     }
-    /// 对照 ggml_scale_bias (ggml.c:3481) — op_params = {s, b}, the kernel's
+    /// verify against ggml_scale_bias (ggml.c:3481) — op_params = {s, b}, the kernel's
     /// `ggml_vec_mad1_f32` path (y = x*s + b). deepseek4's hc pre gates use
     /// it with s = 1 (deepseek4.cpp:384: `pre + dsv4_hc_eps`).
     pub fn scale_bias(&mut self, a: TensorId, s: f32, b: f32) -> TensorId {
@@ -1417,7 +1417,7 @@ impl Context {
         self.params_f32(r, &[s, b]);
         r
     }
-    /// 对照 ggml_scale_inplace (ggml.c:3474)
+    /// verify against ggml_scale_inplace (ggml.c:3474)
     pub fn scale_inplace(&mut self, a: TensorId, s: f32) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Scale, [Some(a), None, None]);
@@ -1427,12 +1427,12 @@ impl Context {
 
     // ===================== soft_max =====================
 
-    /// 对照 ggml_soft_max (ggml.c:4179): scale=1, max_bias=0.
+    /// verify against ggml_soft_max (ggml.c:4179): scale=1, max_bias=0.
     pub fn soft_max(&mut self, a: TensorId) -> TensorId {
         self.soft_max_ext(a, None, 1.0, 0.0)
     }
 
-    /// 对照 ggml_soft_max_ext (ggml.c:4191).
+    /// verify against ggml_soft_max_ext (ggml.c:4191).
     /// `mask` is src[1] (F32 or F16). op_params = {scale, max_bias} f32 bits.
     pub fn soft_max_ext(
         &mut self,
@@ -1458,7 +1458,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_soft_max_add_sinks (ggml.c:4209) — attach the attention-sink
+    /// verify against ggml_soft_max_add_sinks (ggml.c:4209) — attach the attention-sink
     /// logits (F32, one per head = src[0]->ne[2]) as src[2] of an existing
     /// softmax node. The CPU kernel then folds `expf(sk[h] - max)` into the
     /// denominator and includes sk[h] in the row max (ops.cpp:5625-5680).
@@ -1481,7 +1481,7 @@ impl Context {
 
     // ===================== glu / top-k =====================
 
-    /// 对照 ggml_swiglu_oai (ggml.c:2802 → ggml_glu_impl, ggml.c:2760) with
+    /// verify against ggml_swiglu_oai (ggml.c:2802 → ggml_glu_impl, ggml.c:2760) with
     /// alpha/limit in op_params[2]/[3] (f32 bits); params[0] = GGML_GLU_OP_SWIGLU_OAI,
     /// params[1] = swapped (0). src = [gate, up].
     pub fn swiglu_oai(&mut self, a: TensorId, b: TensorId, alpha: f32, limit: f32) -> TensorId {
@@ -1502,7 +1502,7 @@ impl Context {
         self.init_op(r, GgmlOp::Glu, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_argsort_top_k (ggml.c:5454): argsort DESC then a strided view of
+    /// verify against ggml_argsort_top_k (ggml.c:5454): argsort DESC then a strided view of
     /// the first k columns. The view keeps the full-row stride nb[1] (= ne0*4),
     /// exactly like C — downstream get_rows/add_id/mul_mat_id read ids through nb.
     pub fn argsort_top_k(&mut self, a: TensorId, k: i32) -> TensorId {
@@ -1517,14 +1517,14 @@ impl Context {
 
     // ===================== tanh / silu / gelu =====================
 
-    /// 对照 ggml_tanh (ggml.c:2709). op = UNARY(GgmlOp::Silu), params[0] = 4.
+    /// verify against ggml_tanh (ggml.c:2709). op = UNARY(GgmlOp::Silu), params[0] = 4.
     pub fn tanh(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
         self.set_op_params_i32(r, &[GGML_UNARY_OP_TANH]);
         r
     }
-    /// 对照 ggml_tanh_inplace (ggml.c:2715)
+    /// verify against ggml_tanh_inplace (ggml.c:2715)
     pub fn tanh_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
@@ -1532,14 +1532,14 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_silu (ggml.c:2824). op = UNARY(GgmlOp::Silu), params[0] = 10.
+    /// verify against ggml_silu (ggml.c:2824). op = UNARY(GgmlOp::Silu), params[0] = 10.
     pub fn silu(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
         self.set_op_params_i32(r, &[GGML_UNARY_OP_SILU]);
         r
     }
-    /// 对照 ggml_silu_inplace (ggml.c:2830)
+    /// verify against ggml_silu_inplace (ggml.c:2830)
     pub fn silu_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
@@ -1547,7 +1547,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_sigmoid (ggml.c:2731 → ggml_unary). op = UNARY(GgmlOp::Silu),
+    /// verify against ggml_sigmoid (ggml.c:2731 → ggml_unary). op = UNARY(GgmlOp::Silu),
     /// params[0] = 7 (GGML_UNARY_OP_SIGMOID). Kernel: `1/(1 + expf(-x))` with
     /// libm expf (vec.h:936 `ggml_vec_sigmoid_f32` has no SIMD variant) — used
     /// by the MoE router of LFM2 (`expert_gating_func == 2` = SIGMOID).
@@ -1557,7 +1557,7 @@ impl Context {
         self.set_op_params_i32(r, &[GGML_UNARY_OP_SIGMOID]);
         r
     }
-    /// 对照 ggml_relu (ggml.c:2737 → ggml_unary). op = UNARY(GgmlOp::Silu),
+    /// verify against ggml_relu (ggml.c:2737 → ggml_unary). op = UNARY(GgmlOp::Silu),
     /// params[0] = 6 (GGML_UNARY_OP_RELU). Kernel: vec.h:922
     /// `ggml_vec_relu_f32` = `(x > 0) ? x : 0` (no SIMD variant).
     pub fn relu(&mut self, a: TensorId) -> TensorId {
@@ -1566,14 +1566,14 @@ impl Context {
         self.set_op_params_i32(r, &[GGML_UNARY_OP_RELU]);
         r
     }
-    /// 对照 ggml_relu_inplace (ggml.c:2743)
+    /// verify against ggml_relu_inplace (ggml.c:2743)
     pub fn relu_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
         self.set_op_params_i32(r, &[GGML_UNARY_OP_RELU]);
         r
     }
-    /// 对照 ggml_sigmoid_inplace (ggml.c:2737)
+    /// verify against ggml_sigmoid_inplace (ggml.c:2737)
     pub fn sigmoid_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
@@ -1581,7 +1581,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_elu (ggml.c:2721-2727 → ggml_unary(GGML_UNARY_OP_ELU)). op =
+    /// verify against ggml_elu (ggml.c:2721-2727 → ggml_unary(GGML_UNARY_OP_ELU)). op =
     /// UNARY, params[0] = 5. Kernel: `(x > 0) ? x : expm1f(x)` (vec.h:915
     /// `ggml_vec_elu_f32`, scalar). The pocket-tts SEANet activation
     /// (pockettts-seanet.cpp:104).
@@ -1592,14 +1592,14 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_gelu (ggml.c:2782). op = UNARY, params[0] = 8 (GELU).
+    /// verify against ggml_gelu (ggml.c:2782). op = UNARY, params[0] = 8 (GELU).
     pub fn gelu(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
         self.set_op_params_i32(r, &[GGML_UNARY_OP_GELU]);
         r
     }
-    /// 对照 ggml_gelu_inplace (ggml.c:2788)
+    /// verify against ggml_gelu_inplace (ggml.c:2788)
     pub fn gelu_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
@@ -1607,7 +1607,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_gelu_erf (ggml.c:2796 → ggml_unary(GELU_ERF)). op = UNARY,
+    /// verify against ggml_gelu_erf (ggml.c:2796 → ggml_unary(GELU_ERF)). op = UNARY,
     /// params[0] = 16. Kernel: `0.5f*x*(1.0f + erff(x*SQRT_2_INV))`
     /// (`ggml_vec_gelu_erf_f32`, vec.h:1010 — a plain scalar libm loop, no
     /// SIMD variant at this commit); F32 and F16 only
@@ -1619,7 +1619,7 @@ impl Context {
         self.set_op_params_i32(r, &[GGML_UNARY_OP_GELU_ERF]);
         r
     }
-    /// 对照 ggml_gelu_erf_inplace (ggml.c:2802)
+    /// verify against ggml_gelu_erf_inplace (ggml.c:2802)
     pub fn gelu_erf_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
@@ -1627,7 +1627,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_exp (ggml.c:2892 → GGML_UNARY_OP_EXP). op = UNARY,
+    /// verify against ggml_exp (ggml.c:2892 → GGML_UNARY_OP_EXP). op = UNARY,
     /// params[0] = 13. Kernel: per-element `expf` — the reference has no SIMD
     /// exp at this commit (unary-ops.cpp:37 `op_exp` through
     /// `unary_op<op_exp>` :273, and vec.h:956 `ggml_vec_exp_f32` is a plain
@@ -1639,7 +1639,7 @@ impl Context {
         self.set_op_params_i32(r, &[GGML_UNARY_OP_EXP]);
         r
     }
-    /// 对照 ggml_exp_inplace (ggml.c:2898)
+    /// verify against ggml_exp_inplace (ggml.c:2898)
     pub fn exp_inplace(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None]);
@@ -1647,7 +1647,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_round (ggml.c:2963 → GGML_UNARY_OP_ROUND). op = UNARY,
+    /// verify against ggml_round (ggml.c:2963 → GGML_UNARY_OP_ROUND). op = UNARY,
     /// params[0] = 20. Kernel: per-element `roundf` (unary-ops.cpp:92 `op_round`
     /// → `unary_op<op_round>` :317); graniteswitch's router lane rounds the
     /// attended slot value before the I32 cast (granite-switch.cpp:285).
@@ -1658,7 +1658,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_xielu (ggml.c:2838 → GGML_UNARY_OP_XIELU). op = UNARY with a
+    /// verify against ggml_xielu (ggml.c:2838 → GGML_UNARY_OP_XIELU). op = UNARY with a
     /// parameter block instead of the bare op id at [0]:
     ///   [0] = GGML_UNARY_OP_XIELU (i32)
     ///   [1] = beta + softplus(alpha_n)   (f32 bits, folded at build time)
@@ -1701,7 +1701,7 @@ impl Context {
     /// ggml.h:2278 `GGML_OP_POOL_AVG`
     pub const GGML_OP_POOL_AVG: i32 = 1;
 
-    /// 对照 ggml_pool_2d (ggml.c:4928 → GGML_OP_POOL_2D). op_params =
+    /// verify against ggml_pool_2d (ggml.c:4928 → GGML_OP_POOL_2D). op_params =
     /// {op, k0, k1, s0, s1, p0, p1} — the C builder stores the float pads
     /// through an `int32_t params[]` (implicit truncation); dst is always F32
     /// `[calc_pool_out(ne0,k0,s0,p0), calc_pool_out(ne1,k1,s1,p1), ne2, ne3]`.
@@ -1738,7 +1738,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_pool_1d (ggml.c:5071 → GGML_OP_POOL_1D, ggml.h:2281).
+    /// verify against ggml_pool_1d (ggml.c:5071 → GGML_OP_POOL_1D, ggml.h:2281).
     /// op_params = {op, k0, s0, p0}; dst is always F32
     /// `[calc_pool_out(ne0,k0,s0,p0), ne1, ne2, ne3]`.
     /// Kernel: ops.cpp:7690-7754 (`ggml_compute_forward_pool_1d_ksp`) —
@@ -1760,7 +1760,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_arange (ggml.c:5475 → GGML_OP_ARANGE): a fresh F32 1-D
+    /// verify against ggml_arange (ggml.c:5475 → GGML_OP_ARANGE): a fresh F32 1-D
     /// tensor of `ceilf((stop-start)/step)` elements, `value = start + step*i`
     /// (ops.cpp:8386-8405).
     pub fn arange(&mut self, start: f32, stop: f32, step: f32) -> TensorId {
@@ -1774,7 +1774,7 @@ impl Context {
 
     // ===================== rope =====================
 
-    /// 对照 ggml_rope_impl (ggml.c:4266) — the single implementation shared by
+    /// verify against ggml_rope_impl (ggml.c:4266) — the single implementation shared by
     /// every rope flavor. op_params layout (16 i32):
     ///   [0]=n_past(0) [1]=n_dims [2]=mode [3]=n_ctx(0) [4]=n_ctx_orig
     ///   [5..11]=freq_base/freq_scale/ext_factor/attn_factor/beta_fast/beta_slow
@@ -1843,7 +1843,7 @@ impl Context {
 
     // ===================== rope offset (deepseek2 MLA batch 6) =============
 
-    /// 对照 ggml_rope_set_offset (ggml.c:4528-4536): set op_params[15] = n_offs
+    /// verify against ggml_rope_set_offset (ggml.c:4528-4536): set op_params[15] = n_offs
     /// on an existing ROPE node, so the rotation covers the *trailing* pairs
     /// `[n_offs, n_offs + n_dims)` of each row (deepseek2.cpp:617 — the
     /// non-MLA path ropes q's trailing qk_rope segment past the qk_nope
@@ -1866,17 +1866,17 @@ impl Context {
         a
     }
 
-    /// 对照 ggml_rope (ggml.c:4325)
+    /// verify against ggml_rope (ggml.c:4325)
     pub fn rope(&mut self, a: TensorId, b: TensorId, n_dims: i32, mode: i32) -> TensorId {
         self.rope_impl(a, b, None, n_dims, None, mode, 0, 10000.0, 1.0, 0.0, 1.0, 0.0, 0.0, false)
     }
 
-    /// 对照 ggml_rope_inplace (ggml.c:4378)
+    /// verify against ggml_rope_inplace (ggml.c:4378)
     pub fn rope_inplace(&mut self, a: TensorId, b: TensorId, n_dims: i32, mode: i32) -> TensorId {
         self.rope_impl(a, b, None, n_dims, None, mode, 0, 10000.0, 1.0, 0.0, 1.0, 0.0, 0.0, true)
     }
 
-    /// 对照 ggml_rope_multi (ggml.c:4336): mrope with `sections` and the
+    /// verify against ggml_rope_multi (ggml.c:4336): mrope with `sections` and the
     /// optional freq-factor tensor (src[2]) — gemma4's per-layer `rope_freqs`
     /// (gemma4.cpp:129/142, proportional rope) and qwen35's IMROPE
     /// (qwen35.cpp:299-309, sections = hparams.rope_sections).
@@ -1903,7 +1903,7 @@ impl Context {
         )
     }
 
-    /// 对照 ggml_rope_ext (ggml.c:4389) with an optional freq-factor tensor
+    /// verify against ggml_rope_ext (ggml.c:4389) with an optional freq-factor tensor
     /// (src[2]) — the gemma4 full-attention layers.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_ext_c(
@@ -1927,7 +1927,7 @@ impl Context {
         )
     }
 
-    /// 对照 ggml_rope_ext (ggml.c:4389). `c` (freq factors, src[2]) is accepted
+    /// verify against ggml_rope_ext (ggml.c:4389). `c` (freq factors, src[2]) is accepted
     /// verbatim (see `rope_ext_c`); the callers that pass None are unchanged.
     #[allow(clippy::too_many_arguments)]
     pub fn rope_ext(
@@ -1951,7 +1951,7 @@ impl Context {
         )
     }
 
-    /// 对照 ggml_rope_ext_inplace (ggml.c:4409)
+    /// verify against ggml_rope_ext_inplace (ggml.c:4409)
     #[allow(clippy::too_many_arguments)]
     pub fn rope_ext_inplace(
         &mut self,
@@ -1976,7 +1976,7 @@ impl Context {
 
     // ===================== get_rows =====================
 
-    /// 对照 ggml_get_rows (ggml.c:3954)
+    /// verify against ggml_get_rows (ggml.c:3954)
     pub fn get_rows(&mut self, a: TensorId, b: TensorId) -> TensorId {
         let (ane, bne) = (
             self.tensors[a.0 as usize].ne,
@@ -1997,7 +1997,7 @@ impl Context {
         self.init_op(r, GgmlOp::GetRows, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_get_rows_back (ggml.c:3979). `c` only contributes the output
+    /// verify against ggml_get_rows_back (ggml.c:3979). `c` only contributes the output
     /// shape in C. Encoded as GetRows + op_params[15] == 1.
     pub fn get_rows_back(&mut self, a: TensorId, b: TensorId, c: TensorId) -> TensorId {
         let (ane, bne, cne) = (
@@ -2017,7 +2017,7 @@ impl Context {
 
     // ===================== cpy / cont =====================
 
-    /// 对照 ggml_cpy (ggml.c:3603): result is a view of the destination `b`.
+    /// verify against ggml_cpy (ggml.c:3603): result is a view of the destination `b`.
     pub fn cpy(&mut self, a: TensorId, b: TensorId) -> TensorId {
         assert_eq!(
             self.tensors[a.0 as usize].n_elements(),
@@ -2028,14 +2028,14 @@ impl Context {
         self.init_op(r, GgmlOp::Cpy, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_cont (ggml.c:3639). GGML_OP_CONT maps to GgmlOp::Dup here
+    /// verify against ggml_cont (ggml.c:3639). GGML_OP_CONT maps to GgmlOp::Dup here
     /// (C's forward_cont calls forward_dup unchanged).
     pub fn cont(&mut self, a: TensorId) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.init_op(r, GgmlOp::Dup, [Some(a), None, None])
     }
 
-    /// 对照 ggml_cont_4d (ggml.c:3670): fresh **contiguous** tensor of the given
+    /// verify against ggml_cont_4d (ggml.c:3670): fresh **contiguous** tensor of the given
     /// shape filled with `a`'s elements in `a`'s own dimension order (the CPU
     /// kernel is forward_dup, ops.cpp:326 — a permuted `a` is linearised here).
     pub fn cont_4d(&mut self, a: TensorId, ne0: i64, ne1: i64, ne2: i64, ne3: i64) -> TensorId {
@@ -2049,19 +2049,19 @@ impl Context {
         self.init_op(r, GgmlOp::Dup, [Some(a), None, None])
     }
 
-    /// 对照 ggml_cont_3d (ggml.c:3661)
+    /// verify against ggml_cont_3d (ggml.c:3661)
     pub fn cont_3d(&mut self, a: TensorId, ne0: i64, ne1: i64, ne2: i64) -> TensorId {
         self.cont_4d(a, ne0, ne1, ne2, 1)
     }
 
-    /// 对照 ggml_cont_2d (ggml.c:3653)
+    /// verify against ggml_cont_2d (ggml.c:3653)
     pub fn cont_2d(&mut self, a: TensorId, ne0: i64, ne1: i64) -> TensorId {
         self.cont_4d(a, ne0, ne1, 1, 1)
     }
 
     // ===================== views / reshape / permute / transpose =====================
 
-    /// 对照 ggml_view_1d (ggml.c:3800)
+    /// verify against ggml_view_1d (ggml.c:3800)
     pub fn view_1d(&mut self, a: TensorId, ne0: i64, offset: usize) -> TensorId {
         let r = self.view_of(a, [ne0, 1, 1, 1], offset);
         self.set_op_params_i32(
@@ -2071,7 +2071,7 @@ impl Context {
         self.init_op(r, GgmlOp::View, [Some(a), None, None])
     }
 
-    /// 对照 ggml_view_2d (ggml.c:3812)
+    /// verify against ggml_view_2d (ggml.c:3812)
     pub fn view_2d(
         &mut self,
         a: TensorId,
@@ -2094,7 +2094,7 @@ impl Context {
         self.init_op(r, GgmlOp::View, [Some(a), None, None])
     }
 
-    /// 对照 ggml_view_3d (ggml.c:3832)
+    /// verify against ggml_view_3d (ggml.c:3832)
     pub fn view_3d(
         &mut self,
         a: TensorId,
@@ -2119,7 +2119,7 @@ impl Context {
         self.init_op(r, GgmlOp::View, [Some(a), None, None])
     }
 
-    /// 对照 ggml_view_4d (ggml.c:3854)
+    /// verify against ggml_view_4d (ggml.c:3854)
     #[allow(clippy::too_many_arguments)]
     pub fn view_4d(
         &mut self,
@@ -2147,7 +2147,7 @@ impl Context {
         self.init_op(r, GgmlOp::View, [Some(a), None, None])
     }
 
-    /// 对照 ggml_reshape (ggml.c:3690): takes the shape from `b`.
+    /// verify against ggml_reshape (ggml.c:3690): takes the shape from `b`.
     pub fn reshape(&mut self, a: TensorId, b: TensorId) -> TensorId {
         let bne = self.tensors[b.0 as usize].ne;
         assert!(is_contiguous_ctx(self, a), "reshape: a must be contiguous");
@@ -2160,7 +2160,7 @@ impl Context {
         self.init_op(r, GgmlOp::Reshape, [Some(a), None, None])
     }
 
-    /// 对照 ggml_reshape_1d (ggml.c:3707)
+    /// verify against ggml_reshape_1d (ggml.c:3707)
     pub fn reshape_1d(&mut self, a: TensorId, ne0: i64) -> TensorId {
         assert!(is_contiguous_ctx(self, a), "reshape_1d: a must be contiguous");
         assert_eq!(self.tensors[a.0 as usize].n_elements(), ne0);
@@ -2168,7 +2168,7 @@ impl Context {
         self.init_op(r, GgmlOp::Reshape, [Some(a), None, None])
     }
 
-    /// 对照 ggml_reshape_2d (ggml.c:3724)
+    /// verify against ggml_reshape_2d (ggml.c:3724)
     pub fn reshape_2d(&mut self, a: TensorId, ne0: i64, ne1: i64) -> TensorId {
         assert!(is_contiguous_ctx(self, a), "reshape_2d: a must be contiguous");
         assert_eq!(self.tensors[a.0 as usize].n_elements(), ne0 * ne1);
@@ -2176,7 +2176,7 @@ impl Context {
         self.init_op(r, GgmlOp::Reshape, [Some(a), None, None])
     }
 
-    /// 对照 ggml_reshape_3d (ggml.c:3742)
+    /// verify against ggml_reshape_3d (ggml.c:3742)
     pub fn reshape_3d(&mut self, a: TensorId, ne0: i64, ne1: i64, ne2: i64) -> TensorId {
         assert!(is_contiguous_ctx(self, a), "reshape_3d: a must be contiguous");
         assert_eq!(self.tensors[a.0 as usize].n_elements(), ne0 * ne1 * ne2);
@@ -2184,7 +2184,7 @@ impl Context {
         self.init_op(r, GgmlOp::Reshape, [Some(a), None, None])
     }
 
-    /// 对照 ggml_reshape_4d (ggml.c:3761)
+    /// verify against ggml_reshape_4d (ggml.c:3761)
     pub fn reshape_4d(&mut self, a: TensorId, ne0: i64, ne1: i64, ne2: i64, ne3: i64) -> TensorId {
         assert!(is_contiguous_ctx(self, a), "reshape_4d: a must be contiguous");
         assert_eq!(self.tensors[a.0 as usize].n_elements(), ne0 * ne1 * ne2 * ne3);
@@ -2192,7 +2192,7 @@ impl Context {
         self.init_op(r, GgmlOp::Reshape, [Some(a), None, None])
     }
 
-    /// 对照 ggml_permute (ggml.c:3878)
+    /// verify against ggml_permute (ggml.c:3878)
     pub fn permute(&mut self, a: TensorId, axis0: usize, axis1: usize, axis2: usize, axis3: usize) -> TensorId {
         let mut axes = [axis0, axis1, axis2, axis3];
         axes.sort_unstable();
@@ -2213,7 +2213,7 @@ impl Context {
         self.init_op(r, GgmlOp::Permute, [Some(a), None, None])
     }
 
-    /// 对照 ggml_transpose (ggml.c:3934)
+    /// verify against ggml_transpose (ggml.c:3934)
     pub fn transpose(&mut self, a: TensorId) -> TensorId {
         let r = self.view_tensor_of(a);
         {
@@ -2230,7 +2230,7 @@ impl Context {
 
     // ===================== argmax / argsort =====================
 
-    /// 对照 ggml_argmax (ggml.c:2537)
+    /// verify against ggml_argmax (ggml.c:2537)
     pub fn argmax(&mut self, a: TensorId) -> TensorId {
         let at = &self.tensors[a.0 as usize];
         assert!(at.is_matrix(), "argmax: a must be matrix");
@@ -2239,7 +2239,7 @@ impl Context {
         self.init_op(r, GgmlOp::ArgMax, [Some(a), None, None])
     }
 
-    /// 对照 ggml_argsort (ggml.c:5423). order: GGML_SORT_ORDER_ASC/DESC.
+    /// verify against ggml_argsort (ggml.c:5423). order: GGML_SORT_ORDER_ASC/DESC.
     pub fn argsort(&mut self, a: TensorId, order: i32) -> TensorId {
         let ne = self.tensors[a.0 as usize].ne;
         let r = self.new_tensor(GgmlType::I32, ne);
@@ -2249,13 +2249,13 @@ impl Context {
 
     // ===================== diag_mask_inf =====================
 
-    /// 对照 ggml_diag_mask_inf (ggml.c:4062)
+    /// verify against ggml_diag_mask_inf (ggml.c:4062)
     pub fn diag_mask_inf(&mut self, a: TensorId, n_past: i32) -> TensorId {
         let r = self.dup_tensor_of(a);
         self.set_op_params_i32(r, &[n_past]);
         self.init_op(r, GgmlOp::DiagMaskInf, [Some(a), None, None])
     }
-    /// 对照 ggml_diag_mask_inf_inplace (ggml.c:4069)
+    /// verify against ggml_diag_mask_inf_inplace (ggml.c:4069)
     pub fn diag_mask_inf_inplace(&mut self, a: TensorId, n_past: i32) -> TensorId {
         let r = self.view_tensor_of(a);
         self.set_op_params_i32(r, &[n_past]);
@@ -2264,7 +2264,7 @@ impl Context {
 
     // ===================== concat / sum_rows / repeat =====================
 
-    /// 对照 ggml_concat (ggml.c:2622). dim: 0..=3.
+    /// verify against ggml_concat (ggml.c:2622). dim: 0..=3.
     pub fn concat(&mut self, a: TensorId, b: TensorId, dim: usize) -> TensorId {
         assert!(dim < MAX_DIMS, "concat dim");
         let (ane, bne) = (self.tensors[a.0 as usize].ne, self.tensors[b.0 as usize].ne);
@@ -2284,7 +2284,7 @@ impl Context {
         self.init_op(r, GgmlOp::Concat, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_sum_rows (ggml.c:2490)
+    /// verify against ggml_sum_rows (ggml.c:2490)
     pub fn sum_rows(&mut self, a: TensorId) -> TensorId {
         let ane = self.tensors[a.0 as usize].ne;
         let ty = self.tensors[a.0 as usize].ty;
@@ -2292,7 +2292,7 @@ impl Context {
         self.init_op(r, GgmlOp::SumRows, [Some(a), None, None])
     }
 
-    /// 对照 ggml_repeat (ggml.c:2570): repeat `a` to the shape of `b`.
+    /// verify against ggml_repeat (ggml.c:2570): repeat `a` to the shape of `b`.
     pub fn repeat(&mut self, a: TensorId, b: TensorId) -> TensorId {
         assert!(can_repeat(self, a, b), "repeat: !can_repeat");
         let bne = self.tensors[b.0 as usize].ne;
@@ -2303,7 +2303,7 @@ impl Context {
 
     // ===================== flash_attn_ext =====================
 
-    /// 对照 ggml_flash_attn_ext (ggml.c:5497).
+    /// verify against ggml_flash_attn_ext (ggml.c:5497).
     ///
     /// src = [q, k, v, mask]; q [DK, T, H, S], k/v [D, S_kv, H_kv, S],
     /// mask [S_kv, T, mask_ne2, mask_ne3] F16 contiguous (mask optional).
@@ -2379,7 +2379,7 @@ impl Context {
 
     // ===================== ssm (mamba2 / shortconv) =====================
 
-    /// 对照 ggml_ssm_conv (ggml.c:5659-5683) — causal 1D convolution.
+    /// verify against ggml_ssm_conv (ggml.c:5659-5683) — causal 1D convolution.
     ///
     /// `sx` = conv_x {d_conv - 1 + n_t, d_inner, n_seqs} (F32, 3d, nb[1] ==
     /// ne[0]*4), `c` = conv1d.weight {d_conv, d_inner} (F32, matrix).
@@ -2411,7 +2411,7 @@ impl Context {
         self.init_op(r, GgmlOp::SsmConv, [Some(sx), Some(c), None])
     }
 
-    /// 对照 ggml_ssm_scan (ggml.c:5729-5790) — mamba2 selective scan.
+    /// verify against ggml_ssm_scan (ggml.c:5729-5790) — mamba2 selective scan.
     ///
     /// src = [s, x, dt, A, B, C, ids]; op_params[0] = K. Result is the
     /// concatenation of y (nelements(x)) and K state snapshots per sequence:
@@ -2499,7 +2499,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_swiglu_split (ggml.c:3061 → ggml_glu_impl with b != NULL):
+    /// verify against ggml_swiglu_split (ggml.c:3061 → ggml_glu_impl with b != NULL):
     /// `a` and `b` are the *already split* halves, result = silu(a) * b with the
     /// shape of `a` (ggml.c:2918-2919: ne0 = a->ne0 since b is not NULL).
     /// op_params[0] = GGML_GLU_OP_SWIGLU, [1] = swapped (0).
@@ -2514,7 +2514,7 @@ impl Context {
         self.init_op(r, GgmlOp::Glu, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_geglu_split (ggml.c:3043 → ggml_glu_impl with b != NULL):
+    /// verify against ggml_geglu_split (ggml.c:3043 → ggml_glu_impl with b != NULL):
     /// result = gelu(a) * b (ggml-cpu/ops.cpp:3035 `ggml_compute_forward_geglu_f32`
     /// with src1 → `ggml_vec_geglu_f32`, the f16-table gelu). Used by the
     /// gemma4 MoE expert FFN (gemma4.cpp:190 `LLM_FFN_GELU` with gate_exps).
@@ -2530,7 +2530,7 @@ impl Context {
         self.init_op(r, GgmlOp::Glu, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_reglu_split (ggml.c:3019 → ggml_glu_impl with b != NULL):
+    /// verify against ggml_reglu_split (ggml.c:3019 → ggml_glu_impl with b != NULL):
     /// result = relu(a) * b — `(x > 0) ? x * g : 0` (ops.cpp:2892
     /// `ggml_compute_forward_reglu_f32` → vec.h:1401 ggml_vec_reglu_f32, a
     /// plain scalar loop). Used by smallthinker's MoE experts
@@ -2547,7 +2547,7 @@ impl Context {
         self.init_op(r, GgmlOp::Glu, [Some(a), Some(b), None])
     }
 
-    /// 对照 ggml_softplus (ggml.c:2860 → GGML_UNARY_OP_SOFTPLUS).
+    /// verify against ggml_softplus (ggml.c:2860 → GGML_UNARY_OP_SOFTPLUS).
     /// The CPU kernel is `ggml_compute_softplus_f32` = `(x > 20) ? x :
     /// logf(1 + expf(x))` (ggml-impl.h:107, see `ssm::softplus_f32`).
     pub fn softplus(&mut self, a: TensorId) -> TensorId {
@@ -2557,7 +2557,7 @@ impl Context {
         self.init_op(r, GgmlOp::Silu, [Some(a), None, None])
     }
 
-    /// 对照 ggml_repeat_4d (ggml.c:2596): repeat `a` to the given shape. C
+    /// verify against ggml_repeat_4d (ggml.c:2596): repeat `a` to the given shape. C
     /// builds a throwaway tensor carrying the target dims; the port does the
     /// same (the dummy is never a graph leaf, so it costs no storage).
     pub fn repeat_4d(&mut self, a: TensorId, ne0: i64, ne1: i64, ne2: i64, ne3: i64) -> TensorId {
@@ -2566,7 +2566,7 @@ impl Context {
         self.repeat(a, dummy)
     }
 
-    /// 对照 ggml_gated_delta_net (ggml.c:6364-6413) — the fused gated delta net
+    /// verify against ggml_gated_delta_net (ggml.c:6364-6413) — the fused gated delta net
     /// (delta-net-base.cpp:831-874 `build_delta_net_fused`).
     ///
     /// shapes (S_k == S_v, H_v % H_k == 0):
@@ -2644,7 +2644,7 @@ impl Context {
         }
     }
 
-    /// 对照 ggml_rwkv_wkv6 (ggml.c:5873-5912 → GGML_OP_RWKV_WKV6). k/v/r/td
+    /// verify against ggml_rwkv_wkv6 (ggml.c:5873-5912 → GGML_OP_RWKV_WKV6). k/v/r/td
     /// are {S, H, T}, tf is {S, H}, state is {S*S*H, n_seqs}; the packed
     /// result is {S*H, T + S*n_seqs} — the T output rows followed by the new
     /// state. Kernel: ops.cpp:10413-10603 (wkv.rs).
@@ -2681,7 +2681,7 @@ impl Context {
         self.init_op(res, GgmlOp::RwkvWkv6, src)
     }
 
-    /// 对照 ggml_gated_linear_attn (ggml.c:5916-5954 →
+    /// verify against ggml_gated_linear_attn (ggml.c:5916-5954 →
     /// GGML_OP_GATED_LINEAR_ATTN). k/v/q/g are {S, H, T}, state is
     /// {S*S*H, n_seqs}; `scale` rides op_params[0] as f32 bits. Kernel:
     /// ops.cpp:10623-11418 (wkv.rs).
@@ -2715,7 +2715,7 @@ impl Context {
         res
     }
 
-    /// 对照 ggml_rwkv_wkv7 (ggml.c:5959-6000 → GGML_OP_RWKV_WKV7). r/w/k/v/a/b
+    /// verify against ggml_rwkv_wkv7 (ggml.c:5959-6000 → GGML_OP_RWKV_WKV7). r/w/k/v/a/b
     /// are {S, H, T}, state is {S*S*H, n_seqs}; the packed result is
     /// {S*H, T + S*n_seqs}. Kernel: ops.cpp:11422-11617 (wkv.rs).
     #[allow(clippy::too_many_arguments)]
@@ -2749,7 +2749,7 @@ impl Context {
 
     // ===================== vision: cast / im2col / conv_2d / interpolate =====================
 
-    /// 对照 ggml_cast (ggml.c:1970). Same node as C: `ggml_dup_tensor(ctx, a,
+    /// verify against ggml_cast (ggml.c:1970). Same node as C: `ggml_dup_tensor(ctx, a,
     /// type)` + GGML_OP_CAST, which the CPU backend dispatches to
     /// `ggml_compute_forward_dup` (ggml-cpu.c:1883 / ops.cpp:526) — i.e. this
     /// port's GgmlOp::Dup with a different dst type (compute.rs forward_dup,
@@ -2760,12 +2760,12 @@ impl Context {
         self.init_op(r, GgmlOp::Dup, [Some(a), None, None])
     }
 
-    /// 对照 ggml_calc_conv_output_size (ggml.c:4539)
+    /// verify against ggml_calc_conv_output_size (ggml.c:4539)
     fn calc_conv_output_size(ins: i64, ks: i64, s: i32, p: i32, d: i32) -> i64 {
         (ins + 2 * p as i64 - d as i64 * (ks - 1) - 1) / s as i64 + 1
     }
 
-    /// 对照 ggml_im2col (ggml.c:5547).
+    /// verify against ggml_im2col (ggml.c:5547).
     ///
     /// `a` = kernel [KW, KH, IC, OC], `b` = image [IW, IH, IC, N]; result
     /// [IC*KH*KW, OW, OH, N] (`dst_type` is what the caller wants to read it
@@ -2809,7 +2809,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_conv_2d (ggml.c:5678) — im2col + mul_mat against the reshaped
+    /// verify against ggml_conv_2d (ggml.c:5678) — im2col + mul_mat against the reshaped
     /// kernel, returned as [OW, OH, OC, N]. `a` = [KW, KH, IC, OC], `b` =
     /// [IW, IH, IC, N].
     #[allow(clippy::too_many_arguments)]
@@ -2846,7 +2846,7 @@ impl Context {
         self.cont(result)
     }
 
-    /// 对照 ggml_roll (ggml.c:5321 → GGML_OP_ROLL): circularly shift each dim
+    /// verify against ggml_roll (ggml.c:5321 → GGML_OP_ROLL): circularly shift each dim
     /// by `shift{i}` (positive = data moves up in index space — the kernel
     /// reads from `i - s`). src must have contiguous rows (nb[0] == 4, F32).
     /// Kernel: ops.cpp:8328-8373.
@@ -2863,7 +2863,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_conv_2d_direct (ggml.c:4947 → GGML_OP_CONV_2D, single node):
+    /// verify against ggml_conv_2d_direct (ggml.c:4947 → GGML_OP_CONV_2D, single node):
     /// `a` = kernel [KW, KH, IC, OC], `b` = input [W, H, C, N] →
     /// [OW, OH, OC, N]. dst type = b's type.
     ///
@@ -2917,7 +2917,7 @@ impl Context {
         self.cont(result)
     }
 
-    /// 对照 ggml_conv_2d_dw_direct (ggml.c:4907 → GGML_OP_CONV_2D_DW):
+    /// verify against ggml_conv_2d_dw_direct (ggml.c:4907 → GGML_OP_CONV_2D_DW):
     /// depthwise 2-D convolution, `a` = per-channel kernels [KW, KH, 1, C],
     /// `b` = [W, H, C, N] → [OW, OH, C, N]. Kernel: ops.cpp:7524-7619
     /// (whcn — the contiguous layout every audio graph feeds).
@@ -2950,7 +2950,7 @@ impl Context {
         r
     }
 
-    /// 对照 ggml_interpolate (ggml.c:5199, `ggml_interpolate_impl` at :5156).
+    /// verify against ggml_interpolate (ggml.c:5199, `ggml_interpolate_impl` at :5156).
     /// op_params[0] = `mode` (ggml_scale_mode + ggml_scale_flag bits);
     /// the CPU kernel is ggml_compute_forward_upscale_f32 (ops.cpp:7978),
     /// reached through GGML_OP_UPSCALE.

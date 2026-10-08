@@ -7,7 +7,7 @@
 //!
 //! The graph side (kda/dsa/kpool builders) is the documented batch-A gap:
 //! it waits on the kv-cache lane's `llama_memory_hybrid_idx` kpool port
-//! (see the parity ledger 同步批次 A).
+//! (see the parity ledger sync batch A).
 
 use std::io::Write as _;
 use std::sync::Arc;

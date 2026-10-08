@@ -1,4 +1,4 @@
-//! clef — 对照 src/models/clef.cpp (a7b94df2c, upstream 99b95488c "model:
+//! clef — verify against src/models/clef.cpp (a7b94df2c, upstream 99b95488c "model:
 //! add support for clef decision model (text-only)")
 //!
 //! A Qwen3.5 backbone evaluated **without memory** (create_memory returns
@@ -514,7 +514,7 @@ pub struct ClefParams {
     pub head: ClefHeadParams,
 }
 
-/// 对照 clef.cpp:322-381 `graph::graph` + build_layer_attn (:415-476) +
+/// verify against clef.cpp:322-381 `graph::graph` + build_layer_attn (:415-476) +
 /// build_layer_attn_linear (:478-545) — the qwen35 trunk without memory,
 /// then the head; returns `res->t_embd` (the padded decision scores) and
 /// the graph. `kq_mask` is the causal no-cache [n_tokens, n_tokens] mask of

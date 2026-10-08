@@ -30,7 +30,7 @@ fn blocks_of<B>(bytes: &[u8], nb: usize) -> &[B] {
 
 // ===================== simple quants (x * q8_0) =====================
 
-/// 对照 ggml_vec_dot_q4_0_q8_0_generic (quants.c:225)
+/// verify against ggml_vec_dot_q4_0_q8_0_generic (quants.c:225)
 
 /// cast the first `nb` blocks of `bytes` (rd_rest slices run to arena end)
 fn cast_prefix<B: bytemuck::Pod>(bytes: &[u8], nb: usize) -> &[B] {
@@ -64,7 +64,7 @@ pub fn vec_dot_q4_0_q8_0_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// 对照 ggml_vec_dot_q5_0_q8_0_generic (quants.c:365)
+/// verify against ggml_vec_dot_q5_0_q8_0_generic (quants.c:365)
 pub fn vec_dot_q5_0_q8_0_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     let qk = QK8_0;
     let nb = n / qk;
@@ -97,7 +97,7 @@ pub fn vec_dot_q5_0_q8_0_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// 对照 ggml_vec_dot_q8_0_q8_0_generic (quants.c:451)
+/// verify against ggml_vec_dot_q8_0_q8_0_generic (quants.c:451)
 /// ggml_vec_dot_q4_1_q8_1 (generic, quants.c) — f16 d/m·d/s float tail
 pub fn vec_dot_q4_1_q8_1_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     use crate::blocks::{BlockQ4_1, BlockQ8_1, QK8_1};
@@ -172,7 +172,7 @@ pub fn vec_dot_q8_0_q8_0_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
 
 // ===================== K-quants (x * q8_K) =====================
 
-/// 对照 ggml_vec_dot_q2_K_q8_K_generic (quants.c:565)
+/// verify against ggml_vec_dot_q2_K_q8_K_generic (quants.c:565)
 pub fn vec_dot_q2_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     let nb = n / QK_K;
     debug_assert_eq!(n % QK_K, 0);
@@ -225,7 +225,7 @@ pub fn vec_dot_q2_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// 对照 ggml_vec_dot_q3_K_q8_K_generic (quants.c:617)
+/// verify against ggml_vec_dot_q3_K_q8_K_generic (quants.c:617)
 pub fn vec_dot_q3_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     let nb = n / QK_K;
     debug_assert_eq!(n % QK_K, 0);
@@ -304,7 +304,7 @@ pub fn vec_dot_q3_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
 }
 
 /// Decode the 12-byte packed 6-bit scales of Q4_K/Q5_K into (scales[8], mins[8])
-/// 对照 ggml_vec_dot_q4_K_q8_K_generic (quants.c:736-741)
+/// verify against ggml_vec_dot_q4_K_q8_K_generic (quants.c:736-741)
 #[inline]
 fn decode_q4k_scales(packed: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     const KMASK1: u32 = 0x3f3f_3f3f;
@@ -328,7 +328,7 @@ fn decode_q4k_scales(packed: &[u8; 12]) -> ([u8; 8], [u8; 8]) {
     (scales, mins)
 }
 
-/// 对照 ggml_vec_dot_q4_K_q8_K_generic (quants.c:696)
+/// verify against ggml_vec_dot_q4_K_q8_K_generic (quants.c:696)
 pub fn vec_dot_q4_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     let nb = n / QK_K;
     debug_assert_eq!(n % QK_K, 0);
@@ -399,7 +399,7 @@ pub fn vec_dot_q4_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// 对照 ggml_vec_dot_q5_K_q8_K_generic (quants.c:771)
+/// verify against ggml_vec_dot_q5_K_q8_K_generic (quants.c:771)
 pub fn vec_dot_q5_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     let nb = n / QK_K;
     debug_assert_eq!(n % QK_K, 0);
@@ -479,7 +479,7 @@ pub fn vec_dot_q5_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     sumf
 }
 
-/// 对照 ggml_vec_dot_q6_K_q8_K_generic (quants.c:851)
+/// verify against ggml_vec_dot_q6_K_q8_K_generic (quants.c:851)
 pub fn vec_dot_q6_K_q8_K_generic(n: usize, x: &[u8], y: &[u8]) -> f32 {
     let nb = n / QK_K;
     debug_assert_eq!(n % QK_K, 0);
@@ -1698,7 +1698,7 @@ pub fn vec_dot_iq4_xs_q8_K(n: usize, x: &[u8], y: &[u8]) -> f32 {
 
 // ===================== unquantized types =====================
 
-/// 对照 ggml_vec_dot_f32 scalar tail (vec.cpp:11; ggml_float = f64 accumulation)
+/// verify against ggml_vec_dot_f32 scalar tail (vec.cpp:11; ggml_float = f64 accumulation)
 pub fn vec_dot_f32(n: usize, x: &[f32], y: &[f32]) -> f32 {
     debug_assert!(x.len() >= n);
     debug_assert!(y.len() >= n);
@@ -1709,7 +1709,7 @@ pub fn vec_dot_f32(n: usize, x: &[f32], y: &[f32]) -> f32 {
     sumf as f32
 }
 
-/// 对照 ggml_vec_dot_f16 scalar tail (vec.cpp:264)
+/// verify against ggml_vec_dot_f16 scalar tail (vec.cpp:264)
 pub fn vec_dot_f16(n: usize, x: &[f16], y: &[f16]) -> f32 {
     let mut sumf = 0.0f64;
     for i in 0..n {
@@ -1718,7 +1718,7 @@ pub fn vec_dot_f16(n: usize, x: &[f16], y: &[f16]) -> f32 {
     sumf as f32
 }
 
-/// 对照 ggml_vec_dot_bf16 scalar tail (vec.cpp:139)
+/// verify against ggml_vec_dot_bf16 scalar tail (vec.cpp:139)
 pub fn vec_dot_bf16(n: usize, x: &[half::bf16], y: &[half::bf16]) -> f32 {
     let mut sumf = 0.0f64;
     for i in 0..n {

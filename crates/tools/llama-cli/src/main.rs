@@ -5,7 +5,7 @@
 //! with a loader but no builder exits with an error naming it (the reference
 //! aborts inside `llama_model::create_memory`/graph build).
 //!
-//! Non-flash-attn graph (对照锚点: 参考版 `llama-cli -fa off`); sampling via
+//! Non-flash-attn graph (verify against anchor: reference `llama-cli -fa off`); sampling via
 //! `llama::sampling::SamplingContext` (common_sampler replacement) with the
 //! reference default chain, EOG stopping (`llama_vocab_is_eog`) and a minimal
 //! single-turn chat mode (GGUF `tokenizer.chat_template` -> llama::chat).
@@ -36,7 +36,7 @@ use llama::speculative::{
 enum FlashAttn {
     Off,
     On,
-    /// parsed but currently == Off (task: "auto 先等同 off")
+    /// parsed but currently == Off (task: "auto behaves as off for now")
     Auto,
 }
 
