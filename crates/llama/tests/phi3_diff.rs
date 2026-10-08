@@ -1764,6 +1764,10 @@ fn phi3_rope_mscale_check() {
 /// interleaving, a product (not a sum).
 #[test]
 fn phi3_ffn_up_swiglu_split_check() {
+    if !ggml::simd_x86::avx512() {
+        eprintln!("skip: silu bit pattern compared against scalar on AVX512 hosts");
+        return;
+    }
     let n_ff = 96i64;
     let t = 3i64;
     let mut ctx = Context::new();
