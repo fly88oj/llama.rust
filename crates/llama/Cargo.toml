@@ -1,0 +1,15 @@
+[package]
+name = "llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ggml = { path = "../ggml" }
+half = { workspace = true }
+memmap2 = { workspace = true }
+bytemuck = { workspace = true }
+rayon = { workspace = true }
+# tokenizer pre-tokenizer regexes (std::regex ECMAScript equivalent; supports
+# lookaheads like `\s+(?!\S)` which the `regex` crate alone cannot express)
+fancy-regex = "0.14"
