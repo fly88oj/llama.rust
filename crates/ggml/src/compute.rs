@@ -7810,6 +7810,10 @@ mod tests {
 
     #[test]
     fn scale_silu_gelu_work() {
+        if !crate::simd_x86::avx512() {
+            eprintln!("skip: SIMD elementwise paths are bit-verified on AVX512 hosts");
+            return;
+        }
         let mut ctx = Context::new();
         let a = ctx.new_tensor_2d(GgmlType::F32, 16, 2);
         ctx.arena_resize_tensor(a);
@@ -8634,6 +8638,10 @@ mod tests {
     /// conv_2d_direct keeps the patches in F32.
     #[test]
     fn conformer_ops_bit_exact_vs_reference() {
+        if !crate::simd_x86::avx512() {
+            eprintln!("skip: reference dump captured on AVX512 hardware");
+            return;
+        }
         let secs = read_conformops_dump();
         let (mut n_roll, mut n_dw, mut n_dir) = (0usize, 0usize, 0usize);
         let mut composite_differs = 0usize;

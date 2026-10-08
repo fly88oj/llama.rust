@@ -1143,6 +1143,10 @@ mod dump_tests {
     /// so the test skips.
     #[test]
     fn tinyblas_routing_and_values_vs_reference() {
+        if !crate::simd_x86::avx512() {
+            eprintln!("skip: tinyBLAS routing and kernels are bit-verified on AVX512 hosts");
+            return;
+        }
         let bytes = std::fs::read(REF)
             .unwrap_or_else(|_| panic!("missing {REF}: build via parity/ref_tinyblas_dump.c"));
         let (flags, cases) = parse(&bytes);
@@ -1297,6 +1301,10 @@ mod dump_tests {
     /// sgemm.cpp:3827-4149.
     #[test]
     fn accepts_table_matches_the_reference_switch() {
+        if !crate::simd_x86::avx512() {
+            eprintln!("skip: tinyBLAS routing and kernels are bit-verified on AVX512 hosts");
+            return;
+        }
         use GgmlType::*;
         let table: &[(GgmlType, GgmlType, bool)] = &[
             (F32, F32, true),
@@ -1362,6 +1370,10 @@ mod dump_tests {
 /// undriven pool the C's chunk protocol runs job 0 only) and dumps C.
 #[test]
 fn f32_router_shape_matches_reference() {
+        if !crate::simd_x86::avx512() {
+            eprintln!("skip: tinyBLAS routing and kernels are bit-verified on AVX512 hosts");
+            return;
+        }
     let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/");
     let Ok(ab) = std::fs::read(format!("{base}tinyblas_router_ab.bin")) else {
         eprintln!("skipping: build it via parity/ref_tinyblas_router.c");
@@ -1495,6 +1507,10 @@ mod wire_tests {
     /// wrong (it also lacked the `k % KN` / `m % 4` gates).
     #[test]
     fn ne11_one_bails_on_every_plane() {
+        if !crate::simd_x86::avx512() {
+            eprintln!("skip: tinyBLAS routing and kernels are bit-verified on AVX512 hosts");
+            return;
+        }
         for (ty, ne11, planes, want) in [
             (GgmlType::Q5_0, 1usize, 4usize, None),               // n=1 per plane
             (GgmlType::Q5_0, 2, 4, Some(Op::Q5xQ8)),              // n=2 per plane
@@ -1535,6 +1551,10 @@ mod wire_tests {
     /// `vec_dot` fallback, which the counter must confirm too.
     #[test]
     fn mul_mat_routes_like_llamafile_sgemm() {
+        if !crate::simd_x86::avx512() {
+            eprintln!("skip: tinyBLAS routing and kernels are bit-verified on AVX512 hosts");
+            return;
+        }
         let cases: &[(GgmlType, usize, usize, usize, Option<Op>)] = &[
             // (ty, n=k, rows=m, cols per slice, expected Op)
             (GgmlType::Q5_0, 256, 32, 4, Some(Op::Q5xQ8)),
