@@ -684,6 +684,15 @@ fn file_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Build fam's synth file if it is missing — for callers that already hold
+/// [`file_lock`] and would otherwise deadlock in [`load_synth`]. On a cold
+/// /tmp (fresh CI runner) no earlier test has written the file yet.
+fn ensure_synth(fam: Fam) {
+    if std::fs::metadata(fam.path()).is_err() {
+        build_file(fam);
+    }
+}
+
 fn load_synth(fam: Fam) -> LlamaModel {
     {
         let _g = file_lock();
@@ -2806,6 +2815,7 @@ fn mtp2_speculation_matches_plain_greedy() {
     let n_predict = 16usize;
 
     for fam in all_fams() {
+        ensure_synth(fam);
         // the plain baseline (margins recorded for the near-tie notes)
         let mut m_plain = load_synth_nolock(fam);
         let (plain, margins) = plain_greedy_with_margins(&mut m_plain, fam, &prompt, n_predict);
@@ -2914,6 +2924,7 @@ fn mtp2_qwen35_rowcount_probe() {
     let _files = file_lock();
     let fam = Fam::Qwen35;
     let prompt: Vec<i32> = (1..=6).collect();
+    ensure_synth(fam);
 
     // the plain stream's first 13 tokens (the flip decides token 13)
     let mut m0 = load_synth_nolock(fam);
