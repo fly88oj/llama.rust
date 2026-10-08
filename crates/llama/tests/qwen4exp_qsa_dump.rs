@@ -27,7 +27,7 @@ use llama::model::{load_model, LlamaModel};
 use llama::vocab::Vocab;
 use memmap2::Mmap;
 
-const VOCAB_SPM: &str = "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+const VOCAB_SPM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
 const N_LAYER: i64 = 4;
 const N_EMBD: i64 = 64;
 const N_HEAD: i64 = 4;
@@ -711,6 +711,10 @@ fn run_port_stream(synth: &str, fa: bool) -> Vec<u8> {
 /// bit-identical to the NEW reference's (the no-embeddings probe arm)
 #[test]
 fn qwen4exp_qsa_ple_nodes_bit_exact_vs_reference() {
+    if !ggml::simd_x86::avx512() {
+        eprintln!("skip: node dump captured on AVX512 hardware");
+        return;
+    }
     // the static DUMP/ACTIVE globals serialize all dump-driven tests
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ref_path = concat!(
@@ -743,6 +747,10 @@ fn qwen4exp_qsa_ple_nodes_bit_exact_vs_reference() {
 /// (parity/qwen4exp_qsa_nodes_fa_ref.bin).
 #[test]
 fn qwen4exp_qsa_fa_nodes_bit_exact_vs_reference() {
+    if !ggml::simd_x86::avx512() {
+        eprintln!("skip: node dump captured on AVX512 hardware");
+        return;
+    }
     // the static DUMP/ACTIVE globals serialize all dump-driven tests
     let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let ref_path = concat!(

@@ -402,7 +402,8 @@ fn glm5_prefill_node_dump() {
 /// in lockstep with the fixture that produced nodes_ref.bin)
 mod synth {
     pub const VOCAB_SPM: &str =
-        "/home/jeffrey/llm/llama.cpp-pinned/models/ggml-vocab-llama-spm.gguf";
+        concat!(env!("CARGO_MANIFEST_DIR"),
+        "/tests/tokenizer_fixtures/vocab/ggml-vocab-llama-spm.gguf");
     pub const N_LAYER: usize = 3;
     pub const N_EMBD: i64 = 64;
     pub const N_HEAD: i64 = 4;
@@ -717,6 +718,10 @@ fn run_port_stream(synth: &str) -> Vec<u8> {
 /// 13 graph builds must be bit-identical to the NEW reference's
 #[test]
 fn glm5_graph_nodes_bit_exact_vs_reference() {
+    if !ggml::simd_x86::avx512() {
+        eprintln!("skip: node dump captured on AVX512 hardware");
+        return;
+    }
     let ref_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/glm5/nodes_ref.bin");
     let Some(ref_bytes) = std::fs::read(ref_path).ok() else {
         panic!(
