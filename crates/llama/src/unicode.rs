@@ -644,6 +644,170 @@ fn regex_split_custom_llama3(cpts: &[u32], offsets: &[usize]) -> Vec<usize> {
     bpe_offsets
 }
 
+/// K2-Horizon system regex (462524043, unicode.cpp:473-622):
+/// "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+///
+/// The existing llama3 splitter with a single rule widened: a letter run
+/// also takes marks, ZWNJ and ZWJ (the generic fallback cannot serve this
+/// regex — U+200C/U+200D collapse to the 0xD0 fallback byte there, so every
+/// ZWNJ/ZWJ would end a letter run).
+fn regex_split_custom_k2_horizon(cpts: &[u32], offsets: &[usize]) -> Vec<usize> {
+    let mut bpe_offsets: Vec<usize> = Vec::with_capacity(offsets.len());
+    let mut start = 0usize;
+    for &offset in offsets {
+        let offset_ini = start;
+        let offset_end = start + offset;
+        start = offset_end;
+        let out = std::mem::take(&mut bpe_offsets);
+        let mut sp = Splitter {
+            cpts,
+            offset_ini,
+            offset_end,
+            prev_end: offset_ini,
+            out,
+        };
+
+        // K2-Horizon: letter runs are (?:\p{L}|\p{M}|\u200C|\u200D)+
+        let is_k2_letter = |sp: &Splitter, pos: usize| -> bool {
+            let c = sp.cpt(pos);
+            if c == 0x200C || c == 0x200D {
+                return true;
+            }
+            let f = sp.flags(pos);
+            f.is_letter() || f.is_accent_mark()
+        };
+
+        let mut pos = offset_ini;
+        while pos < offset_end {
+            let cpt = sp.cpt(pos);
+            let flags = sp.flags(pos);
+
+            // regex: (?i:'s|'t|'re|'ve|'m|'ll|'d) — see `contraction` above
+            if contraction_at(&sp, pos, offset_end) > 0 {
+                pos += sp.add_token(pos + contraction_at(&sp, pos, offset_end));
+                continue;
+            }
+
+            // regex: [^\r\n\p{L}\p{N}]?(?:\p{L}|\p{M}|\u200C|\u200D)+
+            if !(cpt == '\r' as u32 || cpt == '\n' as u32 || flags.is_number()) {
+                if is_k2_letter(&sp, pos) || is_k2_letter(&sp, pos + 1) {
+                    pos += 1;
+                    while is_k2_letter(&sp, pos) {
+                        pos += 1;
+                    }
+                    sp.add_token(pos);
+                    continue;
+                }
+            }
+
+            // regex: \p{N}{1,3}
+            if flags.is_number() {
+                let mut ini = pos;
+                while sp.flags(pos).is_number() {
+                    pos += 1;
+                    if pos - ini >= 3 {
+                        sp.add_token(pos);
+                        ini = pos;
+                    }
+                }
+                sp.add_token(pos);
+                continue;
+            }
+
+            // regex: <space>?[^\s\p{L}\p{N}]+[\r\n]*
+            let mut flags2 = if cpt == ' ' as u32 {
+                sp.flags(pos + 1)
+            } else {
+                flags
+            };
+            if !(flags2.is_whitespace() | flags2.is_letter() | flags2.is_number())
+                && flags.as_uint() != 0
+            {
+                pos += usize::from(cpt == ' ' as u32);
+                while !(flags2.is_whitespace() | flags2.is_letter() | flags2.is_number())
+                    && flags2.as_uint() != 0
+                {
+                    pos += 1;
+                    flags2 = sp.flags(pos);
+                }
+                let mut cpt2 = sp.cpt(pos);
+                while cpt2 == '\r' as u32 || cpt2 == '\n' as u32 {
+                    pos += 1;
+                    cpt2 = sp.cpt(pos);
+                }
+                sp.add_token(pos);
+                continue;
+            }
+
+            let mut num_whitespaces = 0usize;
+            let mut last_end_r_or_n = 0usize;
+            while sp.flags(pos + num_whitespaces).is_whitespace() {
+                let cpt2 = sp.cpt(pos + num_whitespaces);
+                if cpt2 == '\r' as u32 || cpt2 == '\n' as u32 {
+                    last_end_r_or_n = pos + num_whitespaces + 1;
+                }
+                num_whitespaces += 1;
+            }
+
+            // regex: \s*[\r\n]+
+            if last_end_r_or_n > 0 {
+                pos = last_end_r_or_n;
+                sp.add_token(pos);
+                continue;
+            }
+
+            // regex: \s+(?!\S)
+            if num_whitespaces > 1 && sp.cpt(pos + num_whitespaces) != OUT_OF_RANGE {
+                pos += num_whitespaces - 1;
+                sp.add_token(pos);
+                continue;
+            }
+
+            // regex: \s+
+            if num_whitespaces > 0 {
+                pos += num_whitespaces;
+                sp.add_token(pos);
+                continue;
+            }
+
+            // no matches
+            pos += 1;
+            sp.add_token(pos);
+        }
+
+        bpe_offsets = sp.out;
+    }
+    bpe_offsets
+}
+
+/// the K2-Horizon contraction check with long-s folding — `match_contraction_ci`
+/// plus the 0x017F → 's' fold (unicode.cpp:520-525)
+fn contraction_at(sp: &Splitter, pos: usize, offset_end: usize) -> usize {
+    if sp.cpt(pos) == '\'' as u32 && pos + 1 < offset_end {
+        let mut cpt_next = tolower(sp.cpt(pos + 1));
+        if cpt_next == 0x017F {
+            cpt_next = 's' as u32; // Unicode case-folding of long s
+        }
+        if cpt_next == 's' as u32
+            || cpt_next == 't' as u32
+            || cpt_next == 'm' as u32
+            || cpt_next == 'd' as u32
+        {
+            return 2;
+        }
+        if pos + 2 < offset_end {
+            let cpt_next_next = tolower(sp.cpt(pos + 2));
+            if (cpt_next == 'r' as u32 && cpt_next_next == 'e' as u32)
+                || (cpt_next == 'v' as u32 && cpt_next_next == 'e' as u32)
+                || (cpt_next == 'l' as u32 && cpt_next_next == 'l' as u32)
+            {
+                return 3;
+            }
+        }
+    }
+    0
+}
+
 /// Qwen2 system regex:
 /// "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 fn regex_split_custom_qwen2(cpts: &[u32], offsets: &[usize]) -> Vec<usize> {
@@ -1157,6 +1321,11 @@ fn regex_split_custom(cpts: &[u32], regex_expr: &str, offsets: &[usize]) -> Vec<
         "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" => {
             regex_split_custom_qwen35(cpts, offsets)
         }
+        // K2-Horizon: llama3 splitter with marks + ZWNJ/ZWJ inside letter
+        // runs (462524043, unicode.cpp:1212-1216)
+        "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?(?:\\p{L}|\\p{M}|\\u200C|\\u200D)+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+" => {
+            regex_split_custom_k2_horizon(cpts, offsets)
+        }
         "\\p{Han}+" => regex_split_custom_kimi_k2(cpts, offsets),
         "\\p{AFMoE_digits}" => regex_split_custom_afmoe(cpts, offsets),
         "[^\\n]+|[\\n]+" => regex_split_custom_newlines(cpts, offsets),
@@ -1394,6 +1563,12 @@ fn byte_encoding_process(bpe_words: Vec<String>) -> Vec<String> {
 /// `unicode_regex_split(text, regex_exprs, byte_encode)` — split text into
 /// words by applying each regex in sequence.
 pub fn regex_split(text: &str, regex_exprs: &[String], byte_encode: bool) -> Vec<String> {
+    // 462524043 (unicode.cpp:1369-1371): the empty input returns early —
+    // the collapsed-representation pass below would otherwise emit one
+    // empty word
+    if text.is_empty() {
+        return Vec::new();
+    }
     let cpts = cpts_from_utf8(text.as_bytes());
 
     // compute collapsed codepoints only if needed by at least one regex

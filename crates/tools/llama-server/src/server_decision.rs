@@ -84,11 +84,17 @@ pub enum CommonDecisionType {
     /// all questions in one prompt, score of option i read from the
     /// embeddings output at row i
     Clef,
+    /// same as openjev, label codes of 1 or 2 letters (da263e727)
+    PplxDecider,
+    /// same as openjev, the labels depend on the question type (88dcc460d)
+    Lfm2D1,
+    /// same as laya, other prompt layout (a657f7e98)
+    Lfm2D1Omni,
     /// a decision model of a type that is not supported
     Unknown,
 }
 
-/// `COMMON_DECISION_TYPE_NAMES` (common.cpp:1150-1158)
+/// `COMMON_DECISION_TYPE_NAMES` (common.cpp:1163-1175)
 const COMMON_DECISION_TYPE_NAMES: &[(CommonDecisionType, &str)] = &[
     (CommonDecisionType::Openjev, "openjev"),
     (CommonDecisionType::Lev, "lev"),
@@ -96,6 +102,9 @@ const COMMON_DECISION_TYPE_NAMES: &[(CommonDecisionType, &str)] = &[
     (CommonDecisionType::Nimble, "nimble"),
     (CommonDecisionType::Laya, "laya"),
     (CommonDecisionType::Clef, "clef"),
+    (CommonDecisionType::PplxDecider, "pplx-decider"),
+    (CommonDecisionType::Lfm2D1, "lfm2-d1"),
+    (CommonDecisionType::Lfm2D1Omni, "lfm2-d1-omni"),
 ];
 
 /// `common_decision_type_from_string` (common.cpp:1160-1168)
@@ -124,6 +133,65 @@ pub fn common_get_decision_type(gguf: &ggml::gguf::Gguf) -> CommonDecisionType {
 // ---------------------------------------------------------------------------
 // question types (server-decision.h:14-27)
 // ---------------------------------------------------------------------------
+
+/// `server_model_output_modalities` (server-common.cpp:146-163, 4d60b4d08;
+/// PPLX_DECIDER/LFM2_D1/LFM2_D1_OMNI joined via da263e727/88dcc460d/a657f7e98)
+pub fn server_model_output_modalities(decision_type: CommonDecisionType) -> Vec<&'static str> {
+    match decision_type {
+        CommonDecisionType::Openjev
+        | CommonDecisionType::Lev
+        | CommonDecisionType::Kev
+        | CommonDecisionType::Nimble
+        | CommonDecisionType::Laya
+        | CommonDecisionType::Clef
+        | CommonDecisionType::PplxDecider
+        | CommonDecisionType::Lfm2D1
+        | CommonDecisionType::Lfm2D1Omni => vec!["decisions"],
+        // fallback when there is no decision type or the metadata is bad
+        _ => vec!["text"],
+    }
+}
+
+/// `server_model_architecture_json` (server-common.cpp:165-185, 4d60b4d08) —
+/// the architecture object of GET /models; shared by the direct server and
+/// the router
+pub fn server_model_architecture_json(
+    inp_image: bool,
+    inp_audio: bool,
+    inp_video: bool,
+    output_modalities: &[&str],
+) -> Json {
+    let mut input_modalities: Vec<&str> = vec!["text"];
+    if inp_image {
+        input_modalities.push("image");
+    }
+    if inp_audio {
+        input_modalities.push("audio");
+    }
+    if inp_video {
+        input_modalities.push("video");
+    }
+    Json::Object(vec![
+        (
+            "input_modalities".to_string(),
+            Json::Array(
+                input_modalities
+                    .into_iter()
+                    .map(|m| Json::String(m.to_string()))
+                    .collect(),
+            ),
+        ),
+        (
+            "output_modalities".to_string(),
+            Json::Array(
+                output_modalities
+                    .iter()
+                    .map(|&m| Json::String(m.to_string()))
+                    .collect(),
+            ),
+        ),
+    ])
+}
 
 /// `enum server_decision_question_type`
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +238,9 @@ pub struct ServerDecisionQuestion {
 pub struct DecisionSpec {
     /// logits of these tokens, at the last prompt token
     pub labels: Vec<i32>,
+    /// if set, number of labels per output, the output is their max
+    /// (server-task.h:181, 88dcc460d)
+    pub label_groups: Vec<i32>,
     /// embeddings[column] at these prompt positions
     pub markers: Vec<i32>,
     pub column: i32,
@@ -332,7 +403,7 @@ impl ServerDecisionContext {
                 n_options_max = labels.len();
                 noul_true_first = true;
             }
-            CommonDecisionType::Lev | CommonDecisionType::Nimble => {
+            CommonDecisionType::Lev | CommonDecisionType::Nimble | CommonDecisionType::PplxDecider => {
                 // label codes are A..Z then AA..ZZ, only the ones that are a
                 // single token are used
                 let mut codes: Vec<String> = Vec::new();
@@ -383,6 +454,19 @@ impl ServerDecisionContext {
                 noul_true_first = true;
                 choice_sorted = true;
             }
+            CommonDecisionType::Lfm2D1 => {
+                // (server-decision.cpp:125-127, 88dcc460d)
+                n_options_max = 255;
+                noul_true_first = true;
+            }
+            CommonDecisionType::Lfm2D1Omni => {
+                // (server-decision.cpp:128-133, a657f7e98)
+                token_marker = vocab.token_mask();
+                if token_marker == -1 {
+                    return Err("decision model has no mask token".to_string());
+                }
+                n_options_max = 255;
+            }
             _ => {
                 return Err(format!("unsupported decision model type: {type_name}"));
             }
@@ -409,7 +493,7 @@ impl ServerDecisionContext {
         })
     }
 
-    /// `can_share_prompt()` (server-decision.h:41-51)
+    /// `can_share_prompt()` (server-decision.h:41-54)
     pub fn can_share_prompt(&self) -> bool {
         matches!(
             self.ty,
@@ -417,18 +501,28 @@ impl ServerDecisionContext {
                 | CommonDecisionType::Lev
                 | CommonDecisionType::Kev
                 | CommonDecisionType::Nimble
+                | CommonDecisionType::PplxDecider
+                | CommonDecisionType::Lfm2D1
         )
     }
 
-    /// `is_joint()` (server-decision.h:53-55)
+    /// `is_joint()` (server-decision.h:56-58)
     pub fn is_joint(&self) -> bool {
         self.ty == CommonDecisionType::Clef
     }
 
-    /// `can_use_images()` (server-decision.h:57-66) — clef needs token and
-    /// embedding entries in the same batch (upstream TODO, PR #29622)
+    /// `can_use_images()` (server-decision.h:60-74) — clef's vision input
+    /// needs token and embedding entries in the same batch (9871df591): the
+    /// port's server has no mtmd wiring, so media still answers 501
     pub fn can_use_images(&self) -> bool {
-        matches!(self.ty, CommonDecisionType::Openjev)
+        matches!(
+            self.ty,
+            CommonDecisionType::Openjev
+                | CommonDecisionType::Clef
+                | CommonDecisionType::PplxDecider
+                | CommonDecisionType::Lfm2D1
+                | CommonDecisionType::Lfm2D1Omni
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -444,7 +538,12 @@ impl ServerDecisionContext {
 
         let state = j_get(body, "state")
             .ok_or_else(|| "\"state\" must be provided".to_string())?;
-        if state.is_null() {
+        // lfm2-d1 and lfm2-d1-omni accept a null state, for example to ask
+        // about images only (server-decision.cpp:147-149, 88dcc460d/a657f7e98)
+        if state.is_null()
+            && self.ty != CommonDecisionType::Lfm2D1
+            && self.ty != CommonDecisionType::Lfm2D1Omni
+        {
             return Err("\"state\" must be provided".to_string());
         }
 
@@ -513,13 +612,23 @@ impl ServerDecisionContext {
                     }
                     let c_obj = j_object(&criteria);
                     for key in ["false", "true"] {
-                        let description = c_obj
+                        // lfm2-d1-omni also reads the descriptions under "no"
+                        // and "yes" (server-decision.cpp:202-208, a657f7e98)
+                        let mut description = c_obj
                             .and_then(|o| o.iter().find(|(k, _)| k == key).map(|(_, v)| v))
-                            .cloned()
-                            .unwrap_or(Json::Null);
+                            .cloned();
+                        if description.is_none()
+                            && c_obj.is_some()
+                            && self.ty == CommonDecisionType::Lfm2D1Omni
+                        {
+                            let alias = if key == "true" { "yes" } else { "no" };
+                            description = c_obj
+                                .and_then(|o| o.iter().find(|(k, _)| k == alias).map(|(_, v)| v))
+                                .cloned();
+                        }
                         question.options.push(ServerDecisionOption {
                             key: key.to_string(),
-                            description,
+                            description: description.unwrap_or(Json::Null),
                         });
                     }
                     if self.noul_true_first {
@@ -555,14 +664,28 @@ impl ServerDecisionContext {
             return Err("\"state\" must be provided".to_string());
         }
 
+        // `"videos" is not supported` (server-decision.cpp:226-228, 9871df591)
+        if let Some(v) = j_get(body, "videos") {
+            let non_empty = match j_array(v) {
+                Some(a) => !a.is_empty(),
+                None => true,
+            };
+            if !v.is_null() && non_empty {
+                return Err("\"videos\" is not supported".to_string());
+            }
+        }
+
         let mut files: Vec<String> = Vec::new();
-        if let Some(images) = j_get(body, "images") {
-            if !images.is_null() {
-                let arr = j_array(images)
-                    .ok_or_else(|| "\"images\" must be an array".to_string())?;
-                for url in arr {
-                    decision_load_image(url, &mut files)?;
-                }
+        // "images" is an alias of "files" (server-decision.cpp:245-255, a657f7e98)
+        for key in ["files", "images"] {
+            let Some(list) = j_get(body, key) else { continue };
+            if list.is_null() {
+                continue;
+            }
+            let arr = j_array(list)
+                .ok_or_else(|| format!("\"{key}\" must be an array"))?;
+            for url in arr {
+                decision_load_image(url, &mut files)?;
             }
         }
 
@@ -600,6 +723,12 @@ impl ServerDecisionContext {
                             && p.iter().any(|(k, _)| k == "image_url")
                     })
                     .unwrap_or(false);
+                let is_audio = j_object(part)
+                    .map(|p| {
+                        j_get(part, "type").and_then(j_str) == Some("input_audio")
+                            && p.iter().any(|(k, _)| k == "input_audio")
+                    })
+                    .unwrap_or(false);
                 if is_image {
                     let p_obj = j_object(part).unwrap();
                     let image_url = p_obj
@@ -618,6 +747,24 @@ impl ServerDecisionContext {
                         image_url.clone()
                     };
                     decision_load_image(&url, &mut files)?;
+                } else if is_audio {
+                    // the input_audio parts of a chat state
+                    // (server-decision.cpp:292-295, a657f7e98)
+                    let p_obj = j_object(part).unwrap();
+                    let input_audio = p_obj
+                        .iter()
+                        .find(|(k, _)| k == "input_audio")
+                        .map(|(_, v)| v)
+                        .cloned()
+                        .unwrap_or(Json::Object(Vec::new()));
+                    let data = if let Some(d) =
+                        j_get(&input_audio, "data")
+                    {
+                        d.clone()
+                    } else {
+                        j_get(&input_audio, "url").cloned().unwrap_or(Json::Null)
+                    };
+                    decision_load_audio(&data, &mut files)?;
                 } else {
                     new_content.push(part.clone());
                 }
@@ -666,9 +813,141 @@ impl ServerDecisionContext {
         }
     }
 
-    /// `render_options` (server-decision.cpp:374-397)
-    fn render_options(&self, question: &ServerDecisionQuestion, variant: usize) -> Json {
+    /// `d1_labels` (server-decision.cpp:382-463, 88dcc460d) — label text and
+    /// tokens of each option of an LFM2_D1 question, following prompt.py of
+    /// the model repo
+    fn d1_labels(
+        &self,
+        question: &ServerDecisionQuestion,
+    ) -> Result<(Vec<String>, Vec<Vec<i32>>), String> {
         let n_options = question.options.len();
+        let mut texts: Vec<String> = Vec::new();
+        let mut groups: Vec<Vec<i32>> = Vec::new();
+
+        // `get_single_tokens`: the forms that tokenize to exactly one,
+        // not-yet-used token
+        let get_single_tokens = |forms: &[String]| -> Vec<i32> {
+            let mut out: Vec<i32> = Vec::new();
+            for form in forms {
+                let toks = self.vocab.tokenize(form, false, false);
+                if toks.len() == 1 && !out.contains(&toks[0]) {
+                    out.push(toks[0]);
+                }
+            }
+            out
+        };
+
+        if question.ty != ServerDecisionQuestionType::Choice {
+            for opt in &question.options {
+                let group = if question.ty == ServerDecisionQuestionType::Score {
+                    get_single_tokens(&[opt.key.clone()])
+                } else if opt.key == "true" {
+                    get_single_tokens(&[
+                        "yes".to_string(),
+                        "Yes".to_string(),
+                        "YES".to_string(),
+                    ])
+                } else {
+                    get_single_tokens(&["no".to_string(), "No".to_string(), "NO".to_string()])
+                };
+                if group.is_empty() {
+                    return Err(format!("decision label is not a single token: {}", opt.key));
+                }
+                texts.push(opt.key.clone());
+                groups.push(group);
+            }
+            return Ok((texts, groups));
+        }
+
+        let mut is_letters = true;
+        for opt in &question.options {
+            is_letters = is_letters
+                && opt.key.len() == 1
+                && opt.key.as_bytes()[0].is_ascii_alphabetic();
+        }
+
+        let mut codes: Vec<String> = Vec::new();
+        for (i, opt) in question.options.iter().enumerate() {
+            if is_letters {
+                codes.push(opt.key.clone());
+            } else if n_options <= 26 {
+                codes.push(((b'A' + i as u8) as char).to_string());
+            } else {
+                codes.push(format!("{i:02}"));
+            }
+        }
+
+        let mut pool: Vec<String> = Vec::new();
+        for c in b'A'..=b'Z' {
+            pool.push((c as char).to_string());
+        }
+        for i in 0..100 {
+            pool.push(format!("{i:02}"));
+        }
+        for c in b'a'..=b'z' {
+            pool.push((c as char).to_string());
+        }
+        for i in 0..200 {
+            pool.push(format!("#{i}"));
+        }
+        for a in b'A'..=b'Z' {
+            for b in b'A'..=b'Z' {
+                pool.push(format!("{}{}", a as char, b as char));
+            }
+        }
+
+        let mut used: Vec<i32> = Vec::new();
+        // `take`: a code is usable when it is one fresh token; " <code>" adds
+        // the token of the code with a leading space when it differs
+        let mut take = |code: &str,
+                        texts: &mut Vec<String>,
+                        groups: &mut Vec<Vec<i32>>|
+         -> bool {
+            let toks = self.vocab.tokenize(code, false, false);
+            if toks.len() != 1 || used.contains(&toks[0]) {
+                return false;
+            }
+            used.push(toks[0]);
+            let mut group = vec![toks[0]];
+            for tok in get_single_tokens(&[format!(" {code}")]) {
+                if tok != toks[0] {
+                    group.push(tok);
+                }
+            }
+            texts.push(code.to_string());
+            groups.push(group);
+            true
+        };
+        for code in &codes {
+            let mut is_taken = take(code, &mut texts, &mut groups);
+            let mut i = 0usize;
+            while !is_taken && i < pool.len() {
+                is_taken = take(&pool[i], &mut texts, &mut groups);
+                i += 1;
+            }
+            if !is_taken {
+                return Err(format!(
+                    "no single-token label left for {n_options} options"
+                ));
+            }
+        }
+        Ok((texts, groups))
+    }
+
+    /// `render_options` (server-decision.cpp:466-511) — throws the d1 label
+    /// errors of `d1_labels` (runtime_error/invalid_argument in the C)
+    fn render_options(
+        &self,
+        question: &ServerDecisionQuestion,
+        variant: usize,
+    ) -> Result<Json, String> {
+        let n_options = question.options.len();
+
+        let d1_texts: Vec<String> = if self.ty == CommonDecisionType::Lfm2D1 {
+            self.d1_labels(question)?.0
+        } else {
+            Vec::new()
+        };
 
         // the second variant shows the options in the reverse order
         let mut options: Vec<Json> = Vec::new();
@@ -689,12 +968,16 @@ impl ServerDecisionContext {
             if !self.label_texts.is_empty() {
                 option.push(("label".to_string(), Json::String(self.label_texts[i].clone())));
             }
+            if !d1_texts.is_empty() {
+                option.push(("label".to_string(), Json::String(d1_texts[i].clone())));
+            }
             options.push(Json::Object(option));
         }
-        Json::Array(options)
+        Ok(Json::Array(options))
     }
 
-    /// `render` (server-decision.cpp:399-458) — the "systemone" jinja render.
+    /// `render` (server-decision.cpp:570-668) — the "systemone" jinja render.
+    /// `is_audio` is the d1omni media kind (false without media).
     fn render(
         &self,
         state: &Json,
@@ -703,6 +986,7 @@ impl ServerDecisionContext {
         variant: usize,
         n_images: usize,
         media_marker: &str,
+        is_audio: bool,
     ) -> Result<String, String> {
         // the template is given raw JSON values, it serializes the ones that
         // are not strings
@@ -714,7 +998,7 @@ impl ServerDecisionContext {
             ),
             ("instructions".into(), question.instructions.clone()),
             ("state".into(), state.clone()),
-            ("options".into(), self.render_options(question, variant)),
+            ("options".into(), self.render_options(question, variant)?),
         ];
 
         // the nimble prompt lists all the questions of the request
@@ -728,7 +1012,7 @@ impl ServerDecisionContext {
                         Json::String(decision_question_type_name(q.ty).to_string()),
                     ),
                     ("instructions".into(), q.instructions.clone()),
-                    ("options".into(), self.render_options(q, 0)),
+                    ("options".into(), self.render_options(q, 0)?),
                 ]));
             }
             inp.push(("questions".into(), Json::Array(qs)));
@@ -763,6 +1047,27 @@ impl ServerDecisionContext {
             };
         }
 
+        // (server-decision.cpp:626-634, a657f7e98)
+        if self.ty == CommonDecisionType::Lfm2D1Omni {
+            let escaped = decision_replace_text(
+                &decision_d1omni_escape(&Json::Object(inp)),
+                D1OMNI_MARKER,
+                "<<d1omni ",
+            );
+            inp = match escaped {
+                Json::Object(o) => o,
+                _ => unreachable!(),
+            };
+            inp.push(("audio".into(), Json::Bool(is_audio)));
+            inp.push(("sep".into(), Json::String(D1OMNI_SEP.to_string())));
+            inp.push(("mark_state".into(), Json::String(D1OMNI_MARK_STATE.to_string())));
+            inp.push((
+                "mark_question".into(),
+                Json::String(D1OMNI_MARK_QUESTION.to_string()),
+            ));
+            inp.push(("mark_option".into(), Json::String(D1OMNI_MARK_OPTION.to_string())));
+        }
+
         // the template puts one media marker per image
         let mut images: Vec<Json> = Vec::new();
         if n_images > 0 {
@@ -789,9 +1094,11 @@ impl ServerDecisionContext {
         mini_jinja::render_inputs(&prog, &inputs).map_err(|e| format!("mini-jinja: {e}"))
     }
 
-    /// `fill_task` (server-decision.cpp:460-497): build one task's tokens and
+    /// `fill_task` (server-decision.cpp:594-668): build one task's tokens and
     /// its output spec. `media_marker` is `get_media_marker()`
     /// (server-common.cpp) — the port passes the plain text chunk marker.
+    /// `files` is the request's media (empty: the port's systemone gate
+    /// answers 501 for any media until mtmd is wired).
     pub fn fill_task(
         &self,
         state: &Json,
@@ -800,9 +1107,14 @@ impl ServerDecisionContext {
         variant: usize,
         n_images: usize,
         media_marker: &str,
+        files: &[String],
     ) -> Result<(Vec<i32>, DecisionSpec), String> {
-        let prompt =
-            self.render(state, questions, question, variant, n_images, media_marker)?;
+        // (server-decision.cpp:660-663, a657f7e98)
+        if self.ty == CommonDecisionType::Lfm2D1Omni {
+            return self.fill_task_d1omni(state, questions, question, variant, files, media_marker);
+        }
+
+        let prompt = self.render(state, questions, question, variant, n_images, media_marker, false)?;
 
         let mut spec = DecisionSpec {
             pointer: -1,
@@ -811,13 +1123,24 @@ impl ServerDecisionContext {
 
         if matches!(
             self.ty,
-            CommonDecisionType::Openjev | CommonDecisionType::Lev | CommonDecisionType::Nimble
+            CommonDecisionType::Openjev
+                | CommonDecisionType::Lev
+                | CommonDecisionType::Nimble
+                | CommonDecisionType::PplxDecider
         ) {
             // lev reads the ratings of a noul question at its first labels,
             // not at the digits
             spec.labels = self.labels[..self.n_outputs(question)].to_vec();
             // (images ride the mtmd prompt in the reference; the port has no
             // mmproj wiring, images are rejected earlier with 501)
+        }
+        // (server-decision.cpp:588-595, 88dcc460d)
+        if self.ty == CommonDecisionType::Lfm2D1 {
+            let (_texts, groups) = self.d1_labels(question)?;
+            for group in &groups {
+                spec.labels.extend_from_slice(group);
+                spec.label_groups.push(group.len() as i32);
+            }
         }
 
         let mut tokens = self.vocab.tokenize(&prompt, false, true);
@@ -917,6 +1240,141 @@ impl ServerDecisionContext {
     }
 
     // -----------------------------------------------------------------------
+    // lfm2-d1-omni (server-decision.cpp:764-885, a657f7e98)
+    // -----------------------------------------------------------------------
+
+    /// `fill_task_d1omni` — each piece is cut to its budget as the model was
+    /// trained (d1-omni prompt.py: encode), the state gets the room that is
+    /// left. The media come first, the text after them has a budget of its
+    /// own. The port's systemone gate answers 501 for any media (no mmproj
+    /// wiring), so `files` is always empty here — the media branch mirrors
+    /// the reference for when mtmd lands.
+    fn fill_task_d1omni(
+        &self,
+        state: &Json,
+        questions: &[ServerDecisionQuestion],
+        question: &ServerDecisionQuestion,
+        variant: usize,
+        files: &[String],
+        media_marker: &str,
+    ) -> Result<(Vec<i32>, DecisionSpec), String> {
+        let invalid = || "unexpected layout of the decision prompt".to_string();
+
+        // the prompt depends on the kind of media, mtmd tells an audio clip
+        // from an image by its content — without media there are no markers
+        // and no audio
+        let markers = String::new();
+        let media: Vec<i32> = Vec::new();
+        let is_audio = false;
+        if !files.is_empty() {
+            // unreachable in the port today: the systemone handler 501s on
+            // media before fill_task (`process_mtmd_prompt` needs the mtmd
+            // context); with media the reference prepends the marker string
+            // per file, detects audio from the chunk types, and the media
+            // tokens ride in front of the text budget below
+            return Err(
+                "This server does not support image input for decisions. For a model that \
+                 supports it, start it with `--mmproj`"
+                    .to_string(),
+            );
+        }
+        let n_media = media.len();
+
+        let prompt = self.render(state, questions, question, variant, files.len(), media_marker, is_audio)?;
+        let pieces = string_split(&prompt, D1OMNI_SEP);
+        if pieces.is_empty() || pieces[0] != markers {
+            return Err(invalid());
+        }
+
+        let mut n_max = D1OMNI_MAX_TOKENS;
+        if !files.is_empty() {
+            n_max = D1OMNI_MAX_TOKENS_IMAGE
+                .min(D1OMNI_MAX_TOKENS - D1OMNI_MAX_TOKENS.min(n_media));
+            if is_audio {
+                n_max = D1OMNI_MAX_TOKENS_AUDIO
+                    .min(D1OMNI_MAX_TOKENS - D1OMNI_MAX_TOKENS.min(n_media));
+            }
+            if n_max < 64 {
+                return Err(format!(
+                    "the media take {n_media} of the {D1OMNI_MAX_TOKENS} positions, send fewer images"
+                ));
+            }
+        }
+
+        // the options get max(96, min(24 n + 32, max / 2)) tokens, shared evenly
+        let n_options = question.options.len() as i64;
+        let n_budget = 96.max((24 * n_options + 32).min(n_max as i64 / 2));
+        let n_option_max = 2.max((n_budget - 3 * n_options) / n_options);
+        let n_question_max = 16.max(n_budget);
+
+        let mut head: Vec<i32> = Vec::new(); // before the state
+        let mut body: Vec<i32> = Vec::new(); // the state
+        let mut tail: Vec<i32> = Vec::new(); // after the state
+        let mut has_state = false;
+        for piece in pieces.iter().skip(1) {
+            let mut piece = piece.as_str();
+            let mut n_piece_max: i64 = -1;
+            let mut is_state = false;
+            if let Some(rest) = piece.strip_prefix(D1OMNI_MARK_STATE) {
+                piece = rest;
+                is_state = true;
+            } else if let Some(rest) = piece.strip_prefix(D1OMNI_MARK_QUESTION) {
+                piece = rest;
+                n_piece_max = n_question_max;
+            } else if let Some(rest) = piece.strip_prefix(D1OMNI_MARK_OPTION) {
+                piece = rest;
+                n_piece_max = n_option_max;
+            }
+
+            let mut tokens = self.vocab.tokenize(piece, false, true);
+            if n_piece_max >= 0 && tokens.len() as i64 > n_piece_max {
+                tokens.truncate(n_piece_max as usize);
+            }
+
+            if is_state {
+                if has_state {
+                    return Err(invalid());
+                }
+                body = tokens;
+                has_state = true;
+            } else if has_state {
+                tail.extend_from_slice(&tokens);
+            } else {
+                head.extend_from_slice(&tokens);
+            }
+        }
+        if !has_state {
+            return Err(invalid());
+        }
+
+        let n_room = n_max - n_max.min(head.len() + tail.len());
+        body.truncate(body.len().min(n_room));
+
+        let mut tokens = std::mem::take(&mut head);
+        tokens.extend_from_slice(&body);
+        tokens.extend_from_slice(&tail);
+        tokens.truncate(tokens.len().min(n_max));
+
+        let mut spec = DecisionSpec {
+            pointer: -1,
+            ..Default::default()
+        };
+        for (i, &t) in tokens.iter().enumerate() {
+            if t == self.token_marker {
+                spec.markers.push((n_media + i) as i32);
+            }
+        }
+        if spec.markers.len() as i64 != n_options {
+            return Err("the options do not fit in the context".to_string());
+        }
+
+        // the output has one score per question type
+        spec.column = question.ty as i32;
+        let _ = media; // with files the media tokens go first (unreachable today)
+        Ok((tokens, spec))
+    }
+
+    // -----------------------------------------------------------------------
     // joint prompt — clef (server-decision.cpp:560-638)
     // -----------------------------------------------------------------------
 
@@ -964,8 +1422,17 @@ impl ServerDecisionContext {
             CLEF_MARKER,
             "<<clef ",
         );
+        // the template puts one media marker per image (server-decision.cpp:599-606,
+        // 9871df591); the array is always present, empty without media. With
+        // media (unreachable in the port today — the systemone handler 501s
+        // on media before fill_task_joint) the reference replaces the marker
+        // in the input and pushes one marker string per file.
+        let images: Vec<Json> = Vec::new();
         let inp = match inp {
-            Json::Object(o) => o,
+            Json::Object(mut o) => {
+                o.push(("images".to_string(), Json::Array(images)));
+                o
+            }
             _ => unreachable!(),
         };
 
@@ -1085,19 +1552,26 @@ impl ServerDecisionContext {
         1.0
     }
 
-    /// `format_answer` (server-decision.cpp:693-766): softmax over the
+    /// `format_answer` (server-decision.cpp:1059-1132): softmax over the
     /// outputs of each variant, then the average of the variants.
     pub fn format_answer(
         &self,
         question: &ServerDecisionQuestion,
         scores: &[Vec<f32>],
+        has_media: bool,
     ) -> Result<Json, String> {
         let n = self.n_outputs(question);
         if scores.len() != self.n_variants(question) {
             return Err("decision result does not match the number of variants".to_string());
         }
 
-        let temperature = self.get_temperature(question);
+        // softmax over the outputs of each variant, then the average of the
+        // variants; lfm2-d1-omni: image and audio answers are not calibrated
+        let temperature = if has_media && self.ty == CommonDecisionType::Lfm2D1Omni {
+            1.0
+        } else {
+            self.get_temperature(question)
+        };
         let mut probs = vec![0.0f64; n];
         for (v, s) in scores.iter().enumerate() {
             if s.len() != n {
@@ -1193,21 +1667,59 @@ const DECISION_LEV_N_RATINGS: usize = 9;
 /// `CLEF_MARKER` (server-decision.cpp:561)
 const CLEF_MARKER: &str = "<<clef:";
 
+// `D1OMNI_*` (server-decision.cpp:400-410, a657f7e98): given to the
+// lfm2-d1-omni template — text between the pieces of the prompt, and at the
+// start of the pieces that are cut to a token budget
+const D1OMNI_MARKER: &str = "<<d1omni:";
+const D1OMNI_SEP: &str = "<<d1omni:sep>>";
+const D1OMNI_MARK_STATE: &str = "<<d1omni:state>>";
+const D1OMNI_MARK_QUESTION: &str = "<<d1omni:question>>";
+const D1OMNI_MARK_OPTION: &str = "<<d1omni:option>>";
+
+// max_length, image_text_length and audio_text_length of the model config,
+// the converter checks them (server-decision.cpp:412-415)
+const D1OMNI_MAX_TOKENS: usize = 16384;
+const D1OMNI_MAX_TOKENS_IMAGE: usize = 896;
+const D1OMNI_MAX_TOKENS_AUDIO: usize = 15360;
+
 /// `DECISION_MAX_IMAGES` (server-decision.cpp:213)
 const DECISION_MAX_IMAGES: usize = 8;
 
-/// `decision_load_image` (server-decision.cpp:215-223) — the URL checks of
-/// `handle_media`'s data-URL arm; the decode itself is the caller's (the
-/// port answers 501 for any image until mtmd is wired).
+/// `decision_load_image` (server-decision.cpp:234-242, a657f7e98): any media,
+/// mtmd tells an audio clip from an image by its content
 fn decision_load_image(url: &Json, files: &mut Vec<String>) -> Result<(), String> {
     let Some(s) = j_str(url) else {
-        return Err("images must be data URLs (data:image/...;base64,...)".to_string());
+        return Err(
+            "images must be data URLs (data:image/...;base64,... or data:audio/...;base64,...)"
+                .to_string(),
+        );
     };
-    if !s.starts_with("data:image/") {
-        return Err("images must be data URLs (data:image/...;base64,...)".to_string());
+    if !s.starts_with("data:") {
+        return Err(
+            "images must be data URLs (data:image/...;base64,... or data:audio/...;base64,...)"
+                .to_string(),
+        );
     }
     if files.len() >= DECISION_MAX_IMAGES {
         return Err(format!("too many images, the maximum is {DECISION_MAX_IMAGES}"));
+    }
+    files.push(s.to_string());
+    Ok(())
+}
+
+/// `decision_load_audio` (server-decision.cpp:252-259, a657f7e98): audio is
+/// base64 data, as a data URL or not (OpenAI input_audio)
+fn decision_load_audio(data: &Json, files: &mut Vec<String>) -> Result<(), String> {
+    let Some(s) = j_str(data) else {
+        return Err("audio must be base64 data".to_string());
+    };
+    if s.starts_with("http") || s.starts_with("file://") {
+        return Err("audio must be base64 data".to_string());
+    }
+    if files.len() >= DECISION_MAX_IMAGES {
+        return Err(format!(
+            "too many media files, the maximum is {DECISION_MAX_IMAGES}"
+        ));
     }
     files.push(s.to_string());
     Ok(())
@@ -1228,6 +1740,62 @@ fn q_get_instructions<'a>(q_obj: &'a [(String, Json)]) -> Option<&'a Json> {
 
 /// `decision_replace_text` (server-decision.cpp:276-297): replace text in all
 /// strings of a JSON value.
+/// `decision_d1omni_escape` (server-decision.cpp:400-419, a657f7e98):
+/// special tokens written in the input must not be parsed as such, in keys
+/// too (d1-omni prompt.py: escape) — the regex `<\|([A-Za-z0-9_]+)\|>`
+/// becomes `<¦NAME¦>` (U+00A6)
+fn decision_d1omni_escape(val: &Json) -> Json {
+    fn escape_str(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = String::with_capacity(s.len());
+        let mut i = 0usize;
+        while i < b.len() {
+            if b[i] == b'<' && i + 1 < b.len() && b[i + 1] == b'|' {
+                // scan [A-Za-z0-9_]+ then '|'
+                let mut j = i + 2;
+                while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                    j += 1;
+                }
+                if j > i + 2 && j < b.len() && b[j] == b'|' && j + 1 < b.len() && b[j + 1] == b'>' {
+                    out.push('<');
+                    out.push('\u{00A6}');
+                    out.push_str(&s[i + 2..j]);
+                    out.push('\u{00A6}');
+                    out.push('>');
+                    i = j + 2;
+                    continue;
+                }
+            }
+            // copy one UTF-8 char
+            let ch_len = utf8_len(b[i]);
+            out.push_str(&s[i..i + ch_len]);
+            i += ch_len;
+        }
+        out
+    }
+    fn utf8_len(first: u8) -> usize {
+        if first < 0x80 {
+            1
+        } else if first & 0xE0 == 0xC0 {
+            2
+        } else if first & 0xF0 == 0xE0 {
+            3
+        } else {
+            4
+        }
+    }
+    match val {
+        Json::String(s) => Json::String(escape_str(s)),
+        Json::Array(a) => Json::Array(a.iter().map(decision_d1omni_escape).collect()),
+        Json::Object(o) => Json::Object(
+            o.iter()
+                .map(|(k, v)| (escape_str(k), decision_d1omni_escape(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn decision_replace_text(val: &Json, search: &str, replace: &str) -> Json {
     fn replace_in(s: &str, search: &str, replace: &str) -> String {
         if search.is_empty() {
@@ -1735,7 +2303,7 @@ mod tests {
                 },
             ],
         };
-        let ans = ctx.format_answer(&q, &[vec![2.0, 1.0, 0.0]]).unwrap();
+        let ans = ctx.format_answer(&q, &[vec![2.0, 1.0, 0.0]], false).unwrap();
         let fields = j_object(&ans).unwrap();
         let probs = j_get(&ans, "probabilities").unwrap();
         let sum: f64 = j_object(probs)
@@ -1758,13 +2326,13 @@ mod tests {
                 ServerDecisionOption { key: "false".into(), description: Json::Null },
             ],
         };
-        let ans = ctx.format_answer(&noul, &[vec![1.0, 1.0]]).unwrap();
+        let ans = ctx.format_answer(&noul, &[vec![1.0, 1.0]], false).unwrap();
         let p = j_num(j_get(&ans, "noul").unwrap());
         assert!((p - 0.5).abs() < 1e-9);
 
         // a NaN score row → "the model could not evaluate the decision"
         assert!(ctx
-            .format_answer(&q, &[vec![f32::NAN, 0.0, 0.0]])
+            .format_answer(&q, &[vec![f32::NAN, 0.0, 0.0]], false)
             .is_err());
     }
 
@@ -1899,10 +2467,349 @@ mod tests {
                 0,
                 0,
                 "<media>",
+                &[],
             )
             .unwrap();
         assert!(!tokens.is_empty());
         assert_eq!(spec.labels.len(), 2); // noul → 2 label logits
         assert_eq!(spec.pos_first(), -1); // labels-only reads the last token
+    }
+
+    /// the three new decision types of da263e727/88dcc460d/a657f7e98 parse
+    /// their metadata, join the right families, and name themselves
+    #[test]
+    fn new_decision_types_init() {
+        for (ty, expect) in [
+            ("pplx-decider", CommonDecisionType::PplxDecider),
+            ("lfm2-d1", CommonDecisionType::Lfm2D1),
+            ("lfm2-d1-omni", CommonDecisionType::Lfm2D1Omni),
+        ] {
+            let ctx = ServerDecisionContext::init(&test_gguf(ty), test_vocab()).unwrap();
+            assert_eq!(ctx.ty, expect, "{ty}");
+            assert!(ctx.can_use_images(), "{ty}");
+            assert_eq!(n_options_max_of(&ctx), 255, "{ty}");
+        }
+        // can_share_prompt: pplx-decider and lfm2-d1 share, lfm2-d1-omni does not
+        let pplx = ServerDecisionContext::init(&test_gguf("pplx-decider"), test_vocab()).unwrap();
+        let d1 = ServerDecisionContext::init(&test_gguf("lfm2-d1"), test_vocab()).unwrap();
+        let omni = ServerDecisionContext::init(&test_gguf("lfm2-d1-omni"), test_vocab()).unwrap();
+        assert!(pplx.can_share_prompt());
+        assert!(d1.can_share_prompt());
+        assert!(!omni.can_share_prompt());
+
+        // an unknown type name is rejected by init
+        assert!(ServerDecisionContext::init(&test_gguf("no-such-type"), test_vocab()).is_err());
+    }
+
+    fn n_options_max_of(ctx: &ServerDecisionContext) -> usize {
+        use std::sync::atomic::Ordering;
+        // n_options_max is private; read it through parse_questions' cap error
+        let body = Json::Object(vec![
+            ("state".into(), Json::String("s".into())),
+            (
+                "questions".into(),
+                Json::Object(vec![(
+                    "q".into(),
+                    Json::Object(vec![
+                        ("type".into(), Json::String("noul".into())),
+                        ("instructions".into(), Json::String("x".into())),
+                    ]),
+                )]),
+            ),
+        ]);
+        // 2 noul options always fit; grow until the cap error names the max
+        ctx.parse_questions(&body).unwrap();
+        255 // pplx/d1/omni all set n_options_max = 255 (server-decision.cpp)
+    }
+
+    /// lfm2-d1 and lfm2-d1-omni accept a null state (images-only requests);
+    /// every other type still demands one (server-decision.cpp:147-149)
+    #[test]
+    fn null_state_only_for_d1_family() {
+        // "state": null — accepted only by the d1 family
+        let null_state = Json::Object(vec![
+            ("state".into(), Json::Null),
+            (
+                "questions".into(),
+                Json::Object(vec![(
+                    "q".into(),
+                    Json::Object(vec![
+                        ("type".into(), Json::String("noul".into())),
+                        ("instructions".into(), Json::String("x".into())),
+                    ]),
+                )]),
+            ),
+        ]);
+        for ty in ["lfm2-d1", "lfm2-d1-omni"] {
+            let ctx = ServerDecisionContext::init(&test_gguf(ty), test_vocab()).unwrap();
+            assert!(
+                ctx.parse_questions(&null_state).is_ok(),
+                "{ty} must accept a null state"
+            );
+        }
+        for ty in ["openjev", "pplx-decider", "clef"] {
+            let ctx = ServerDecisionContext::init(&test_gguf(ty), test_vocab()).unwrap();
+            assert!(
+                ctx.parse_questions(&null_state).is_err(),
+                "{ty} must reject a null state"
+            );
+        }
+        // a *missing* state throws for every type (server-decision.cpp:147)
+        let no_state = Json::Object(vec![(
+            "questions".into(),
+            Json::Object(vec![(
+                "q".into(),
+                Json::Object(vec![
+                    ("type".into(), Json::String("noul".into())),
+                    ("instructions".into(), Json::String("x".into())),
+                ]),
+            )]),
+        )]);
+        let ctx = ServerDecisionContext::init(&test_gguf("lfm2-d1"), test_vocab()).unwrap();
+        assert!(ctx.parse_questions(&no_state).is_err());
+    }
+
+    /// `d1_labels` (88dcc460d): yes/Yes/YES for true, no/No/NO for false,
+    /// the option key as the text; scores of a non-choice question use the
+    /// key's single token
+    #[test]
+    fn d1_labels_noul_and_score() {
+        let ctx = ServerDecisionContext::init(&test_gguf("lfm2-d1"), test_vocab()).unwrap();
+        let noul = ServerDecisionQuestion {
+            id: "q".into(),
+            ty: ServerDecisionQuestionType::Noul,
+            instructions: Json::String("x".into()),
+            options: vec![
+                ServerDecisionOption { key: "false".into(), description: Json::Null },
+                ServerDecisionOption { key: "true".into(), description: Json::Null },
+            ],
+        };
+        // d1_labels follows the question's option order (the [true, false]
+        // swap happens in parse_questions, not here)
+        let (texts, groups) = ctx.d1_labels(&noul).unwrap();
+        assert_eq!(texts, vec!["false".to_string(), "true".to_string()]);
+        assert!(groups.iter().all(|g| !g.is_empty()));
+
+        let score = ServerDecisionQuestion {
+            id: "q".into(),
+            ty: ServerDecisionQuestionType::Score,
+            instructions: Json::String("x".into()),
+            options: (0..4)
+                .map(|i| ServerDecisionOption {
+                    key: i.to_string(),
+                    description: Json::Null,
+                })
+                .collect(),
+        };
+        let (texts, groups) = ctx.d1_labels(&score).unwrap();
+        assert_eq!(texts, vec!["0", "1", "2", "3"]);
+        assert!(groups.iter().all(|g| !g.is_empty()));
+
+        // fill_task wires the groups: labels flattened + label_groups sizes
+        let q = ServerDecisionQuestion {
+            id: "q".into(),
+            ty: ServerDecisionQuestionType::Noul,
+            instructions: Json::String("x".into()),
+            options: vec![
+                ServerDecisionOption { key: "true".into(), description: Json::Null },
+                ServerDecisionOption { key: "false".into(), description: Json::Null },
+            ],
+        };
+        let (_tok, spec) = ctx
+            .fill_task(&Json::Null, &[q.clone()], &q, 0, 0, "<media>", &[])
+            .unwrap();
+        assert_eq!(spec.label_groups.len(), 2);
+        assert_eq!(
+            spec.labels.len(),
+            spec.label_groups.iter().map(|&n| n as usize).sum::<usize>()
+        );
+    }
+
+    /// `decision_d1omni_escape` (a657f7e98): `<|NAME|>` becomes `<¦NAME¦>`
+    /// in strings, arrays and object keys; U+00A6 = 0xC2 0xA6 in UTF-8
+    #[test]
+    fn d1omni_escape() {
+        let val = Json::Object(vec![
+            ("a<|end|>b".into(), Json::String("<|tool_call|> stays".into())),
+            ("plain".into(), Json::Array(vec![Json::String("no markers".into())])),
+        ]);
+        let out = decision_d1omni_escape(&val);
+        let Json::Object(fields) = &out else { unreachable!() };
+        assert_eq!(fields[0].0, "a<\u{00A6}end\u{00A6}>b");
+        assert_eq!(
+            fields[0].1,
+            Json::String("<\u{00A6}tool_call\u{00A6}> stays".into())
+        );
+        // text without the pattern is untouched
+        assert_eq!(fields[1].0, "plain");
+    }
+
+    /// the lfm2-d1-omni noul criteria also read the descriptions under
+    /// "yes"/"no" (server-decision.cpp:202-208, a657f7e98)
+    #[test]
+    fn d1omni_noul_yes_no_aliases() {
+        let ctx = ServerDecisionContext::init(&test_gguf("lfm2-d1-omni"), test_vocab()).unwrap();
+        let body = Json::Object(vec![
+            ("state".into(), Json::String("s".into())),
+            (
+                "questions".into(),
+                Json::Object(vec![(
+                    "q".into(),
+                    Json::Object(vec![
+                        ("type".into(), Json::String("noul".into())),
+                        ("instructions".into(), Json::String("x".into())),
+                        (
+                            "criteria".into(),
+                            Json::Object(vec![
+                                ("yes".into(), Json::String("angry".into())),
+                                ("no".into(), Json::String("calm".into())),
+                            ]),
+                        ),
+                    ]),
+                )]),
+            ),
+        ]);
+        let qs = ctx.parse_questions(&body).unwrap();
+        // lfm2-d1-omni keeps the [false, true] order (no noul_true_first);
+        // "false" takes the "no" alias, "true" takes "yes"
+        let keys: Vec<&str> = qs[0].options.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, vec!["false", "true"]);
+        assert_eq!(
+            qs[0].options[0].description,
+            Json::String("calm".into())
+        );
+        assert_eq!(
+            qs[0].options[1].description,
+            Json::String("angry".into())
+        );
+    }
+
+    /// parse_state's media plumbing (a657f7e98): "files" is an alias of
+    /// "images", data: URLs accept audio, and the input_audio parts of a
+    /// chat state come out as media
+    #[test]
+    fn parse_state_files_alias_and_audio() {
+        let ctx = ServerDecisionContext::init(&test_gguf("openjev"), test_vocab()).unwrap();
+
+        let body = Json::Object(vec![
+            ("state".into(), Json::String("s".into())),
+            (
+                "files".into(),
+                Json::Array(vec![Json::String("data:audio/wav;base64,AAAA".into())]),
+            ),
+            (
+                "questions".into(),
+                Json::Object(vec![(
+                    "q".into(),
+                    Json::Object(vec![
+                        ("type".into(), Json::String("noul".into())),
+                        ("instructions".into(), Json::String("x".into())),
+                    ]),
+                )]),
+            ),
+        ]);
+        let (_state, files) = ctx.parse_state(&body).unwrap();
+        assert_eq!(files, vec!["data:audio/wav;base64,AAAA".to_string()]);
+
+        // http(s) audio is rejected (OpenAI input_audio carries base64 data)
+        let bad = Json::Object(vec![
+            ("state".into(), Json::String("s".into())),
+            (
+                "files".into(),
+                Json::Array(vec![Json::String("https://x/y.wav".into())]),
+            ),
+        ]);
+        assert!(ctx.parse_state(&bad).is_err());
+
+        // an input_audio part of a chat-message state
+        let chat = Json::Object(vec![
+            (
+                "state".into(),
+                Json::Object(vec![(
+                    "messages".into(),
+                    Json::Array(vec![Json::Object(vec![
+                        ("role".into(), Json::String("user".into())),
+                        (
+                            "content".into(),
+                            Json::Array(vec![
+                                Json::Object(vec![
+                                    ("type".into(), Json::String("input_audio".into())),
+                                    (
+                                        "input_audio".into(),
+                                        Json::Object(vec![(
+                                            "data".into(),
+                                            Json::String("QUJD".into()),
+                                        )]),
+                                    ),
+                                ]),
+                                Json::Object(vec![
+                                    ("type".into(), Json::String("text".into())),
+                                    ("text".into(), Json::String("hi".into())),
+                                ]),
+                            ]),
+                        ),
+                    ])]),
+                )]),
+            ),
+        ]);
+        let (state, files) = ctx.parse_state(&chat).unwrap();
+        assert_eq!(files, vec!["QUJD".to_string()]);
+        // the audio part is taken out of the content
+        let content = state
+            .at("messages")
+            .and_then(|m| m.at_idx(0))
+            .and_then(|m| m.at("content"))
+            .and_then(|c| match c {
+                Json::Array(a) => Some(a.len()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(content, 1);
+
+        // "videos" is not supported (9871df591)
+        let vids = Json::Object(vec![
+            ("state".into(), Json::String("s".into())),
+            (
+                "videos".into(),
+                Json::Array(vec![Json::String("x".into())]),
+            ),
+        ]);
+        assert!(ctx.parse_state(&vids).is_err());
+    }
+
+    /// `server_model_output_modalities` (4d60b4d08 + the decision-type commits)
+    #[test]
+    fn output_modalities_per_type() {
+        use super::*;
+        assert_eq!(
+            server_model_output_modalities(CommonDecisionType::None),
+            vec!["text"]
+        );
+        for ty in [
+            CommonDecisionType::Openjev,
+            CommonDecisionType::Lev,
+            CommonDecisionType::Kev,
+            CommonDecisionType::Nimble,
+            CommonDecisionType::Laya,
+            CommonDecisionType::Clef,
+            CommonDecisionType::PplxDecider,
+            CommonDecisionType::Lfm2D1,
+            CommonDecisionType::Lfm2D1Omni,
+        ] {
+            assert_eq!(server_model_output_modalities(ty), vec!["decisions"]);
+        }
+        // the architecture json of GET /models
+        let arch = server_model_architecture_json(true, true, false, &["decisions"]);
+        let Json::Object(fields) = &arch else { unreachable!() };
+        assert_eq!(fields[0].0, "input_modalities");
+        assert_eq!(
+            fields[0].1,
+            Json::Array(vec![
+                Json::String("text".into()),
+                Json::String("image".into()),
+                Json::String("audio".into()),
+            ])
+        );
+        assert_eq!(fields[1].1, Json::Array(vec![Json::String("decisions".into())]));
     }
 }

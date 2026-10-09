@@ -1117,6 +1117,15 @@ impl KvCache {
             n_rs_seq,
             rs_idx: vec![0; n_stream as usize],
         });
+        // `n_rot_k` (210791069, llama-kv-cache.cpp:334-341): the
+        // DeepSeek-indexer clause above is the only way the port's F16
+        // planes rotate, and the width is the largest power of two >= 64
+        // dividing `n_embd_head_k_all` — `raw_k_rot_nrot` (the same loop the
+        // old build-time do-while computed, now fixed at construction so the
+        // state blob can persist it)
+        if n_embd_head_k == indexer_head_size {
+            cache.n_rot_k = raw_k_rot_nrot(n_embd_head_k);
+        }
         cache
     }
 
@@ -1263,6 +1272,22 @@ pub fn hadamard_nrot(head: i64) -> usize {
     nrot
 }
 
+/// `n_rot_k`'s construction-time derivation (210791069,
+/// llama-kv-cache.cpp:334-341): `n_rot = 64; while head % (2*n_rot) == 0
+/// { n_rot *= 2 }`. Equivalent to the old graph-time do-while of
+/// `build_input_k_rot` (`nrot *= 2 do-while head % nrot == 0; nrot /= 2` —
+/// both stop at the largest power of two >= 64 dividing `head`, e.g. 192→64,
+/// 128→128, 256→256), which is exactly [`hadamard_nrot`]; kept as its own
+/// 1:1 twin because the C now computes it once in the constructor and
+/// persists it in the state blob.
+pub fn raw_k_rot_nrot(n_embd_head_k_all: i64) -> u32 {
+    let mut n_rot = 64u32;
+    while n_embd_head_k_all % (2 * n_rot as i64) == 0 {
+        n_rot *= 2;
+    }
+    n_rot
+}
+
 /// `llama_kv_cache_iswa`'s SWA cache size (llama-kv-cache-iswa.cpp:69-81):
 /// `size_swa = swa_full ? size_base : GGML_PAD(std::min(size_base,
 /// n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256)`.
@@ -1334,6 +1359,17 @@ pub struct KvCache {
     /// from their own members). The port still materializes a V plane for
     /// shape uniformity; nothing reads or serializes it.
     pub k_only: bool,
+    /// `n_rot_k` (210791069, llama-kv-cache.h:281): the construction-time
+    /// Hadamard rotation width of the K plane — 0 = no rotation. The C's
+    /// `attn_rot_k` bool became this exact width so the state blob can
+    /// reject a mismatched restore ("incompatible key rotation"). The port's
+    /// planes are F16 (never `ggml_is_quantized`), so only the DeepSeek
+    /// lightning-indexer clause of llama-kv-cache.cpp:321-332 ever turns it
+    /// on (set by `new_dsv4`).
+    pub n_rot_k: u32,
+    /// `n_rot_v` (llama-kv-cache.h:282) — the V twin. Always 0 in the port
+    /// (F16 planes never satisfy the quantized-type gate).
+    pub n_rot_v: u32,
     /// per-step plans + inputs of the three compressors
     /// (`llm_graph_input_dsv4::set_input`)
     pub dsv4_step: Option<Dsv4Step>,
@@ -1430,6 +1466,8 @@ impl KvCache {
             dsv4: None,
             dsv4_step: None,
             k_only: false,
+            n_rot_k: 0,
+            n_rot_v: 0,
         }
     }
 
@@ -1527,6 +1565,8 @@ impl KvCache {
             dsv4: None,
             dsv4_step: None,
             k_only: false,
+            n_rot_k: 0,
+            n_rot_v: 0,
         }
     }
 
@@ -3194,6 +3234,33 @@ impl KvCache {
         })
     }
 
+    /// the base half's rotation widths — see raw_state_write's note
+    fn raw_half_n_rot_base(&self) -> (u32, u32) {
+        let has_layers = (0..self.layers.len())
+            .any(|il| !self.layer_is_swa(il) && self.k_row[il] > 0);
+        if !has_layers {
+            return (0, 0);
+        }
+        (self.n_rot_k, self.n_rot_v)
+    }
+
+    /// the SWA half's rotation widths
+    fn raw_half_n_rot_swa(&self) -> (u32, u32) {
+        let has_layers = (0..self.layers.len())
+            .any(|il| self.layer_is_swa(il) && self.k_row[il] > 0);
+        if !has_layers {
+            return (0, 0);
+        }
+        (self.n_rot_k, self.n_rot_v)
+    }
+
+    fn raw_half_n_rot(&self, view: &RawCacheView) -> (u32, u32) {
+        if view.layer_ids.is_empty() {
+            return (0, 0);
+        }
+        (self.n_rot_k, self.n_rot_v)
+    }
+
     /// `llama_kv_cache::state_write` (llama-kv-cache.cpp:2055-2123) over one
     /// raw half, `n_stream == 1`: the stream count, the kept-cell count, the
     /// per-cell metadata (`state_write_meta`, :2205-2236) and the K/V row
@@ -3267,6 +3334,19 @@ impl KvCache {
         // state_write_data (:2238-2270 keys, :2272-2297 values, v_trans = 0)
         io.write_u32(0); // v_trans
         io.write_u32(view.layer_ids.len() as u32);
+        // 210791069 (llama-kv-cache.cpp:2258-2259): persist the exact
+        // rotation widths so a mismatched restore is rejected. The width is
+        // per cache (each iswa half is its own llama_kv_cache): a half with
+        // no participating layers has n_embd_head_k_all == 0 and no
+        // rotation. NOTE: upstream @c35b66744 crashes on that half — the
+        // DeepSeek-indexer clause of :321-332 does not re-check
+        // n_embd_head_k_all > 0, so the `while (0 % (2*n_rot_k) == 0)`
+        // doubling overflows the u32 divisor to 0 (SIGFPE, hit by the dsv4
+        // state probe on the all-SWA base half). The port writes the
+        // guarded value (0), which is what a fixed upstream produces.
+        let (n_rot_k, n_rot_v) = self.raw_half_n_rot(view);
+        io.write_u32(n_rot_k);
+        io.write_u32(n_rot_v);
 
         for &il in &view.layer_ids {
             let k = self.layers[il].k;
@@ -3488,6 +3568,10 @@ impl KvCache {
     ) -> Result<(), String> {
         let v_trans = io.read_u32()?;
         let n_layer = io.read_u32()?;
+        // 210791069 (llama-kv-cache.cpp:2552-2556): the rotation widths ride
+        // the blob; a mismatch is fatal (:2575-2584)
+        let n_rot_k_ref = io.read_u32()?;
+        let n_rot_v_ref = io.read_u32()?;
 
         let layer_ids: Vec<usize> = if swa_half {
             self.swa
@@ -3516,6 +3600,23 @@ impl KvCache {
             // the port's caches are always the C's !v_trans layout; the C
             // errors the same way against a v_trans=0 cache
             return Err("incompatible V transposition".into());
+        }
+        // (:2575-2584) exact rotation metadata, a mismatched restore is
+        // rejected — per half, see raw_state_write's note
+        let (n_rot_k, n_rot_v) = if swa_half {
+            self.raw_half_n_rot_swa()
+        } else {
+            self.raw_half_n_rot_base()
+        };
+        if n_rot_k_ref != n_rot_k {
+            return Err(format!(
+                "incompatible key rotation ({n_rot_k_ref} instead of {n_rot_k})"
+            ));
+        }
+        if n_rot_v_ref != n_rot_v {
+            return Err(format!(
+                "incompatible value rotation ({n_rot_v_ref} instead of {n_rot_v})"
+            ));
         }
 
         // keys, one row per cell (:2552-2581)
@@ -4146,9 +4247,8 @@ pub struct KpoolLayoutSeq {
     /// where the pool scan stopped, so an append resumes instead of starting
     /// over (:680-681)
     pub j_next: usize,
-    /// whether any cell also carries another sequence, which rules out
-    /// caching this sequence's pooled keys (:683-684)
-    pub shared: bool,
+    // (43fe9c642 dropped the `shared` member — rep_gen marks each rep once
+    // instead of ruling out caching for shared sequences)
 }
 
 /// `llama_memory_hybrid_idx::kpool_layout` (:673-691)
@@ -4156,7 +4256,6 @@ pub struct KpoolLayoutSeq {
 pub struct KpoolLayout {
     pub seqs: Vec<KpoolLayoutSeq>,
     pub n_pool_real: u32,
-    pub cache_safe: bool,
 }
 
 /// `llama_memory_hybrid_idx_context::kpool_state` (:694-701 + a7b94df2c:379)
@@ -4171,7 +4270,12 @@ pub struct KpoolState {
     /// graph size of the new pool list, stable across decode steps
     /// (a7b94df2c:379)
     pub n_new_g: u32,
-    pub cache_safe: bool,
+    /// `rep_gen` (43fe9c642, llama-memory-hybrid-idx.cpp:702-703) — per
+    /// global cell, the generation that last marked a pool with that rep:
+    /// a pool is marked once per rep so sequences sharing cells (a seq_cp,
+    /// or tokens decoded for several sequences) never scatter two rows into
+    /// one rep (the CPU-backend data race the commit fixes)
+    pub rep_gen: Vec<u32>,
 }
 
 impl Default for KpoolState {
@@ -4183,7 +4287,7 @@ impl Default for KpoolState {
             n_pool_real: 0,
             n_new: 0,
             n_new_g: 1,
-            cache_safe: false,
+            rep_gen: Vec::new(),
         }
     }
 }
@@ -4320,11 +4424,6 @@ impl HybridIdxCache {
         self.stale = hybrid_idx_stale_clean();
     }
 
-    /// `kpool_layout_shared` (:720-722)
-    pub fn kpool_layout_shared(&self) -> bool {
-        matches!(&self.kpool_lay, Some(l) if !l.cache_safe)
-    }
-
     /// `kpool_layout_update` (llama-memory-hybrid-idx.cpp:726-817) — pools
     /// are fixed by the positions relative to the sequence's first one, so
     /// the layout survives a plain append; `mem_idx_stale` tells us when a
@@ -4337,13 +4436,11 @@ impl HybridIdxCache {
             self.kpool_lay = Some(KpoolLayout {
                 seqs: vec![KpoolLayoutSeq::default(); crate::batch::LLAMA_MAX_SEQ],
                 n_pool_real: 0,
-                cache_safe: true,
             });
         }
         let lay = self.kpool_lay.as_mut().unwrap();
 
         lay.n_pool_real = 0;
-        lay.cache_safe = true;
 
         for s in 0..crate::batch::LLAMA_MAX_SEQ {
             let sq = &mut lay.seqs[s];
@@ -4379,23 +4476,13 @@ impl HybridIdxCache {
                 sq.cells = sp.clone();
                 sq.pools.clear();
                 sq.j_next = 0;
-                sq.shared = false;
                 sq.pos_min = if sp.is_empty() { 0 } else { sp[0].0 };
                 n_kept = 0;
             }
-
-            // sharing starts with a seq_cp; it ends with an edit or a
-            // seq_rm/state_drop/state_read that frees the shared cells
-            // (:776-779 — the unified arm only)
-            if !sq.shared {
-                for j in n_kept..sq.cells.len() {
-                    let cell = sq.cells[j].1 as usize;
-                    if base_cells[cell].seq.count_ones() > 1 {
-                        sq.shared = true;
-                        break;
-                    }
-                }
-            }
+            // (43fe9c642 dropped the per-sequence `shared` scan and the
+            // layout's cache_safe flag: whole-sequence seq_cp shares the
+            // pools themselves, and rep_gen marks each rep once instead)
+            let _ = n_kept;
 
             // pools start at the first valid token (:788-809; the order-mode
             // branch is a7b94df2c:477-481)
@@ -4431,7 +4518,6 @@ impl HybridIdxCache {
             sq.j_next = j;
 
             lay.n_pool_real += sq.pools.len() as u32;
-            lay.cache_safe = lay.cache_safe && !sq.shared;
         }
 
         self.kpool_lay.as_ref().unwrap()
@@ -4446,7 +4532,6 @@ impl HybridIdxCache {
         let lay = self.kpool_lay.as_ref().expect("kpool_build_sizes");
         KpoolState {
             n_pool_real: lay.n_pool_real,
-            cache_safe: lay.cache_safe,
             ..KpoolState::default()
         }
     }
@@ -4490,27 +4575,45 @@ impl HybridIdxCache {
         }
         let st = self.kpool_st.as_mut().unwrap();
 
+        // (43fe9c642, llama-memory-hybrid-idx.cpp:634-671) the rep_gen
+        // table spans the cache's global cells — the port's single-stream
+        // cache folds `kv_size*idx->get_n_stream()` to `self.size`
+        let kv_size = self.size;
+        let kpool_u = self.kpool as usize;
+
         st.n_pool_real = lay.n_pool_real;
-        st.cache_safe = lay.cache_safe;
         st.n_new = 0;
         st.generation = st.generation.wrapping_add(1);
         if st.generation == 0 {
             st.is_new.fill(0);
+            st.rep_gen.fill(0);
             st.generation = 1;
         }
         st.is_new.resize(lay.n_pool_real as usize, 0);
+        st.rep_gen.resize(kv_size as usize, 0);
         let gen = st.generation;
 
         let mut pool_start = [0u32; crate::batch::LLAMA_MAX_SEQ];
+
+        // a pool is marked once per rep: sequences sharing cells (a seq_cp,
+        // or tokens decoded for several sequences) share their pools, whose
+        // single pooled row they all read through pool_cells, so the scatter
+        // rows stay unique (:656-663)
+        let mut mark = |st: &mut KpoolState, s: usize, k: usize, pool_start: &[u32; crate::batch::LLAMA_MAX_SEQ]| {
+            let sq = &lay.seqs[s];
+            let rep = (sq.strm * kv_size + sq.cells[sq.pools[k] as usize + kpool_u - 1].1) as usize;
+            if st.rep_gen[rep] != gen {
+                st.rep_gen[rep] = gen;
+                st.is_new[pool_start[s] as usize + k] = gen;
+                st.n_new += 1;
+            }
+        };
+
         let mut ip = 0u32;
         for s in 0..crate::batch::LLAMA_MAX_SEQ {
             let sq = &lay.seqs[s];
             pool_start[s] = ip;
             ip += sq.pools.len() as u32;
-
-            if !st.cache_safe {
-                continue;
-            }
 
             // a sequence edit invalidates only pools ending after the edited
             // position (:1029-1041) — `std::lower_bound(pools, stale_from,
@@ -4524,24 +4627,12 @@ impl HybridIdxCache {
 
             let first = sq
                 .pools
-                .partition_point(|&j| (sq.cells[j as usize + self.kpool as usize - 1].0 as i64) < stale_from as i64);
+                .partition_point(|&j| (sq.cells[j as usize + kpool_u - 1].0 as i64) < stale_from as i64);
             for pi in first..sq.pools.len() {
-                let idx = pool_start[s] + pi as u32;
-                if st.is_new[idx as usize] != gen {
-                    st.is_new[idx as usize] = gen;
-                    st.n_new += 1;
-                }
+                mark(st, s, pi, &pool_start);
             }
         }
         assert!(ip as usize == st.is_new.len(), "kpool_build_state: pool count");
-
-        if !st.cache_safe {
-            // (:1044-1048 + a7b94df2c:729-731)
-            st.is_new.fill(gen);
-            st.n_new = st.n_pool_real;
-            st.n_new_g = st.n_new.max(1);
-            return;
-        }
 
         // in order mode a token's cell gives its rank, and the rank its
         // pool: positions cannot, as an image shares one
@@ -4556,12 +4647,8 @@ impl HybridIdxCache {
                 if by_order {
                     let r = kpool_rank(&sq.cells, p, ubatch_cells[i]);
                     assert!(r >= 0, "kpool_build_state: order-mode rank");
-                    if (r as u64 / self.kpool as u64) < sq.pools.len() as u64 {
-                        let idx = pool_start[s as usize] + (r / self.kpool as i64) as u32;
-                        if st.is_new[idx as usize] != gen {
-                            st.is_new[idx as usize] = gen;
-                            st.n_new += 1;
-                        }
+                    if (r as u64 / kpool_u as u64) < sq.pools.len() as u64 {
+                        mark(st, s as usize, (r as usize) / kpool_u, &pool_start);
                     }
                     continue;
                 }
@@ -4577,12 +4664,8 @@ impl HybridIdxCache {
                 let it = it - 1;
                 // a7b94df2c:746 — `p <= cells[*it + kpool - 1].first`: the
                 // last member's position is the pool's true end
-                if p <= sq.cells[sq.pools[it] as usize + self.kpool as usize - 1].0 {
-                    let idx = pool_start[s as usize] + it as u32;
-                    if st.is_new[idx as usize] != gen {
-                        st.is_new[idx as usize] = gen;
-                        st.n_new += 1;
-                    }
+                if p <= sq.cells[sq.pools[it] as usize + kpool_u - 1].0 {
+                    mark(st, s as usize, it, &pool_start);
                 }
             }
         }
@@ -4632,10 +4715,6 @@ impl HybridIdxCache {
         self.kpool_cur().n_new_g
     }
 
-    /// `get_kpool_cache_safe()` (:1082-1084)
-    pub fn get_kpool_cache_safe(&self) -> bool {
-        self.kpool_cur().cache_safe
-    }
 
     /// `llama_memory_hybrid_idx_context::set_input_kpool`
     /// (llama-memory-hybrid-idx.cpp:1086-1287 + a7b94df2c:791-1058) — fills
@@ -4658,10 +4737,16 @@ impl HybridIdxCache {
         pool_mask: TensorId,
         mask_f16: bool,
         tail_idxs: TensorId,
-        gather_mask: Option<TensorId>,
-        gather: bool,
+        // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the
+        // live selection slots, -inf for the dead ones — the old
+        // gather_mask + gather pair collapsed into one (310991409 removed
+        // the gather path of glm5-next's sparse attention, c173a53bd
+        // dropped the gather-mode sentinel)
+        sel_mask: Option<TensorId>,
         new_pool_idxs: TensorId,
-        new_pool_rep: Option<TensorId>,
+        // new_pool_rep is required since c173a53bd: the graph always
+        // scatters the fresh pooled keys back into the cache (build_qsa_sel)
+        new_pool_rep: TensorId,
         ubatch_pos: &[i32],
         ubatch_seqs: &[Vec<i32>],
         ubatch_cells: &[u32],
@@ -4692,11 +4777,13 @@ impl HybridIdxCache {
             gctx.ne(pool_idxs)[0] == kpool as i64
                 && gctx.ne(pool_idxs)[1] == n_pool as i64
         );
-        assert!(st.cache_safe == new_pool_rep.is_some(), "kpool: cache_safe");
-        assert!(gctx.ne(new_pool_idxs)[0] == kpool as i64 && gctx.ne(new_pool_idxs)[1] == n_new_g as i64);
-        if let Some(rep) = new_pool_rep {
-            assert!(gctx.ne(rep)[0] == n_new_g as i64, "kpool: new_pool_rep");
-        }
+        // the graph always scatters the fresh pooled keys back into the
+        // cache (c173a53bd, llama-memory-hybrid-idx.cpp:815-817)
+        assert!(
+            gctx.ne(new_pool_idxs)[0] == kpool as i64
+                && gctx.ne(new_pool_idxs)[1] == n_new_g as i64
+        );
+        assert!(gctx.ne(new_pool_rep)[0] == n_new_g as i64, "kpool: new_pool_rep");
         if let Some(pos) = new_pool_pos {
             assert!(gctx.ne(pos)[0] == 4 * n_new_g as i64, "kpool: new_pool_pos");
         }
@@ -4729,8 +4816,10 @@ impl HybridIdxCache {
             dummy_cell = gcell(sq.strm, sq.cells[it].1);
         }
 
-        // gather maps padding to a real cell and masks it separately (:1146)
-        let sentinel = if gather { dummy_cell as i32 } else { n_kv as i32 };
+        // padding and absent cells point at the n_kv sentinel row, one
+        // past the live cells (c173a53bd, :813-814 — the gather-mode
+        // "dummy cell + separate mask" sentinel is gone with the gather path)
+        let sentinel = n_kv as i32;
 
         // in order mode a token sees the pools and the tail up to its own
         // rank in the sequence, which its cell pins down (:852-864,
@@ -4753,12 +4842,12 @@ impl HybridIdxCache {
         let mut gm: Option<TensorId> = None;
         let mut n_sel = 0u32;
         let mut n_top = 0u32; // pools per token in the selection
-        if let Some(t) = gather_mask {
-            assert!(gctx.ty(t) == GgmlType::F32, "kpool: gather_mask F32");
+        if let Some(t) = sel_mask {
+            assert!(gctx.ty(t) == GgmlType::F32, "kpool: sel_mask F32");
             let ne = *gctx.ne(t);
             assert!(
                 ne[3] == n_tokens as i64 && ne[1] == 1 && ne[2] == 1,
-                "kpool: gather_mask shape"
+                "kpool: sel_mask shape"
             );
             n_sel = ne[0] as u32;
             n_top = n_sel / self.kpool;
@@ -4787,7 +4876,9 @@ impl HybridIdxCache {
             let sq = &lay.seqs[s];
             seq_pool_start[s] = pool_end.len() as u32;
 
-            let _inert = !gather && !seq_in_ub[s]; // n_stream_kv == 1 ⇒ false
+            // inert = n_stream_kv > 1 && !seq_in_ub[s] (:849-850) — the
+            // port's single-stream cache makes it false for every sequence
+            let _inert = !seq_in_ub[s];
 
             for pi in 0..sq.pools.len() {
                 let j = sq.pools[pi] as usize;
@@ -4799,12 +4890,9 @@ impl HybridIdxCache {
                 pcell[ip] = gcell(sq.strm, rep) as i32;
 
                 for k in 0..kpool {
-                    // inert == false ⇒ always the cell (gather or local)
-                    pidx[ip * kpool + k] = if gather {
-                        gcell(sq.strm, sq.cells[j + k].1) as i32
-                    } else {
-                        sq.cells[j + k].1 as i32
-                    };
+                    // inert == false ⇒ always the cell (:858-861, c173a53bd
+                    // dropped the gather-mode gcell branch)
+                    pidx[ip * kpool + k] = sq.cells[j + k].1 as i32;
                 }
 
                 if st.is_new[ip] == st.generation {
@@ -4813,9 +4901,9 @@ impl HybridIdxCache {
                         nidx[i_new as usize * kpool + k] =
                             gcell(sq.strm, sq.cells[j + k].1) as i32;
                     }
-                    if new_pool_rep.is_some() {
-                        nrep[i_new as usize] = gcell(sq.strm, rep);
-                    }
+                    // nrep is always written (c173a53bd: new_pool_rep is
+                    // required, the graph always scatters)
+                    nrep[i_new as usize] = gcell(sq.strm, rep);
                     if !npos.is_empty() {
                         // a pooled key is rotated to the M-RoPE position of
                         // its first member (:930-937, a7b94df2c) — sec1/sec2
@@ -4860,9 +4948,7 @@ impl HybridIdxCache {
                 for k in 0..kpool {
                     nidx[i * kpool + k] = pad_cell as i32;
                 }
-                if new_pool_rep.is_some() {
-                    nrep[i] = pad_cell;
-                }
+                nrep[i] = pad_cell;
                 pad_cell += 1;
             }
         }
@@ -4884,8 +4970,8 @@ impl HybridIdxCache {
         gctx
             .with_i32_mut(new_pool_idxs, |p| p.copy_from_slice(&nidx))
             .unwrap();
-        if let Some(rep) = new_pool_rep {
-            let bytes = gctx.data_bytes_mut(rep).unwrap();
+        {
+            let bytes = gctx.data_bytes_mut(new_pool_rep).unwrap();
             bytes.copy_from_slice(bytemuck::cast_slice(&nrep));
         }
         if new_pool_pos.is_some() {
@@ -4982,21 +5068,13 @@ impl HybridIdxCache {
                     // order mode: the k cells below the token's rank
                     // (:1018-1021, a7b94df2c)
                     let c = sq.cells[(rank[i] - k as i64) as usize].1;
-                    cell = if gather {
-                        gcell(sq.strm, c) as i32
-                    } else {
-                        c as i32
-                    };
+                    cell = c as i32;
                     real = true;
                 } else if k < n_tail {
                     let pt = p - k as i32;
                     let it = sq.cells.partition_point(|&c| c.0 < pt);
                     if it < sq.cells.len() && sq.cells[it].0 == pt {
-                        cell = if gather {
-                            gcell(sq.strm, sq.cells[it].1) as i32
-                        } else {
-                            sq.cells[it].1 as i32
-                        };
+                        cell = sq.cells[it].1 as i32;
                         real = true;
                     }
                 }
@@ -5103,6 +5181,13 @@ impl HybridIdxCache {
         // state_write_data — K rows only (no V: MLA-fooled K-only cache)
         io.write_u32(0); // v_trans (fa on)
         io.write_u32(idx_layers.len() as u32);
+        // 210791069: the base state_write_data persists the rotation widths
+        // (the idx cache is a llama_kv_cache, its blob carries them too).
+        // The idx plane is F16 (never quantized) and the hybrid-idx archs
+        // are outside the DeepSeek-indexer clause of llama-kv-cache.cpp:
+        // 321-332, so both widths are 0
+        io.write_u32(0); // n_rot_k
+        io.write_u32(0); // n_rot_v
         for &k in &idx_layers {
             let k_size_row = GgmlType::F16.row_size(self.row_w as usize) as u64;
             io.write_i32(GgmlType::F16 as i32);
@@ -5170,6 +5255,10 @@ impl HybridIdxCache {
 
         let v_trans = io.read_u32()?;
         let n_layer = io.read_u32()?;
+        // 210791069: the idx cache's own rotation widths (always 0/0 — F16
+        // plane, non-DeepSeek arch) still ride the blob and are checked
+        let n_rot_k_ref = io.read_u32()?;
+        let n_rot_v_ref = io.read_u32()?;
         let idx_layers = self.idx_layers();
         if n_layer != idx_layers.len() as u32 {
             return Err(format!(
@@ -5179,6 +5268,16 @@ impl HybridIdxCache {
         }
         if v_trans != 0 {
             return Err("incompatible V transposition (hybrid idx)".into());
+        }
+        if n_rot_k_ref != 0 {
+            return Err(format!(
+                "incompatible key rotation ({n_rot_k_ref} instead of 0)"
+            ));
+        }
+        if n_rot_v_ref != 0 {
+            return Err(format!(
+                "incompatible value rotation ({n_rot_v_ref} instead of 0)"
+            ));
         }
 
         let k_size_row = GgmlType::F16.row_size(self.row_w as usize) as u64;

@@ -637,9 +637,16 @@ pub const PARSE_FLAG_NONE: ParseFlags = 0;
 pub const PARSE_FLAG_LENIENT: ParseFlags = 1 << 0;
 pub const PARSE_FLAG_DEBUG: ParseFlags = 1 << 1;
 
-/// `common_peg_parse_context` (peg-parser.h:184-199)
+/// `common_peg_parse_context` (peg-parser.h:184-203)
 pub struct ParseContext {
+    /// `input` — the bytes being parsed (peg-parser.h:186)
     pub input: String,
+    /// `tokens` — token ids aligned 1:1 with `input`'s bytes
+    /// (`LLAMA_TOKEN_NULL` on continuation bytes), e.g.
+    /// input  = [h,   e,  l,  l,  o,  _,  w,  o,  r,  l,  d]
+    /// tokens = [id, -1, -1, -1, -1, id, -1, -1, -1, -1, -1]
+    /// (peg-parser.h:187; 18b5f8b18)
+    pub tokens: Vec<i32>,
     pub flags: ParseFlags,
     pub ast: PegAstArena,
     pub parse_depth: i32,
@@ -649,6 +656,21 @@ impl ParseContext {
     pub fn new(input: &str, flags: ParseFlags) -> Self {
         ParseContext {
             input: input.to_string(),
+            tokens: Vec::new(),
+            flags,
+            ast: PegAstArena::default(),
+            parse_depth: 0,
+        }
+    }
+
+    /// `common_peg_parse_context(std::string, std::vector<llama_token>, flags)`
+    /// (peg-parser.h:200-203, 18b5f8b18) — the token-aligned constructor;
+    /// asserts the vectors are byte-aligned when tokens are present.
+    pub fn new_with_tokens(input: String, tokens: Vec<i32>, flags: ParseFlags) -> Self {
+        assert!(tokens.is_empty() || tokens.len() == input.len());
+        ParseContext {
+            input,
+            tokens,
             flags,
             ast: PegAstArena::default(),
             parse_depth: 0,

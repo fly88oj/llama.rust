@@ -831,10 +831,21 @@ fn forward_weights(
             let gp = weights::granite_params(hp, n_trunk, attn);
             llama::context::ForwardWeights::Granite(weights::granite_weights(model, n_trunk), gp)
         }
-        llama::arch::LlmArch::LFM2MOE => {
-            attn = attn_params(hp, weights::first_attn_layer(hp, n_trunk), use_flash_attn);
-            let gp = weights::lfm2_params(hp, n_trunk, attn);
-            llama::context::ForwardWeights::Lfm2(weights::lfm2_weights(model, n_trunk), gp)
+        llama::arch::LlmArch::LFM2 | llama::arch::LlmArch::LFM2MOE => {
+            // the lfm2 build fork (lfm2.cpp:137-139): n_layer_decision > 0
+            // loads the Decision form (no memory — create_memory's nullptr
+            // arm, llama-model.cpp:2385-2387); lfm2moe ships no decision
+            // files — the same fork llama-cli drives
+            if model.arch == llama::arch::LlmArch::LFM2 && hp.n_layer_decision > 0 {
+                llama::context::ForwardWeights::Lfm2Decision(
+                    model.lfm2_decision_weights(),
+                    model.lfm2_decision_params(),
+                )
+            } else {
+                attn = attn_params(hp, weights::first_attn_layer(hp, n_trunk), use_flash_attn);
+                let gp = weights::lfm2_params(hp, n_trunk, attn);
+                llama::context::ForwardWeights::Lfm2(weights::lfm2_weights(model, n_trunk), gp)
+            }
         }
         llama::arch::LlmArch::QWEN35 => {
             // per-layer head geometry (the GDN layers differ from the attention
@@ -1738,6 +1749,26 @@ fn forward_weights(
             llama::context::ForwardWeights::Glm5Next(
                 weights::glm5_weights(model, n_trunk),
                 weights::glm5_params(hp, n_trunk, a),
+            )
+        }
+        // ---- batch 20 (the c35b66744 sync): k2-horizon (dense + MoVA) —
+        // the same construction llama-cli drives ----
+        llama::arch::LlmArch::K2_HORIZON => {
+            llama::context::ForwardWeights::K2Horizon(
+                model.k2_horizon_weights(),
+                llama::graph_arch::K2HorizonParams {
+                    attn,
+                    n_norm_groups: hp.n_norm_groups as i64,
+                    norm_rms_eps: hp.f_norm_rms_eps,
+                    n_layer_dense_lead: hp.n_layer_dense_lead,
+                    n_expert: hp.n_expert as i64,
+                    n_expert_used: hp.n_expert_used(0) as i64,
+                    n_value_expert: hp.n_value_expert as i64,
+                    n_value_expert_used: hp.n_value_expert_used as i64,
+                    expert_gating_func: hp.expert_gating_func as i32,
+                    expert_weights_norm: hp.expert_weights_norm,
+                    expert_weights_scale: hp.expert_weights_scale,
+                },
             )
         }
         // ---- arch batch 11b (2026-10): the long-tail queue, second half ----
@@ -2695,11 +2726,13 @@ fn load_engine(
     // these decision models return a score for each token via the embeddings
     // output, so embedding mode is forced on (pooling NONE)
     let decision_type = server_decision::common_get_decision_type(&gguf);
+    // (common.cpp:1285-1290, a657f7e98: LFM2_D1_OMNI joins the embeddings family)
     let decision_reads_embd = matches!(
         decision_type,
         server_decision::CommonDecisionType::Laya
             | server_decision::CommonDecisionType::Kev
             | server_decision::CommonDecisionType::Clef
+            | server_decision::CommonDecisionType::Lfm2D1Omni
     );
     let embeddings = args.embeddings || decision_reads_embd;
     let pooling_arg = if decision_reads_embd {
@@ -2766,6 +2799,10 @@ fn load_engine(
             // + llama-embed (the causal no-cache graph<true>)
             | llama::arch::LlmArch::GEMMA_EMBEDDING
             | llama::arch::LlmArch::LLAMA_EMBED
+            // batch 20 — gemma-embedding2 (the null-memory embedding family:
+            // create_memory returns nullptr, llama-model.cpp:2402 — decode
+            // reroutes to encode, llama-context.cpp:1729-1732)
+            | llama::arch::LlmArch::GEMMA_EMBEDDING2
     );
     let core = if is_encoder {
         if !args.lora.is_empty() {
@@ -2802,8 +2839,14 @@ fn load_engine(
         });
         // llama-embed's graph<true> runs the CAUSAL no-cache mask
         let causal = model.arch == llama::arch::LlmArch::LLAMA_EMBED;
-        // gemma-embedding's symmetric-SWA facts (gemma-embedding.cpp:3-28)
-        let gemma_swa = (model.arch == llama::arch::LlmArch::GEMMA_EMBEDDING).then(|| {
+        // gemma-embedding's symmetric-SWA facts (gemma-embedding.cpp:3-28);
+        // gemma-embedding2 reads the same window pair (its loader also sets
+        // swa_type = SYMMETRIC, gemma-embedding2.cpp:4-6)
+        let gemma_swa = matches!(
+            model.arch,
+            llama::arch::LlmArch::GEMMA_EMBEDDING | llama::arch::LlmArch::GEMMA_EMBEDDING2
+        )
+        .then(|| {
             let hp = &model.hparams;
             let rope = hp.rope_runtime();
             let gr = llama::graph_arch::EurobertRope {
@@ -2851,6 +2894,42 @@ fn load_engine(
             }
             llama::arch::LlmArch::GEMMA_EMBEDDING => {
                 llama::context::EncoderWeights::GemmaEmbedding(model.gemma_embedding_weights())
+            }
+            // gemma-embedding2 — the bundled params carry the per-layer-input
+            // facts + the SWA rope pair (the ge2 test assembly,
+            // tests/gemma_embedding2_e2e.rs); text embeddings only — the
+            // vision/audio halves ride mtmd, not ported
+            llama::arch::LlmArch::GEMMA_EMBEDDING2 => {
+                let hp = &model.hparams;
+                let rope = hp.rope_runtime();
+                let p = llama::graph_arch::GemmaEmbedding2Params {
+                    n_head: hp.n_head(0) as i64,
+                    n_head_kv: hp.n_head_kv(0) as i64,
+                    n_embd_head: hp.n_embd_head_k(0) as i64,
+                    norm_rms_eps: hp.f_norm_rms_eps,
+                    n_embd_per_layer: hp.n_embd_per_layer as i64,
+                    f_attention_scale: hp.f_attention_scale,
+                    is_swa: (0..hp.n_layer() as usize).map(|il| hp.is_swa(il)).collect(),
+                    freq_base_swa: hp.rope_freq_base_train_swa,
+                    freq_scale_swa: hp.rope_freq_scale_train_swa,
+                    rope: llama::graph_arch::EurobertRope {
+                        n_rot: hp.n_rot(0) as i32,
+                        // llama_model_rope_type(GEMMA_EMBEDDING2) = NEOX
+                        // (llama-model.cpp:3184)
+                        rope_mode: hp.rope_type as i32,
+                        n_ctx_orig: rope.n_ctx_orig_yarn,
+                        freq_base: hp.rope_freq_base_train,
+                        freq_scale: rope.freq_scale,
+                        ext_factor: rope.ext_factor,
+                        attn_factor: rope.attn_factor,
+                        beta_fast: rope.beta_fast,
+                        beta_slow: rope.beta_slow,
+                    },
+                };
+                llama::context::EncoderWeights::GemmaEmbedding2(
+                    model.gemma_embedding2_weights(),
+                    p,
+                )
             }
             llama::arch::LlmArch::LLAMA_EMBED => {
                 llama::context::EncoderWeights::LlamaEmbed(weights::llama_embed_weights(&model))
@@ -3352,13 +3431,14 @@ fn load_engine(
             state: SlotState::Idle,
             n_ctx: slot_n_ctx,
             prompt_tokens: Vec::new(),
+            checkpoints: std::collections::VecDeque::new(),
             task: None,
             sampler: None,
             grammar: None,
             stats: api::GenStats::default(),
             sampled: 0,
             i_batch: -1,
-            generated_text: String::new(),
+            generated: llama::chat_tools::ChatInput::default(),
             generated_tokens: Vec::new(),
             n_sent_text: 0,
             has_next_token: false,
@@ -3486,6 +3566,8 @@ fn load_engine(
             llama::vocab::VocabType::Rwkv => 5,
             llama::vocab::VocabType::Plamo2 => 6,
             llama::vocab::VocabType::Test => 7,
+            // LLAMA_VOCAB_TYPE_PLAMO3 = 8 (abeada335, B domain)
+            llama::vocab::VocabType::Plamo3 => 8,
         },
         n_vocab: vocab.id_to_token.len() as u64,
         n_ctx: slot_n_ctx as u64,
@@ -3495,6 +3577,11 @@ fn load_engine(
         size: model_size,
         ftype: engine.ftype.clone(),
         has_mtmd: false,
+        // `server_model_output_modalities(common_get_decision_type(model))`
+        // (server-context.cpp:4548, 4d60b4d08)
+        model_output_modalities: server_decision::server_model_output_modalities(
+            decision_type,
+        ),
     };
     eprintln!(
         "llama-server: model loaded in {:?} (n_ctx = {}, n_parallel = {} -> slot n_ctx = {}, \
@@ -3538,6 +3625,9 @@ pub struct ModelMeta {
     pub size: u64,
     pub ftype: String,
     pub has_mtmd: bool,
+    /// `model_output_modalities` (server-context.h:23, 4d60b4d08) — output
+    /// modalities for GET /models
+    pub model_output_modalities: Vec<&'static str>,
 }
 
 /// `random_string()` (server-common.cpp:108-124) — 32 alphanumeric characters.
@@ -4558,6 +4648,19 @@ fn handle_models(server: &Arc<engine::Server>) -> Response {
         ("aliases".into(), Json::Array(vec![model_name])),
         ("tags".into(), Json::Array(Vec::new())),
         ("object".into(), Json::String("model".into())),
+        // `server_model_architecture_json(has_inp_image, has_inp_audio,
+        // has_inp_video, model_output_modalities)` (server-context.cpp:4902-4906,
+        // 4d60b4d08) — the port has no mmproj wiring, so the input flags
+        // (chat_params.allow_image/audio/video) are always false
+        (
+            "architecture".into(),
+            server_decision::server_model_architecture_json(
+                false,
+                false,
+                false,
+                &m.model_output_modalities,
+            ),
+        ),
         ("created".into(), Json::Int(t)),
         ("owned_by".into(), Json::String("llamacpp".into())),
         (

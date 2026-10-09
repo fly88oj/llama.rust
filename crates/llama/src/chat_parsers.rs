@@ -9,6 +9,8 @@
 //!   * parsers/functionary-v3-2.cpp `common_chat_params_init_functionary_v3_2` → [`chat_params_init_functionary_v3_2`]
 //!   * parsers/kimi-k2.cpp        `common_chat_params_init_kimi_k2`           → [`chat_params_init_kimi_k2`]
 //!   * parsers/kimi-k3.cpp        `common_chat_params_init_kimi_k3`           → [`chat_params_init_kimi_k3`]
+//!   * parsers/k2-horizon.cpp     `common_chat_params_init_k2_horizon`         → [`chat_params_init_k2_horizon`] (4fbc76dec)
+//!   * parsers/translate-gemma.cpp `common_chat_params_init_translate_gemma`   → [`chat_params_init_translate_gemma`] (bd4eeaa04)
 //!   * parsers/ling3.cpp          `common_chat_params_init_ling3`             → [`chat_params_init_ling3`]
 //!   * parsers/cohere2moe.cpp     `common_chat_params_init_cohere2moe`        → [`chat_params_init_cohere2moe`]
 //!   * parsers/lfm2.cpp           `is_lfm2_template` / `common_chat_params_init_lfm2` → [`is_lfm2_template`] / [`chat_params_init_lfm2`]
@@ -254,7 +256,7 @@ pub(crate) fn chat_params_init_ministral_3(
         // Tool call parser
         if has_tools && inputs.tool_choice != ChatToolChoice::None {
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -270,13 +272,13 @@ pub(crate) fn chat_params_init_ministral_3(
                 let t_open = p.tool_open(oseq);
                 let json_p = p.p.json();
                 let sch =
-                    p.p.schema(json_p, &format!("tool-{name}-schema"), &schema, false);
+                    p.p.schema(json_p, &format!("tool-{tool_index}-schema"), &schema, false);
                 let ta = p.tool_args(sch);
                 // NB: no p.tool() wrapper here (parsers/ministral3.cpp:94-96):
                 // tool_open(...) + tool_args(...)
                 let seq = p.p.sequence(&[t_open, ta]);
 
-                let r = p.p.rule(&format!("tool-{name}"), seq, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), seq, false);
                 tool_choice_alts.push(r);
             });
             let tool_choice = p.p.choice(&tool_choice_alts);
@@ -500,7 +502,7 @@ pub(crate) fn chat_params_init_gpt_oss(
         if has_tools && inputs.tool_choice != ChatToolChoice::None {
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
 
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -519,7 +521,7 @@ pub(crate) fn chat_params_init_gpt_oss(
                 let constraint = p.p.optional(cseq);
                 let json_p = p.p.json();
                 let sch =
-                    p.p.schema(json_p, &format!("tool-{name}-schema"), &params, false);
+                    p.p.schema(json_p, &format!("tool-{tool_index}-schema"), &params, false);
                 let args = p.tool_args(sch);
 
                 // recipient in role header
@@ -536,7 +538,7 @@ pub(crate) fn chat_params_init_gpt_oss(
                 let tool_in_channel = pegc1!(p, tool, p.p.sequence(&[ch_open, args]));
 
                 let alt = p.p.choice(&[tool_in_role, tool_in_channel]);
-                let r = p.p.rule(&format!("tool-{name}"), alt, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), alt, false);
                 tool_choice_alts.push(r);
             });
 
@@ -760,7 +762,7 @@ pub(crate) fn chat_params_init_llm_jp_harmony(
         if has_tools && inputs.tool_choice != ChatToolChoice::None {
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
 
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -774,7 +776,7 @@ pub(crate) fn chat_params_init_llm_jp_harmony(
                 let func_name = p.p.sequence(&[fn_lit, tn]);
                 let json_p = p.p.json();
                 let sch =
-                    p.p.schema(json_p, &format!("tool-{name}-schema"), &params, false);
+                    p.p.schema(json_p, &format!("tool-{tool_index}-schema"), &params, false);
                 let args = p.tool_args(sch);
 
                 // recipient in role header
@@ -790,7 +792,7 @@ pub(crate) fn chat_params_init_llm_jp_harmony(
                 let tool_in_channel = pegc1!(p, tool, p.p.sequence(&[ch_open, args]));
 
                 let alt = p.p.choice(&[tool_in_role, tool_in_channel]);
-                let r = p.p.rule(&format!("tool-{name}"), alt, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), alt, false);
                 tool_choice_alts.push(r);
             });
 
@@ -974,7 +976,7 @@ pub(crate) fn chat_params_init_muse_glimmer(
             let string_value = p.p.ac(seq, &[delim]);
 
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -982,7 +984,7 @@ pub(crate) fn chat_params_init_muse_glimmer(
                     .to_string();
 
                 let mut arg_rules: Vec<ParserId> = Vec::new();
-                foreach_parameter(function, |prop, doc| {
+                foreach_parameter(function, |param_index, prop, doc| {
                     // auto value_parser = p.eps();
                     let value_parser = if doc.may_be_string(prop.schema) {
                         string_value
@@ -990,7 +992,7 @@ pub(crate) fn chat_params_init_muse_glimmer(
                         let json_p = p.p.json();
                         let sch = p.p.schema_node(
                             json_p,
-                            &format!("tool-{name}-arg-{}-schema", prop.name),
+                            &format!("tool-{tool_index}-arg-{param_index}-schema"),
                             Rc::clone(doc),
                             prop.schema,
                             false,
@@ -1044,7 +1046,7 @@ pub(crate) fn chat_params_init_muse_glimmer(
                 let body = p.p.spaced(a, t_close);
                 let tool_parser = p.tool(body);
 
-                let r = p.p.rule(&format!("tool-{name}"), tool_parser, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
                 tool_choice_alts.push(r);
             });
 
@@ -1152,7 +1154,7 @@ pub(crate) fn chat_params_init_functionary_v3_2(
 
         // Build tool call parsers for each available function
         let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-        foreach_function(&inputs.tools, |function| {
+        foreach_function(&inputs.tools, |tool_index, function| {
             let name = function
                 .at("name")
                 .and_then(|v| v.get_str().ok())
@@ -1168,12 +1170,12 @@ pub(crate) fn chat_params_init_functionary_v3_2(
             let t_open = p.tool_open(oseq);
             let json_p = p.p.json();
             let sch =
-                p.p.schema(json_p, &format!("tool-{name}-schema"), &schema, false);
+                p.p.schema(json_p, &format!("tool-{tool_index}-schema"), &schema, false);
             let ta = p.tool_args(sch);
             let seq = p.p.sequence(&[t_open, ta]);
             let tool_parser = p.tool(seq);
 
-            let r = p.p.rule(&format!("tool-{name}"), tool_parser, false);
+            let r = p.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
             tool_choice_alts.push(r);
         });
 
@@ -1319,7 +1321,7 @@ pub(crate) fn chat_params_init_kimi_k2(
         // The ID format is: functions.<name>:<index>
         // We need to match: functions.<name>:<digits>
         let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-        foreach_function(&inputs.tools, |function| {
+        foreach_function(&inputs.tools, |tool_index, function| {
             let name = function
                 .at("name")
                 .and_then(|v| v.get_str().ok())
@@ -1341,7 +1343,7 @@ pub(crate) fn chat_params_init_kimi_k2(
             let t_open = p.tool_open(open_seq);
             let json_p = p.p.json();
             let sch =
-                p.p.schema(json_p, &format!("tool-{name}-schema"), &schema, false);
+                p.p.schema(json_p, &format!("tool-{tool_index}-schema"), &schema, false);
             let ta = p.tool_args(sch);
             let ce = p.p.literal(CALL_END);
             let close = p.p.optional(ce);
@@ -1349,7 +1351,7 @@ pub(crate) fn chat_params_init_kimi_k2(
             let seq = p.p.sequence(&[t_open, ta, t_close]);
             let tool_parser = p.tool(seq);
 
-            let r = p.p.rule(&format!("tool-{name}"), tool_parser, false);
+            let r = p.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
             tool_choice_alts.push(r);
         });
         let tool_choice = p.p.choice(&tool_choice_alts);
@@ -1526,7 +1528,7 @@ pub(crate) fn chat_params_init_kimi_k3(
         }
 
         let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-        foreach_function(&inputs.tools, |function| {
+        foreach_function(&inputs.tools, |tool_index, function| {
             let name = function
                 .at("name")
                 .and_then(|v| v.get_str().ok())
@@ -1541,6 +1543,7 @@ pub(crate) fn chat_params_init_kimi_k3(
             if let Some(props) = schema.at("properties") {
                 if !props.empty() {
                     let mut arg_choice_alts: Vec<ParserId> = Vec::new();
+                    let mut param_index = 0usize;
                     for (key, prop_value) in props.items() {
                         let mut ty = "string".to_string();
                         if prop_value.is_object() {
@@ -1571,8 +1574,13 @@ pub(crate) fn chat_params_init_kimi_k3(
                         let tac = p.tool_arg_close(ae_lit);
                         let arg_seq = p.p.sequence(&[tao, tan, q, until_sep, sep1, value, tac]);
                         let arg = p.tool_arg(arg_seq);
-                        let r = p.p.rule(&format!("kimi-k3-arg-{name}-{key}"), arg, false);
+                        let r = p.p.rule(
+                            &format!("kimi-k3-arg-{tool_index}-{param_index}"),
+                            arg,
+                            false,
+                        );
                         arg_choice_alts.push(r);
+                        param_index += 1;
                     }
                     let arg_choices = p.p.choice(&arg_choice_alts);
                     args = p.p.zero_or_more(arg_choices);
@@ -1593,7 +1601,7 @@ pub(crate) fn chat_params_init_kimi_k3(
             let t_close = p.tool_close(ce_lit);
             let call = pegc1!(p, tool, p.p.sequence(&[t_open, ta, t_close]));
 
-            let r = p.p.rule(&format!("kimi-k3-tool-{name}"), call, false);
+            let r = p.p.rule(&format!("kimi-k3-tool-{tool_index}"), call, false);
             tool_choice_alts.push(r);
         });
         let tool_choices = p.p.choice(&tool_choice_alts);
@@ -1627,6 +1635,384 @@ pub(crate) fn chat_params_init_kimi_k3(
         data.grammar = parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(TOOLS_START)];
+    }
+
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
+// K2 Horizon (parsers/k2-horizon.cpp, 46252404/4fbc76dec)
+// ---------------------------------------------------------------------------
+
+/// `common_chat_params_init_k2_horizon` (parsers/k2-horizon.cpp:11-166):
+/// `<|ifm|im_start|>` turns, `<ifm|think*>` reasoning picked by
+/// reasoning_effort and `<ifm|tool_calls>` sections — the three think tag
+/// pairs defeat the autoparser's reasoning detection.
+pub(crate) fn chat_params_init_k2_horizon(
+    tmpl: &ChatTemplate,
+    inputs: &GenerationParams,
+) -> Result<ChatParams, String> {
+    let mut data = ChatParams::default();
+
+    // The template requires a thinking field on every assistant message
+    let mut messages = inputs.messages.clone();
+    if let Json::Array(msgs) = &mut messages {
+        for msg in msgs.iter_mut() {
+            let is_assistant = msg
+                .at("role")
+                .and_then(|v| v.get_str().ok())
+                .map(|r| r == "assistant")
+                .unwrap_or(false);
+            let has_reasoning = msg
+                .at("reasoning_content")
+                .map(|v| !v.is_null())
+                .unwrap_or(false);
+            if is_assistant && !has_reasoning {
+                if let Json::Object(fields) = msg {
+                    fields.push(("reasoning_content".to_string(), Json::String(String::new())));
+                }
+            }
+        }
+    }
+
+    data.prompt = template_direct_apply_impl(tmpl, inputs, Some(&messages), None, None)?;
+    data.generation_prompt = template_generation_prompt_impl(tmpl, inputs, Some(&messages), None, None)?;
+    data.format = ChatFormat::PegNative;
+    data.supports_thinking = true;
+
+    // `inputs.extra_context.value("reasoning_effort", "high")` and
+    // `.value("tool_call_format", "xml")` (parsers/k2-horizon.cpp:31-32)
+    let ctx_str = |key: &str, default: &str| -> String {
+        inputs
+            .extra_context
+            .at(key)
+            .and_then(|v| v.get_str().ok())
+            .unwrap_or(default)
+            .to_string()
+    };
+    let effort = ctx_str("reasoning_effort", "high");
+    let call_format = ctx_str("tool_call_format", "xml");
+
+    // Templates that handle enable_thinking disable it with an empty
+    // `<ifm|think></ifm|think>` block for every effort
+    let thinking_off = !inputs.enable_thinking && tmpl.source().contains("enable_thinking");
+    let think: &str = if thinking_off {
+        "ifm|think"
+    } else if effort == "medium" {
+        "ifm|think_fast"
+    } else if effort == "low" {
+        "ifm|think_faster"
+    } else {
+        "ifm|think"
+    };
+
+    let gen_prefix = "<|ifm|im_start|>assistant\n";
+    let think_start = format!("<{think}>");
+    let think_end = format!("</{think}>");
+    let section_start = "<ifm|tool_calls>";
+    let section_end = "</ifm|tool_calls>";
+    let call_start = "<ifm|tool_call>";
+    let call_end = "</ifm|tool_call>";
+    let arg_key = "<ifm|arg_key>";
+    let arg_key_end = "</ifm|arg_key>";
+    let arg_type = "<ifm|arg_type>";
+    let arg_type_end = "</ifm|arg_type>";
+    let arg_val = "<ifm|arg_value>";
+    let arg_val_end = "</ifm|arg_value>";
+
+    data.thinking_start_tag = think_start.clone();
+    data.thinking_end_tags = vec![think_end.clone()];
+
+    data.preserved_tokens = data.thinking_end_tags.clone();
+    data.preserved_tokens.extend(
+        [
+            think_start.clone(),
+            section_start.to_string(),
+            section_end.to_string(),
+            call_start.to_string(),
+            call_end.to_string(),
+            arg_key.to_string(),
+            arg_key_end.to_string(),
+            arg_type.to_string(),
+            arg_type_end.to_string(),
+            arg_val.to_string(),
+            arg_val_end.to_string(),
+        ]
+        .into_iter(),
+    );
+
+    data.message_delimiters = vec![
+        ("assistant".to_string(), "<|ifm|im_start|>assistant".to_string()),
+        ("user".to_string(), "<|ifm|im_start|>user".to_string()),
+        ("tool".to_string(), "<|ifm|im_start|>tool".to_string()),
+        ("system".to_string(), "<|ifm|im_start|>system".to_string()),
+    ];
+
+    let has_tools = inputs.tools.is_array() && !inputs.tools.empty();
+    let has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+    let extract_reasoning = inputs.reasoning_format != ReasoningFormat::None;
+    let include_grammar =
+        has_response_format || (has_tools && inputs.tool_choice != ChatToolChoice::None);
+
+    if inputs.has_continuation() {
+        let msg = &inputs.continue_msg;
+
+        data.generation_prompt =
+            format!("{gen_prefix}{think_start}\n{}", msg.reasoning_content);
+        if inputs.continue_final_message == ChatContinuation::Content {
+            data.generation_prompt += &format!("{think_end}{}", msg.render_content("\n\n")?);
+        }
+
+        data.prompt += &data.generation_prompt;
+    }
+
+    // `think_block(body)` (k2-horizon.cpp:56-58):
+    // `optional(THINK_START + space() + ac(body + think_end, tags))`
+    let think_block = |p: &mut ChatPegBuilder,
+                        think_start: &str,
+                        body: ParserId,
+                        think_end_choice: ParserId,
+                        tags: &[String]|
+     -> ParserId {
+        let ts = p.p.literal(think_start);
+        let sp = p.p.space();
+        let seq = p.p.sequence(&[body, think_end_choice]);
+        let ac = p.p.ac(seq, tags);
+        let inner = p.p.sequence(&[ts, sp, ac]);
+        p.p.optional(inner)
+    };
+
+    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+        // `p.literal(GEN_PREFIX)` (k2-horizon.cpp:50) — the literal prefix,
+        // not the template's full generation prompt
+        let generation_prompt = p.p.literal(gen_prefix);
+
+        // the think-end choice over the tag family + the body up to any of them
+        let tags = data.thinking_end_tags.clone();
+        let tag_refs: Vec<&str> = tags.iter().map(|s| s.as_str()).collect();
+        let mut think_end_alts: Vec<ParserId> = Vec::new();
+        for tag in &tags {
+            think_end_alts.push(p.p.literal(tag));
+        }
+        let think_end_choice = p.p.choice(&think_end_alts);
+        let think_body = p.p.until_one_of(&tag_refs);
+
+        let reasoning = if extract_reasoning {
+            let r = p.reasoning(think_body);
+            think_block(p, &think_start, r, think_end_choice, &tags)
+        } else {
+            p.p.eps()
+        };
+
+        if has_response_format {
+            // The answer must be bare JSON, so the think block is consumed
+            // even when it is not extracted
+            let thoughts = if extract_reasoning {
+                reasoning
+            } else {
+                think_block(p, &think_start, think_body, think_end_choice, &tags)
+            };
+            let j = p.p.json();
+            let sch = p.p.schema(j, "response-format", &inputs.json_schema, false);
+            let c = p.content(sch);
+            let spaced = p.p.spaced(thoughts, c);
+            return p.p.sequence(&[generation_prompt, spaced]);
+        }
+
+        if !has_tools || inputs.tool_choice == ChatToolChoice::None {
+            let rest = p.p.rest();
+            let c = p.content(rest);
+            let spaced = p.p.spaced(reasoning, c);
+            return p.p.sequence(&[generation_prompt, spaced]);
+        }
+
+        let tool_choice;
+        if call_format == "json" {
+            tool_choice = p.standard_json_tools(
+                call_start, call_end, &inputs.tools,
+                /* parallel_tool_calls = */ false,
+                /* force_tool_calls = */ true,
+                "", "", false, false, "", "", &[], false,
+            );
+        } else {
+            let arg_close_lit = p.p.literal(arg_val_end);
+            let arg_close = p.tool_arg_close(arg_close_lit);
+            let arg_string_until = p.p.until(arg_val_end);
+            let arg_string_v = p.tool_arg_string_value(arg_string_until);
+            let arg_string_seq = p.p.sequence(&[arg_string_v, arg_close]);
+            let arg_string_ac = p.p.ac(arg_string_seq, &[arg_val_end.to_string()]);
+            let arg_string = p.p.rule("xml-arg-string", arg_string_ac, false);
+
+            // The models leave out <ifm|arg_type> even when asked for xml_typed
+            let arg_type_parser = if call_format == "xml_typed" {
+                let t = p.p.literal(arg_type);
+                let u = p.p.until(arg_type_end);
+                let te = p.p.literal(arg_type_end);
+                let sp = p.p.space();
+                let seq = p.p.sequence(&[t, u, te, sp]);
+                p.p.optional(seq)
+            } else {
+                p.p.eps()
+            };
+
+            let mut tool_choice_alts: Vec<ParserId> = Vec::new();
+            foreach_function(&inputs.tools, |tool_index, function| {
+                let name = function
+                    .at("name")
+                    .and_then(|v| v.get_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                let mut required_args: Vec<ParserId> = Vec::new();
+                let mut optional_args: Vec<ParserId> = Vec::new();
+                foreach_parameter(function, |param_index, param, doc| {
+                    let rule_name = format!("tool-{tool_index}-arg-{param_index}");
+                    let types = doc.value_types(param.schema);
+
+                    let mut arg_value = arg_string;
+                    if !types.has(ValueType::String) {
+                        let j = p.p.json();
+                        let sch = p.p.schema_node(
+                            j,
+                            &format!("{rule_name}-schema"),
+                            Rc::clone(doc),
+                            param.schema,
+                            false,
+                        );
+                        let jv = p.tool_arg_json_value(sch);
+                        arg_value = p.p.sequence(&[jv, arg_close]);
+                    }
+                    if types.has(ValueType::String) && !types.is_only(ValueType::String) {
+                        // The string alternative accepts any text, so only
+                        // the parser needs the JSON alternatives.
+                        let mut json_alts: Vec<ParserId> = Vec::new();
+                        if types.has(ValueType::Object) {
+                            json_alts.push(p.p.json_object());
+                        }
+                        if types.has(ValueType::Array) {
+                            json_alts.push(p.p.json_array());
+                        }
+                        if types.has(ValueType::Number) || types.has(ValueType::Integer) {
+                            json_alts.push(p.p.json_number());
+                        }
+                        if types.has(ValueType::Boolean) {
+                            json_alts.push(p.p.json_bool());
+                        }
+                        if types.has(ValueType::Null) {
+                            json_alts.push(p.p.json_null());
+                        }
+                        let json_value = p.p.choice(&json_alts);
+                        let tjv = p.tool_arg_json_value(json_value);
+                        let jseq = p.p.sequence(&[tjv, arg_close]);
+                        let jatomic = p.p.atomic(jseq);
+                        let alt = p.p.choice(&[jatomic, arg_string]);
+                        arg_value = p.p.gbnf(alt, "xml-arg-string");
+                    }
+
+                    // space() + tool_arg(tool_arg_open(ARG_KEY + name + ARG_KEY_END)
+                    //                    << arg_type + ARG_VAL + arg_value)
+                    let k = p.p.literal(arg_key);
+                    let nm = p.p.literal(&param.name);
+                    let tan = p.tool_arg_name(nm);
+                    let ke = p.p.literal(arg_key_end);
+                    let kseq = p.p.sequence(&[k, tan, ke]);
+                    let tao = p.tool_arg_open(kseq);
+                    let v = p.p.literal(arg_val);
+                    let tail = p.p.sequence(&[arg_type_parser, v, arg_value]);
+                    let open_spaced = p.p.spaced(tao, tail);
+                    let ta = p.tool_arg(open_spaced);
+                    let sp = p.p.space();
+                    let arg = p.p.sequence(&[sp, ta]);
+                    let r = p.p.rule(&rule_name, arg, false);
+                    if param.required {
+                        required_args.push(r);
+                    } else {
+                        optional_args.push(r);
+                    }
+                });
+
+                let mut args = p.permute(&format!("tool-{tool_index}-args"), &required_args);
+                if !optional_args.is_empty() {
+                    let any_opt = p.p.choice(&optional_args);
+                    let zom = p.p.zero_or_more(any_opt);
+                    args = p.p.sequence(&[args, zom]);
+                }
+
+                let cs = p.p.literal(call_start);
+                let nm = p.p.literal(&name);
+                let tn = p.tool_name(nm);
+                let nl = p.p.literal("\n");
+                let oseq = p.p.sequence(&[cs, tn, nl]);
+                let t_open = p.tool_open(oseq);
+                let targs = p.tool_args(args);
+                let ce = p.p.literal(call_end);
+                let t_close = p.tool_close(ce);
+
+                // tool(tool_open + tool_args << tool_close) — `+` then `<<`:
+                // sequence([sequence([open, args]), space, close])
+                let body = p.p.sequence(&[t_open, targs]);
+                let spaced = p.p.spaced(body, t_close);
+                let call = pegc1!(p, tool, spaced);
+
+                let r = p.p.rule(&format!("tool-{tool_index}"), call, false);
+                tool_choice_alts.push(r);
+            });
+            tool_choice = p.p.choice(&tool_choice_alts);
+        }
+
+        let required = inputs.tool_choice == ChatToolChoice::Required;
+        let calls = if inputs.parallel_tool_calls {
+            // tool_choice + zero_or_more(space + tool_choice)
+            let sp = p.p.space();
+            let seq = p.p.sequence(&[sp, tool_choice]);
+            let more = p.p.zero_or_more(seq);
+            p.p.sequence(&[tool_choice, more])
+        } else {
+            tool_choice
+        };
+        // repeat(SECTION_START << calls << SECTION_END, required ? 1 : 0, 1)
+        let ss = p.p.literal(section_start);
+        let se = p.p.literal(section_end);
+        let head = p.p.spaced(ss, calls);
+        let body = p.p.spaced(head, se);
+        let rep = p.p.repeat3(body, if required { 1 } else { 0 }, 1);
+        let tool_calls = p.p.trigger_rule("tool-calls", rep);
+
+        // Keep thinking inline when required calls bypass the content parser.
+        // (`reasoning = p.content(think_block(think_body))` — the content
+        // wraps the whole optional block, k2-horizon.cpp:157-159)
+        let reasoning = if required && !extract_reasoning {
+            let block = think_block(p, &think_start, think_body, think_end_choice, &tags);
+            p.content(block)
+        } else {
+            reasoning
+        };
+
+        // A required call follows the reasoning directly, the models
+        // otherwise keep writing content
+        let content = if required {
+            p.p.eps()
+        } else {
+            let u = p.p.until(section_start);
+            p.content(u)
+        };
+
+        // generation_prompt + (reasoning << content << tool_calls)
+        let rc = p.p.spaced(reasoning, content);
+        let rct = p.p.spaced(rc, tool_calls);
+        p.p.sequence(&[generation_prompt, rct])
+    })?;
+
+    data.parser = parser.save();
+
+    if include_grammar {
+        data.grammar_lazy =
+            !(has_response_format || inputs.tool_choice == ChatToolChoice::Required);
+        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+
+        if data.grammar_lazy {
+            data.grammar_triggers = vec![GrammarTrigger::word(section_start)];
+        }
     }
 
     Ok(data)
@@ -1791,7 +2177,7 @@ pub(crate) fn chat_params_init_ling3(
         let arg_string_seq = p.p.sequence(&[arg_string_v, arg_close]);
         let arg_string = p.p.rule("ling3-arg-string", arg_string_seq, false);
 
-        foreach_function(&inputs.tools, |function| {
+        foreach_function(&inputs.tools, |tool_index, function| {
             let name = function
                 .at("name")
                 .and_then(|v| v.get_str().ok())
@@ -1803,8 +2189,8 @@ pub(crate) fn chat_params_init_ling3(
 
             // each argument may be preceded by whitespace: the model emits
             // newlines between arguments, the template history does not
-            foreach_parameter(function, |param, doc| {
-                let rule_name = format!("ling3-arg-{name}-{}", param.name);
+            foreach_parameter(function, |param_index, param, doc| {
+                let rule_name = format!("ling3-arg-{tool_index}-{param_index}");
 
                 let types = doc.value_types(param.schema);
 
@@ -1869,7 +2255,7 @@ pub(crate) fn chat_params_init_ling3(
 
             // required arguments in any order (as Qwen3-Coder does), then
             // optional ones in any order and number
-            let mut args = p.permute(&format!("ling3-{name}-args"), &required_args);
+            let mut args = p.permute(&format!("ling3-{tool_index}-args"), &required_args);
             if !optional_args.is_empty() {
                 let any_opt = p.p.choice(&optional_args);
                 let zom = p.p.zero_or_more(any_opt);
@@ -1893,7 +2279,7 @@ pub(crate) fn chat_params_init_ling3(
             let t_close = p.tool_close(ce_seq);
             let call = pegc1!(p, tool, p.p.sequence(&[t_open, ta, t_close]));
 
-            let r = p.p.rule(&format!("ling3-tool-{name}"), call, false);
+            let r = p.p.rule(&format!("ling3-tool-{tool_index}"), call, false);
             tool_choice_alts.push(r);
         });
         let tool_choices = p.p.choice(&tool_choice_alts);
@@ -2307,7 +2693,7 @@ pub(crate) fn chat_params_init_gigachat_v3(
         if has_tools && inputs.tool_choice != ChatToolChoice::None {
             // Build a choice of all available tools
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-            for tool in inputs.tools.iter() {
+            for (tool_index, tool) in inputs.tools.iter().enumerate() {
                 let Some(function) = tool.at("function") else {
                     continue;
                 };
@@ -2329,7 +2715,7 @@ pub(crate) fn chat_params_init_gigachat_v3(
                 // tool_args = p.json_member("arguments", p.tool_args(p.schema(...)))
                 let json_p = p.p.json();
                 let sch =
-                    p.p.schema(json_p, &format!("tool-{name}-schema"), &schema, false);
+                    p.p.schema(json_p, &format!("tool-{tool_index}-schema"), &schema, false);
                 let ta = p.tool_args(sch);
                 let tool_args = p.p.json_member("arguments", ta);
 
@@ -2344,7 +2730,7 @@ pub(crate) fn chat_params_init_gigachat_v3(
                 let s2 = p.p.spaced(s1, tool_args);
                 let rbrace = p.p.literal("}");
                 let s3 = p.p.spaced(s2, rbrace);
-                let r = p.p.rule(&format!("tool-{name}"), s3, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), s3, false);
                 tool_choice_alts.push(r);
             }
             let tool_choice = p.p.choice(&tool_choice_alts);
@@ -2503,12 +2889,12 @@ fn minimax_m3_members_of(
     // Required properties in schema order, then any number of optional ones in any order.
     let mut required_elements: Vec<ParserId> = Vec::new();
     let mut optional_elements: Vec<ParserId> = Vec::new();
-    for prop in properties {
+    for (i, prop) in properties.iter().enumerate() {
         let element = element_of(
             p,
             &prop.name,
             prop.schema,
-            &format!("{rule_prefix}-{}", prop.name),
+            &format!("{rule_prefix}-{i}"),
         );
         if prop.required {
             required_elements.push(element);
@@ -2656,7 +3042,7 @@ pub(crate) fn chat_params_init_minimax_m3(
         }
 
         let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-        foreach_function(&tools_json, |function| {
+        foreach_function(&tools_json, |tool_index, function| {
             let name = function
                 .at("name")
                 .and_then(|v| v.get_str().ok())
@@ -2676,7 +3062,7 @@ pub(crate) fn chat_params_init_minimax_m3(
             let mut invoke_body = p.p.eps();
             if let SchemaKind::Object { properties, .. } = &doc.node(doc.root).kind {
                 invoke_body =
-                    minimax_m3_members_of(p, &doc, properties, &format!("tool-{name}-arg"));
+                    minimax_m3_members_of(p, &doc, properties, &format!("tool-{tool_index}-arg"));
             }
 
             let inv_open1 = p.p.literal(&format!("{NS}<invoke name=\""));
@@ -2692,7 +3078,7 @@ pub(crate) fn chat_params_init_minimax_m3(
             let body = p.p.sequence(&[t_open, sp1, invoke_body, sp2, t_close]);
             let func_parser = p.tool(body);
 
-            let r = p.p.rule(&format!("tool-{name}"), func_parser, false);
+            let r = p.p.rule(&format!("tool-{tool_index}"), func_parser, false);
             tool_choice_alts.push(r);
         });
         let tool_choice = p.p.choice(&tool_choice_alts);
@@ -2943,7 +3329,7 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
         // build tool call section first since we might need it in reasoning
         let mut tool_choice_alts: Vec<ParserId> = Vec::new();
         if has_tool_calls {
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -2952,7 +3338,7 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
 
                 let mut required_parsers: Vec<ParserId> = Vec::new();
                 let mut optional_parsers: Vec<ParserId> = Vec::new();
-                foreach_parameter(function, |param, doc| {
+                foreach_parameter(function, |param_index, param, doc| {
                     let is_string = doc.may_be_string(param.schema);
 
                     // <｜DSML｜parameter name="KEY" string="true|false">
@@ -2971,7 +3357,7 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
                         let json_p = p.p.json();
                         let sch = p.p.schema_node(
                             json_p,
-                            &format!("tool-{name}-arg-{}-schema", param.name),
+                            &format!("tool-{tool_index}-arg-{param_index}-schema"),
                             Rc::clone(doc),
                             param.schema,
                             false,
@@ -2984,7 +3370,7 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
                     let arg = p.tool_arg(arg_seq);
 
                     let named_arg =
-                        p.p.rule(&format!("tool-{name}-arg-{}", param.name), arg, false);
+                        p.p.rule(&format!("tool-{tool_index}-arg-{param_index}"), arg, false);
                     if param.required {
                         required_parsers.push(named_arg);
                     } else {
@@ -3022,7 +3408,7 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
                 let body = p.p.sequence(&[t_open, invoke_body, sp, t_close]);
                 let func_parser = p.tool(body);
 
-                let r = p.p.rule(&format!("tool-{name}"), func_parser, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), func_parser, false);
                 tool_choice_alts.push(r);
             });
         }
@@ -3529,7 +3915,7 @@ pub(crate) fn chat_params_init_gemma4(
 
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
 
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -3549,7 +3935,7 @@ pub(crate) fn chat_params_init_gemma4(
                 let seq = p.p.sequence(&[t_open, ta]);
                 let tool_parser = p.tool(seq);
 
-                let r = p.p.rule(&format!("tool-{name}"), tool_parser, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
                 tool_choice_alts.push(r);
             });
             let tool_choice = p.p.choice(&tool_choice_alts);
@@ -3716,7 +4102,7 @@ pub(crate) fn chat_params_init_minicpm5(
             let string_value = p.p.choice(&[cdata_branch, plain_branch]);
 
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -3724,14 +4110,14 @@ pub(crate) fn chat_params_init_minicpm5(
                     .to_string();
 
                 let mut arg_rules: Vec<ParserId> = Vec::new();
-                foreach_parameter(function, |prop, doc| {
+                foreach_parameter(function, |param_index, prop, doc| {
                     let value_parser = if doc.may_be_string(prop.schema) {
                         string_value
                     } else {
                         let json_p = p.p.json();
                         let sch = p.p.schema_node(
                             json_p,
-                            &format!("tool-{name}-arg-{}-schema", prop.name),
+                            &format!("tool-{tool_index}-arg-{param_index}-schema"),
                             Rc::clone(doc),
                             prop.schema,
                             false,
@@ -3774,7 +4160,7 @@ pub(crate) fn chat_params_init_minicpm5(
                 let body = p.p.spaced(a, t_close);
                 let tool_parser = p.tool(body);
 
-                let r = p.p.rule(&format!("tool-{name}"), tool_parser, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
                 tool_choice_alts.push(r);
             });
             let tool_choice = p.p.choice(&tool_choice_alts);
@@ -3894,7 +4280,7 @@ pub(crate) fn chat_params_init_qwen3_coder(
         // Match complete <function=name> opener for Qwen3-Coder models that occasionally omit the
         // starting <tool_call>. The model may hallucinate a tool name, but it is preferable over
         // constraining on <function which may occur in valid content generation, e.g. #include <functional>
-        foreach_function(&inputs.tools, |function| {
+        foreach_function(&inputs.tools, |_tool_index, function| {
             let name = function
                 .at("name")
                 .and_then(|v| v.get_str().ok())
@@ -3950,7 +4336,7 @@ pub(crate) fn chat_params_init_qwen3_coder(
             );
 
             let mut tool_choice_alts: Vec<ParserId> = Vec::new();
-            foreach_function(&inputs.tools, |function| {
+            foreach_function(&inputs.tools, |tool_index, function| {
                 let name = function
                     .at("name")
                     .and_then(|v| v.get_str().ok())
@@ -3960,8 +4346,8 @@ pub(crate) fn chat_params_init_qwen3_coder(
                 let mut required_args: Vec<ParserId> = Vec::new();
                 let mut optional_args: Vec<ParserId> = Vec::new();
 
-                foreach_parameter(function, |param, doc| {
-                    let rule_name = format!("tool-{name}-arg-{}", param.name);
+                foreach_parameter(function, |param_index, param, doc| {
+                    let rule_name = format!("tool-{tool_index}-arg-{param_index}");
 
                     // p.tool_arg_open("<parameter=" + p.tool_arg_name(p.literal(param.name)) + ">\n")
                     let open1 = p.p.literal("<parameter=");
@@ -4027,7 +4413,7 @@ pub(crate) fn chat_params_init_qwen3_coder(
 
                 // Accept required arguments in any order, as Qwen does not always adhere to the
                 // order provided.
-                let mut args = p.permute(&format!("tool-{name}-args"), &required_args);
+                let mut args = p.permute(&format!("tool-{tool_index}-args"), &required_args);
                 if !optional_args.is_empty() {
                     let any_opt = p.p.choice(&optional_args);
                     let zom = p.p.zero_or_more(any_opt);
@@ -4045,7 +4431,7 @@ pub(crate) fn chat_params_init_qwen3_coder(
                 let t_close = p.tool_close(ce);
                 let func = pegc1!(p, tool, p.p.sequence(&[t_open, ta, t_close]));
 
-                let r = p.p.rule(&format!("tool-{name}"), func, false);
+                let r = p.p.rule(&format!("tool-{tool_index}"), func, false);
                 tool_choice_alts.push(r);
             });
             let tool_choice = p.p.choice(&tool_choice_alts);
@@ -4119,6 +4505,104 @@ pub(crate) fn chat_params_init_qwen3_coder(
 }
 
 // ---------------------------------------------------------------------------
+// TranslateGemma (parsers/translate-gemma.cpp, bd4eeaa04)
+// ---------------------------------------------------------------------------
+
+/// `common_chat_params_init_translate_gemma` (parsers/translate-gemma.cpp:9-63):
+/// TranslateGemma does not support tools or reasoning, it only needs user
+/// messages in its own content schema.
+pub(crate) fn chat_params_init_translate_gemma(
+    tmpl: &ChatTemplate,
+    inputs: &GenerationParams,
+) -> Result<ChatParams, String> {
+    let mut data = ChatParams::default();
+
+    // default to chat_template_kwargs, or en-GB if not specified
+    let ctx_str = |key: &str| -> Option<String> {
+        inputs
+            .extra_context
+            .at(key)
+            .and_then(|v| v.get_str().ok())
+            .map(|s| s.to_string())
+    };
+    let src_lang = ctx_str("source_lang_code").unwrap_or_else(|| "en-GB".to_string());
+    let tgt_lang = ctx_str("target_lang_code").unwrap_or_else(|| "en-GB".to_string());
+    for key in ["source_lang_code", "target_lang_code"] {
+        if inputs.extra_context.at(key).is_none() {
+            // LOG_WRN "TranslateGemma: %s not set in chat_template_kwargs,
+            // defaulting to en-GB"
+            eprintln!(
+                "common_chat_try_specialized_template: TranslateGemma: {key} not set in chat_template_kwargs, defaulting to en-GB"
+            );
+        }
+    }
+
+    // user messages become a [{type: text, text, source_lang_code,
+    // target_lang_code}] content array
+    let mut messages = inputs.messages.clone();
+    if let Json::Array(msgs) = &mut messages {
+        for message in msgs.iter_mut() {
+            let is_user = message
+                .at("role")
+                .and_then(|v| v.get_str().ok())
+                .map(|r| r == "user")
+                .unwrap_or(false);
+            if !is_user {
+                continue;
+            }
+            let content = message.at("content").cloned().unwrap_or(Json::Null);
+            let mut text = String::new();
+            if let Ok(s) = content.get_str() {
+                text = s.to_string();
+            } else if let Json::Array(parts) = &content {
+                for part in parts {
+                    if !text.is_empty() {
+                        text += "\n";
+                    }
+                    // `part.value("text", "")`
+                    text += &part.at("text").and_then(|v| v.get_str().ok()).unwrap_or("");
+                }
+            }
+            let new_content = Json::Array(vec![Json::Object(vec![
+                ("type".to_string(), Json::String("text".to_string())),
+                ("text".to_string(), Json::String(text)),
+                ("source_lang_code".to_string(), Json::String(src_lang.clone())),
+                ("target_lang_code".to_string(), Json::String(tgt_lang.clone())),
+            ])]);
+            if let Json::Object(fields) = message {
+                if let Some(slot) = fields.iter_mut().find(|(k, _)| k == "content") {
+                    slot.1 = new_content;
+                } else {
+                    fields.push(("content".to_string(), new_content));
+                }
+            }
+        }
+    }
+
+    data.prompt = template_direct_apply_impl(tmpl, inputs, Some(&messages), None, None)?;
+    data.generation_prompt = template_generation_prompt_impl(tmpl, inputs, Some(&messages), None, None)?;
+    data.format = ChatFormat::PegNative;
+    data.supports_thinking = false;
+
+    if inputs.has_continuation() {
+        data.generation_prompt =
+            format!("<start_of_turn>model\n{}", inputs.continue_msg.render_content("\n\n")?);
+        data.prompt += &data.generation_prompt;
+    }
+
+    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+        // literal(generation_prompt) << content(rest)
+        let gp = p.p.literal(&data.generation_prompt);
+        let rest = p.p.rest();
+        let c = p.content(rest);
+        p.p.spaced(gp, c)
+    })?;
+    data.parser = parser.save();
+
+    Ok(data)
+}
+
+// ---------------------------------------------------------------------------
 // dispatch — common_chat_try_specialized_template (chat.cpp:1090-1223)
 // ---------------------------------------------------------------------------
 
@@ -4168,6 +4652,12 @@ pub(crate) fn try_specialized_template(
     // Kimi K3 - the <|open|>/<|close|>/<|end_of_msg|> markers are unique to it
     if src.contains("<|open|>") && src.contains("<|close|>") && src.contains("<|end_of_msg|>") {
         return Ok(Some(chat_params_init_kimi_k3(tmpl, params)?));
+    }
+
+    // K2 Horizon - <|ifm|im_start|> turns, <ifm|think*> reasoning picked by reasoning_effort and
+    // <ifm|tool_calls> sections; the three think tag pairs defeat the autoparser's reasoning detection
+    if src.contains("<|ifm|im_start|>") && src.contains("<ifm|tool_calls>") {
+        return Ok(Some(chat_params_init_k2_horizon(tmpl, params)?));
     }
 
     // Ling 3.0 / Bailing V3 - <role>X</role> sections with <arg_key>/<arg_value> tagged
@@ -4242,6 +4732,11 @@ pub(crate) fn try_specialized_template(
         && src.contains("<param name=\"")
     {
         return Ok(Some(chat_params_init_minicpm5(tmpl, params)?));
+    }
+
+    // TranslateGemma - user content must follow a custom schema with language codes
+    if src.contains("[source_lang_code]") && src.contains("[target_lang_code]") {
+        return Ok(Some(chat_params_init_translate_gemma(tmpl, params)?));
     }
 
     // Qwen3-Coder XML tool calls, also used by Nemotron Nano 3, Qwen3.5 and StepFun-3.5-Flash

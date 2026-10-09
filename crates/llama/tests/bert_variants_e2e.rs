@@ -962,10 +962,25 @@ fn bert_variants_graph_structure() {
         let mut ctx = encoder(m, P::RANK);
         let g = ctx.build(&tokens).unwrap();
         // the head's own gelu — the per-layer GEGLU is the fused Glu op,
-        // asserted via count(Glu) above
-        assert_eq!(gelu(&ctx, &g), 1, "modern-bert-rank: the head's gelu (llama-graph.cpp:3729)");
-        // no tanh on the modern GTE flavor
+        // asserted via count(Glu) above. 37ac63456 maps the classifier gelu
+        // to the exact erf variant (GGML_UNARY_OP_GELU_ERF, the modern-bert
+        // loader default when the file names no activation)
+        let gelu_erf = |ctx: &llama::context::EncoderContext,
+                        g: &llama::context::EncoderGraph| {
+            g.graph.nodes.iter().filter(|&&n| {
+                ctx.gctx.op(n) == ggml::GgmlOp::Silu
+                    && ctx.gctx.op_params(n)[0] == ggml::ops::GGML_UNARY_OP_GELU_ERF
+            })
+            .count()
+        };
+        assert_eq!(
+            gelu_erf(&ctx, &g),
+            1,
+            "modern-bert-rank: the head's gelu_erf (llama-graph.cpp:3729, 37ac63456)"
+        );
+        // no tanh and no tanh-approx gelu on the modern GTE flavor
         assert_eq!(tanh(&ctx, &g), 0, "modern-bert-rank: GTE head uses gelu, not tanh");
+        assert_eq!(gelu(&ctx, &g), 0, "modern-bert-rank: exact erf gelu, not the tanh approx");
     }
 }
 

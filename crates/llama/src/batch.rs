@@ -131,10 +131,11 @@ pub struct LlamaUbatch {
     pub seq_idx: Vec<i32>,
     /// [n_tokens]
     pub output: Vec<bool>,
+    /// `type` (llama-batch.h:60, 0bb496dbd) — [n_tokens], **mixed ubatch
+    /// only** (empty = the C's nullptr): 0 = token row, 1 = embd row.
+    pub type_: Vec<i8>,
     /// `decision_order` (llama-batch.h:55, a7b94df2c) — [n_tokens], empty
-    /// (the C's NULL) if no entry has one. Marks the entries a joint
-    /// decision head (clef) reads; a run of entries with the same value is
-    /// one span, spans must be separated by entries with value 0. See
+    /// (the C's NULL) if no entry has one, see
     /// [`DECISION_ORDER_*`] and `llama_batch_ext_set_decision_order`.
     pub decision_order: Vec<i32>,
     /// `data_t::batch_idxs` (llama-batch.h:65, 4453b535f) — the original
@@ -163,6 +164,14 @@ impl LlamaUbatch {
     /// position inputs per token.
     pub fn is_pos_2d(&self) -> bool {
         self.n_pos >= 3
+    }
+
+    /// `llama_ubatch::is_mixed()` (llama-batch.h:32-34, 0bb496dbd): a
+    /// type-marked ubatch whose rows mix token ids and raw embeddings —
+    /// `type` picks token or embd per row, `pos` has `n_pos` sections for
+    /// all rows.
+    pub fn is_mixed(&self) -> bool {
+        !self.type_.is_empty()
     }
 
     /// number of output-flagged tokens in the ubatch (llama-context.cpp:
@@ -568,9 +577,18 @@ pub struct BatchAllocr {
     batch: LlamaBatch,
 
     n_pos_per_embd: u32,
+    /// `allow_mixed` (llama-batch.h:205, 0bb496dbd) — the context passes
+    /// `llm_arch_supports_mixed_batch(arch) && ctx_type == DEFAULT`
+    /// (llama-context.cpp:90-92)
+    allow_mixed: bool,
+
     n_embd: u32,
     n_seq_max: u32,
     n_outputs: u32,
+
+    /// `is_embd_vec` (llama-batch.h:211, 0bb496dbd) — mixed batch only
+    /// (= 1 if embd, 0 if text token); empty on non-mixed batches
+    is_embd_vec: Vec<i8>,
 
     pos: Vec<i32>,
     n_seq_id: Vec<i32>,
@@ -607,8 +625,9 @@ pub struct BatchAllocr {
 }
 
 impl BatchAllocr {
-    /// `llama_batch_allocr::llama_batch_allocr` (llama-batch.cpp:12-23)
-    pub fn new(n_pos_per_embd: u32) -> Self {
+    /// `llama_batch_allocr::llama_batch_allocr` (llama-batch.cpp:12-23,
+    /// 0bb496dbd adds the `allow_mixed` parameter)
+    pub fn new(n_pos_per_embd: u32, allow_mixed: bool) -> Self {
         let debug = std::env::var("LLAMA_BATCH_DEBUG")
             .ok()
             .and_then(|v| v.parse::<i32>().ok())
@@ -616,9 +635,11 @@ impl BatchAllocr {
         BatchAllocr {
             batch: LlamaBatch::default(),
             n_pos_per_embd,
+            allow_mixed,
             n_embd: 0,
             n_seq_max: 0,
             n_outputs: 0,
+            is_embd_vec: Vec::new(),
             pos: Vec::new(),
             n_seq_id: Vec::new(),
             seq_id: Vec::new(),
@@ -675,36 +696,69 @@ impl BatchAllocr {
         let mem = batch_inp.mem;
 
         //
-        // determine the content types of the batch (:43-62)
+        // determine the content types of the batch (:49-79, 0bb496dbd)
         // an entry can carry a token id, a token embedding, or both (e.g. MTP
-        // hook batches); all entries must carry the same combination
+        // hook batches); all entries must carry the same combination, or be a
+        // mix of token and embd entries
         //
 
-        let has_token = batch_inp.tokens[0].id != LLAMA_TOKEN_NULL;
-        let has_embd = batch_inp.tokens[0].has_embd;
+        let mut n_tok_only: i32 = 0;
+        let mut n_embd_only: i32 = 0;
+        let mut n_both: i32 = 0;
 
-        for i in 1..n_tok as usize {
-            if (batch_inp.tokens[i].id != LLAMA_TOKEN_NULL) != has_token
-                || batch_inp.tokens[i].has_embd != has_embd
-            {
-                return Err(
-                    "all entries in the batch must have the same content types".into()
-                );
+        for i in 0..n_tok as usize {
+            let is_tok = batch_inp.tokens[i].id != LLAMA_TOKEN_NULL;
+            let is_emb = batch_inp.tokens[i].has_embd;
+
+            if !is_tok && !is_emb {
+                return Err(format!(
+                    "entry {i} has neither a token id nor an embedding"
+                ));
             }
+
+            n_tok_only += (is_tok && !is_emb) as i32;
+            n_embd_only += (is_emb && !is_tok) as i32;
+            n_both += (is_tok && is_emb) as i32;
         }
 
-        if !has_token && !has_embd {
-            return Err("batch has neither token ids nor embeddings".into());
+        if n_both > 0 && n_both != n_tok {
+            return Err(
+                "entries with both a token id and an embedding cannot be mixed with other \
+                 entries"
+                    .into(),
+            );
+        }
+
+        let mixed = n_tok_only > 0 && n_embd_only > 0;
+
+        if mixed && !self.allow_mixed {
+            return Err(
+                "this model or context does not support batches mixing token and embedding \
+                 entries"
+                    .into(),
+            );
+        }
+
+        let has_token = n_tok_only > 0 || n_both > 0;
+        let has_embd = n_embd_only > 0 || n_both > 0;
+
+        // (:67-72) the per-row content kind of a mixed batch
+        if mixed {
+            self.is_embd_vec = batch_inp.tokens.iter().map(|t| t.has_embd as i8).collect();
         }
 
         //
-        // build flat token/embd array (:64-84)
+        // build flat token/embd array (:97-124)
         //
 
         let mut token_vec: Vec<i32> = Vec::new();
         if has_token {
             token_vec = vec![0; n_tok as usize];
             for (i, tok) in batch_inp.tokens.iter().enumerate() {
+                if mixed && self.is_embd_vec[i] != 0 {
+                    token_vec[i] = 0; // placeholder
+                    continue;
+                }
                 let id = tok.id;
                 if id < 0 || id >= batch_inp.n_vocab {
                     return Err(format!("invalid token[{i}] = {id}"));
@@ -713,33 +767,50 @@ impl BatchAllocr {
             }
         }
 
-        let embd_vec: Vec<f32> = if has_embd {
+        let embd_vec: Vec<f32> = if mixed {
+            // (:105-113) all rows zero, the embd entries' rows copied in —
+            // the token rows' bytes are never read (the graph overwrites
+            // them, llama-graph.cpp:2530-2533)
+            let mut v = vec![0.0f32; n_tok as usize * self.n_embd as usize];
+            for i in 0..n_tok as usize {
+                if self.is_embd_vec[i] != 0 {
+                    let off = batch_inp.tokens[i].embd_off;
+                    let src = &batch_inp.embd[off..off + self.n_embd as usize];
+                    v[i * self.n_embd as usize..(i + 1) * self.n_embd as usize].copy_from_slice(src);
+                }
+            }
+            v
+        } else if has_embd {
             batch_inp.embd.clone()
         } else {
             Vec::new()
         };
 
         //
-        // build flat pos array (:86-104)
-        // token batch:     pos[i]            = tokens[i].pos[0]
-        // embedding batch: pos[j*n_tok + i]  = tokens[i].pos[j]  (section-major)
+        // build flat pos array, section-major (:126-140, 0bb496dbd)
+        //     pos[j*n_tok + i] = section j of entry i
+        // token entry: [p, p, p, 0] (M-RoPE text position)
+        // embd entry:  tokens[i].pos as-is
+        //
+        // upstream note: the 1D→4D expansion used to live in
+        // llm_graph_input_pos::set_input (llama-graph.cpp:179-193, deleted);
+        // it moved here so mixed batches expand per entry.
         //
 
-        let n_pos_total = if has_token {
-            n_tok as usize
-        } else {
-            n_tok as usize * batch_inp.n_pos_per_embd
-        };
-        self.pos.resize(n_pos_total, 0);
-        if has_token {
-            for i in 0..n_tok as usize {
-                self.pos[i] = batch_inp.tokens[i].pos[0];
-            }
-        } else {
-            for i in 0..n_tok as usize {
-                for j in 0..batch_inp.n_pos_per_embd {
-                    self.pos[j * n_tok as usize + i] = batch_inp.tokens[i].pos[j];
+        // (the allocr's `n_pos_per_embd` member — the ext carries the same
+        // hparams value in C, llama-context.cpp:90)
+        let n_pos_per_embd = self.n_pos_per_embd as usize;
+        self.pos.resize(n_tok as usize * n_pos_per_embd, 0);
+        for i in 0..n_tok as usize {
+            let tok = &batch_inp.tokens[i];
+            let expand = tok.id != LLAMA_TOKEN_NULL;
+            for j in 0..n_pos_per_embd {
+                let mut p = tok.pos[j];
+                if expand {
+                    // expand [p] to [p, p, p, 0] for M-RoPE
+                    p = if j < 3 { tok.pos[0] } else { 0 };
                 }
+                self.pos[j * n_tok as usize + i] = p;
             }
         }
 
@@ -879,14 +950,29 @@ impl BatchAllocr {
 
         // consistency checks (:251-386)
         let pos = self.batch.pos.as_ref().unwrap();
-        // same discriminator as `ubatch_add`: a flat pos array with one entry
-        // per RoPE section marks an embedding batch, whose positions MAY
-        // overlap the memory (:283 "embedding inputs can have overlapping
-        // positions"); token batches must move strictly forward (:266).
-        let embed_batch = self.n_pos_per_embd > 1
-            && pos.len() >= n_tok as usize * self.n_pos_per_embd as usize;
         if self.n_pos_per_embd > 1 {
-            // M-RoPE: positions may jump forward (:255-288)
+            // in a mixed batch, the first entry of each seq picks the rule
+            // (:332-346, 0bb496dbd): a token-first sequence must move strictly
+            // past the memory (`p0 >= smin` errors), an embd-first sequence
+            // may overlap it (`p0 > smin` errors — embedding inputs can have
+            // overlapping positions, :283)
+            let mut seq_first_embd = vec![
+                if self.batch.token.is_empty() { 1i8 } else { 0i8 };
+                self.n_seq_max as usize
+            ];
+            if mixed {
+                let mut seen = vec![false; self.n_seq_max as usize];
+                for i in 0..self.batch.n_tokens() {
+                    for &sid in self.batch.seq_id.as_ref().unwrap()[i].iter() {
+                        if !seen[sid as usize] {
+                            seen[sid as usize] = true;
+                            seq_first_embd[sid as usize] = self.is_embd_vec[i];
+                        }
+                    }
+                }
+            }
+            // M-RoPE case: allow position to "jump" forward only
+            // (non-continuous positions are allowed)
             for s in 0..self.n_seq_max as usize {
                 let (smin, smax) = match Self::pos_min_max(&self.seq_pos[s]) {
                     Some(v) => v,
@@ -894,7 +980,13 @@ impl BatchAllocr {
                 };
                 let _ = smax;
                 let p0 = mem.map(|m| m.seq_pos_max(s as i32)).unwrap_or(-1);
-                if p0 >= 0 && (if embed_batch { p0 > smin } else { p0 >= smin }) {
+                if p0 >= 0
+                    && (if seq_first_embd[s] != 0 {
+                        p0 > smin
+                    } else {
+                        p0 >= smin
+                    })
+                {
                     return Err(format!(
                         "the tokens of sequence {s} in the input batch have inconsistent sequence \
                          positions: memory max X = {p0}, batch start Y = {smin}; for M-RoPE it is \
@@ -1245,6 +1337,9 @@ impl BatchAllocr {
             seq_id_unq: Vec::new(),
             seq_idx: vec![-1; LLAMA_MAX_SEQ],
             output: vec![false; n_tokens as usize],
+            // `ubatch_reserve` leaves type empty (the C's nullptr — a reserve
+            // ubatch is never mixed, llama-batch.cpp:524, 0bb496dbd)
+            type_: Vec::new(),
             // `ubatch_reserve` leaves decision_order empty (the C's nullptr,
             // llama-batch.cpp:474, a7b94df2c)
             decision_order: Vec::new(),
@@ -1266,6 +1361,7 @@ impl BatchAllocr {
         self.n_outputs = 0;
         self.batch = LlamaBatch::default();
         self.pos.clear();
+        self.is_embd_vec.clear();
         self.n_seq_id.clear();
         self.seq_id.clear();
         self.seq_id_unq.clear();
@@ -1290,7 +1386,7 @@ impl BatchAllocr {
             .unwrap_or_default()
     }
 
-    /// `ubatch_add` (:749-844)
+    /// `ubatch_add` (:849-995, 0bb496dbd)
     fn ubatch_add(&mut self, idxs: &[i32], n_seqs: u32, equal_seqs: bool) -> LlamaUbatch {
         let n_tokens = idxs.len() as u32;
         assert!(n_seqs > 0 && n_tokens % n_seqs == 0);
@@ -1299,22 +1395,29 @@ impl BatchAllocr {
         let batch_logits = self.batch.logits.clone().unwrap();
         let batch_seq_id = self.batch.seq_id.clone().unwrap();
         // the MTP draft hook batches carry F32 embd rows (speculative.cpp:
-        // 1521-1547); the width is the row count / token count
+        // 1521-1547); the row width is `this->n_embd` — the ext's row width
+        // fixed by the first set_token_embd (init :34-38)
         let batch_embd = self.batch.embd.as_ref();
-        let n_embd_row = batch_embd
-            .map(|e| e.len() / self.batch.token.len().max(1))
-            .unwrap_or(0);
-        // llama-batch.cpp:781-788: with an *embedding* batch (`batch.embd !=
-        // NULL` in C) the caller supplies one position per RoPE section
-        // (`batch.pos` laid out [n_pos][n_tokens], the image-embedding
-        // convention of mtmd-helper-common.h:120); a token batch carries one
-        // position per token and it is broadcast across the sections. This port
-        // has no `embd` field, so a flat pos array long enough to hold
-        // n_pos_per_embd positions per token selects the per-section copy — the
-        // existing (shorter) arrays keep the broadcast behaviour unchanged.
+        let n_embd_row = self.n_embd as usize;
+
+        // (:854-866, 0bb496dbd) a ubatch with a single kind of rows is
+        // emitted as a plain token or embd ubatch
+        let mixed_batch = !self.is_embd_vec.is_empty();
+        let n_embd_rows: u32 = if mixed_batch {
+            idxs.iter().map(|&i| self.is_embd_vec[i as usize] as u32).sum()
+        } else {
+            0
+        };
+        let mixed = mixed_batch && n_embd_rows > 0 && n_embd_rows < n_tokens;
+        let use_token =
+            !self.batch.token.is_empty() && !(mixed_batch && n_embd_rows == n_tokens);
+        let use_embd = batch_embd.is_some() && !(mixed_batch && n_embd_rows == 0);
+
+        // `batch.pos` is section-major (`init` :126-140): pos[j*n + i] is
+        // section j of entry i — the ubatch copies the caller's per-section
+        // positions verbatim (the M-RoPE [p,p,p,0] expansion of token rows
+        // happened in `init`, 0bb496dbd)
         let n_tokens_all = self.batch.token.len() as usize;
-        let per_section = self.n_pos_per_embd > 1
-            && batch_pos.len() >= n_tokens_all * self.n_pos_per_embd as usize;
 
         let mut ub = LlamaUbatch {
             equal_seqs,
@@ -1323,18 +1426,20 @@ impl BatchAllocr {
             n_seqs,
             n_seqs_unq: 0,
             n_pos: self.n_pos_per_embd,
-            token: Vec::with_capacity(n_tokens as usize),
+            token: Vec::with_capacity(if use_token { n_tokens as usize } else { 0 }),
             pos: vec![0; (n_tokens * self.n_pos_per_embd) as usize],
-            embd: Vec::with_capacity(
-                batch_embd
-                    .map(|_| (n_tokens as usize) * n_embd_row)
-                    .unwrap_or(0),
-            ),
+            embd: Vec::with_capacity(if use_embd {
+                (n_tokens as usize) * n_embd_row
+            } else {
+                0
+            }),
             n_seq_id: vec![0; n_tokens as usize],
             seq_id: Vec::with_capacity(n_tokens as usize),
             seq_id_unq: Vec::new(),
             seq_idx: vec![-1; LLAMA_MAX_SEQ],
             output: vec![false; n_tokens as usize],
+            // `udata->type.resize(mixed ? n_tokens : 0)` (:878, 0bb496dbd)
+            type_: vec![0; if mixed { n_tokens as usize } else { 0 }],
             // `udata->decision_order.resize(decision_order.empty() ? 0 :
             // n_tokens)` (llama-batch.cpp:813, a7b94df2c)
             decision_order: vec![0; if self.decision_order.is_empty() {
@@ -1348,16 +1453,25 @@ impl BatchAllocr {
         let mut seq_set_unq = 0u64;
         for (i, &idx) in idxs.iter().enumerate() {
             let idx = idx as usize;
-            ub.token.push(self.batch.token[idx]);
-            if let Some(e) = batch_embd {
+            if use_token {
+                ub.token.push(self.batch.token[idx]);
+            }
+
+            if use_embd {
                 // one F32 row per token, [n_tokens][n_embd] row-major
+                let e = batch_embd.unwrap();
                 ub.embd
                     .extend_from_slice(&e[idx * n_embd_row..(idx + 1) * n_embd_row]);
             }
+
+            if mixed {
+                ub.type_[i] = self.is_embd_vec[idx];
+            }
+
             for j in 0..self.n_pos_per_embd as usize {
-                // `src_off = batch.token ? 0 : j*batch.n_tokens` (llama-batch.cpp:784)
-                let src_off = if per_section { j * n_tokens_all } else { 0 };
-                ub.pos[j * n_tokens as usize + i] = batch_pos[src_off + idx];
+                // `udata->pos[j*n_tokens + i] = batch.pos[j*batch.n_tokens + idxs[i]]`
+                // (:896-898, 0bb496dbd — always section-major)
+                ub.pos[j * n_tokens as usize + i] = batch_pos[j * n_tokens_all + idx];
             }
             let ids = &batch_seq_id[idx];
             ub.n_seq_id[i] = ids.len() as i32;
@@ -1390,18 +1504,24 @@ impl BatchAllocr {
         ub
     }
 
-    /// `ubatch_print` (:846-925), the LLAMA_BATCH_DEBUG > 0 diagnostics.
+    /// `ubatch_print` (:1000-1070, 0bb496dbd adds the `type` line and skips
+    /// the token print of an embd row), the LLAMA_BATCH_DEBUG > 0 diagnostics.
     fn ubatch_print(&self, ub: &LlamaUbatch) {
         eprintln!("ubatch_add:   equal_seqs   = {}", ub.equal_seqs as i32);
         eprintln!("ubatch_add:   n_tokens     = {}", ub.n_tokens);
         eprintln!("ubatch_add:   n_seq_tokens = {}", ub.n_seq_tokens);
         eprintln!("ubatch_add:   n_seqs       = {}", ub.n_seqs);
         eprintln!("ubatch_add:   n_seqs_unq   = {}", ub.n_seqs_unq);
+        eprintln!("ubatch_add:   type         = {}", !ub.type_.is_empty());
         for i in 0..ub.n_tokens as usize {
-            eprintln!(
-                "ubatch_add:  {:4}: id = {:6}, pos = {:4}, n_seq_id = {:2}, seq_id = {:?}, output = {}",
-                i, ub.token[i], ub.pos[i], ub.n_seq_id[i], ub.seq_id[i], ub.output[i] as i32
-            );
+            // the embd rows of a mixed ubatch print no token id
+            // (:1033 `ubatch.token && !(ubatch.is_mixed() && ubatch.type[i])`)
+            if !ub.token.is_empty() && !(ub.is_mixed() && ub.type_[i] != 0) {
+                eprintln!(
+                    "ubatch_add:  {:4}: id = {:6}, pos = {:4}, n_seq_id = {:2}, seq_id = {:?}, output = {}",
+                    i, ub.token[i], ub.pos[i], ub.n_seq_id[i], ub.seq_id[i], ub.output[i] as i32
+                );
+            }
         }
     }
 }
@@ -1411,7 +1531,7 @@ mod tests {
     use super::*;
 
     fn allocr() -> BatchAllocr {
-        BatchAllocr::new(1)
+        BatchAllocr::new(1, false)
     }
 
     /// `batch_builder` (tests/test-batch-alloc.cpp:52-90, fc343a84b) — build a
@@ -1733,20 +1853,24 @@ mod tests {
         // batch_idxs preserve the logical order (4453b535f)
         assert_eq!(ub.batch_idxs, vec![0, 1, 2, 3]);
 
-        // the content-type uniformity rule: one entry without an id among
-        // id-carrying entries is rejected (:48-58)
+        // the content-type rules (0bb496dbd, llama-batch.cpp:49-79): one
+        // embd-only entry among id-carrying entries is a *mixed* batch —
+        // rejected unless the allocr allows mixed
         let mut mixed = LlamaBatchExt::new(4, 8, 8, 1, None, 100, 1);
         let m0 = mixed.add_token(0);
         assert!(mixed.set_token_id(m0, 1));
-        // the second entry keeps id = LLAMA_TOKEN_NULL
-        let _ = mixed.add_token(0);
+        // the second entry keeps id = LLAMA_TOKEN_NULL and carries a row
+        let m1 = mixed.add_token(0);
+        let mrow = [0.5f32; 8];
+        assert!(mixed.set_token_embd(m1, LlamaEmbd { data: &mrow, n_rows: 1, n_embd: 8 }));
         let mut a2 = allocr();
         assert!(a2
             .init(&mixed, 100, false)
             .unwrap_err()
-            .contains("same content types"));
+            .contains("does not support batches mixing token and embedding"));
 
-        // and a batch with neither ids nor embeddings is rejected (:60-62)
+        // ... and a batch with neither ids nor embeddings is rejected per
+        // entry (:59-62 "entry %d has neither a token id nor an embedding")
         let mut none = LlamaBatchExt::new(2, 8, 8, 1, None, 100, 1);
         none.add_token(0);
         none.add_token(0);
@@ -1754,7 +1878,21 @@ mod tests {
         assert!(a3
             .init(&none, 100, false)
             .unwrap_err()
-            .contains("neither token ids nor embeddings"));
+            .contains("entry 0 has neither a token id nor an embedding"));
+
+        // an id+embd entry mixed with plain entries is rejected (:64-67)
+        let mut both = LlamaBatchExt::new(2, 8, 8, 1, None, 100, 1);
+        let b0 = both.add_token(0);
+        assert!(both.set_token_id(b0, 1));
+        let row = [0.0f32; 8];
+        assert!(both.set_token_embd(b0, LlamaEmbd { data: &row, n_rows: 1, n_embd: 8 }));
+        let _ = both.add_token(0); // token-only second entry
+        assert!(both.set_token_id(1, 2));
+        let mut a4 = allocr();
+        assert!(a4
+            .init(&both, 100, false)
+            .unwrap_err()
+            .contains("cannot be mixed with other entries"));
     }
 
     /// `set_token_embd` fixes the ext's row width on first use and rejects
@@ -1774,11 +1912,13 @@ mod tests {
         assert_eq!(a.get_batch().embd.as_ref().unwrap().len(), 8);
     }
 
-    /// M-RoPE batches (`n_pos_per_embd = 4`) broadcast one position across the
-    /// sections and *allow* position jumps (:255-288).
+    /// M-RoPE batches (`n_pos_per_embd = 4`) expand each token's 1D position
+    /// to `[p, p, p, 0]` sections and *allow* position jumps (:126-140/:255-288,
+    /// 0bb496dbd — the expansion moved from llm_graph_input_pos::set_input to
+    /// the batch layer).
     #[test]
     fn mrope_positions_broadcast_and_jump() {
-        let mut a = BatchAllocr::new(4);
+        let mut a = BatchAllocr::new(4, false);
         let b = LlamaBatch {
             token: vec![1, 2],
             pos: Some(vec![5, 9]),
@@ -1790,7 +1930,143 @@ mod tests {
         let ub = a.split_simple(8);
         assert_eq!(ub.n_pos, 4);
         assert!(ub.is_pos_2d());
-        // pos[j*n + i] = pos[i] for text batches
-        assert_eq!(ub.pos, vec![5, 9, 5, 9, 5, 9, 5, 9]);
+        // section-major pos[j*n + i]: sections 0-2 repeat p, section 3 is 0
+        // (the M-RoPE text rule, llama-batch.cpp:134-138)
+        assert_eq!(ub.pos, vec![5, 9, 5, 9, 5, 9, 0, 0]);
+    }
+
+    /// Mixed token+embd batches (0bb496dbd, llama-batch.cpp:49-124/:849-995):
+    /// the three content-type counts gate the mode, `is_embd_vec` marks the
+    /// rows, token rows of a mixed batch keep placeholder ids, the embd rows
+    /// ride a zero-padded dense array, and `ubatch_add` emits a type-marked
+    /// ubatch (single-kind splits degrade to plain token/embd ubatches).
+    #[test]
+    fn mixed_token_embd_batch() {
+        // 3 entries: token, embd, token (n_pos_per_embd = 1)
+        let mut ext = LlamaBatchExt::new(4, 4, 4, 1, None, 100, 1);
+        let e0 = ext.add_token(0);
+        assert!(ext.set_token_id(e0, 11));
+        assert!(ext.set_token_pos(e0, &[0, 0, 0, 0]));
+        let e1 = ext.add_token(0);
+        let row = [1.0f32, 2.0, 3.0, 4.0];
+        assert!(ext.set_token_embd(e1, LlamaEmbd { data: &row, n_rows: 1, n_embd: 4 }));
+        assert!(ext.set_token_pos(e1, &[1, 0, 0, 0]));
+        let e2 = ext.add_token(0);
+        assert!(ext.set_token_id(e2, 13));
+        assert!(ext.set_token_pos(e2, &[2, 0, 0, 0]));
+
+        // allow_mixed = false -> rejected (:73-77)
+        let mut a = BatchAllocr::new(1, false);
+        assert!(a
+            .init(&ext, 100, false)
+            .unwrap_err()
+            .contains("does not support batches mixing token and embedding"));
+
+        // allow_mixed = true -> the mixed internal batch
+        let mut a = BatchAllocr::new(1, true);
+        a.init(&ext, 100, false).unwrap();
+        let b = a.get_batch();
+        // token rows keep their ids, the embd row keeps the placeholder 0
+        assert_eq!(b.token, vec![11, 0, 13]);
+        // the embd rows ride a dense zero-padded array: only entry 1's bytes
+        assert_eq!(b.embd.as_ref().unwrap(), &vec![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0]);
+        // every entry contributes n_pos_per_embd sections (embd entries
+        // verbatim, token entries expanded — n_pos = 1 here)
+        assert_eq!(b.pos.as_ref().unwrap(), &[0, 1, 2]);
+
+        // the whole batch in one ubatch: type-marked, both arrays present
+        let ub = a.split_simple(8);
+        assert!(ub.is_mixed());
+        assert_eq!(ub.type_, vec![0, 1, 0]);
+        assert_eq!(ub.token, vec![11, 0, 13]);
+        assert_eq!(ub.embd.len(), 3 * 4);
+        assert_eq!(&ub.embd[4..8], &row);
+
+        // single-kind splits degrade: only the embd entry -> a plain embd
+        // ubatch (use_token false, no type array)
+        let ub_e = a.split_simple(1);
+        assert!(ub_e.is_empty()); // the batch was fully consumed above
+        let mut a2 = BatchAllocr::new(1, true);
+        a2.init(&ext, 100, false).unwrap();
+        // consume the two token rows first ([11, 13] are at idx 0, 2; a
+        // chunk of 2 takes idx 0,1 -> mixed (1 embd row), then idx 2 alone
+        // -> plain token)
+        let u0 = a2.split_simple(2);
+        assert!(u0.is_mixed());
+        assert_eq!(u0.type_, vec![0, 1]);
+        let u1 = a2.split_simple(2);
+        assert!(!u1.is_mixed());
+        assert!(u1.type_.is_empty());
+        assert_eq!(u1.token, vec![13]);
+        assert!(u1.embd.is_empty());
+    }
+
+    /// The M-RoPE mixed twin (n_pos_per_embd = 4): each entry expands by its
+    /// own kind — token rows to [p, p, p, 0], embd rows verbatim per section.
+    #[test]
+    fn mixed_batch_mrope_pos_sections() {
+        let mut ext = LlamaBatchExt::new(2, 4, 4, 1, None, 100, 4);
+        let e0 = ext.add_token(0);
+        assert!(ext.set_token_id(e0, 7));
+        assert!(ext.set_token_pos(e0, &[5, 0, 0, 0]));
+        let e1 = ext.add_token(0);
+        let row = [1.0f32, 2.0, 3.0, 4.0];
+        assert!(ext.set_token_embd(e1, LlamaEmbd { data: &row, n_rows: 1, n_embd: 4 }));
+        // the embd entry reads all four sections (set_token_pos reads
+        // n_pos_per_embd positions of an id-less entry, :1180-1195); section
+        // 0 must not decrease behind the token entry's 5
+        // (:354-386 reads section 0 of every entry)
+        assert!(ext.set_token_pos(e1, &[6, 7, 8, 9]));
+
+        let mut a = BatchAllocr::new(4, true);
+        a.init(&ext, 100, false).unwrap();
+        let b = a.get_batch();
+        // section-major: section j of entry i at pos[j*2 + i]
+        //   j=0: [5, 6]  j=1: [5, 7]  j=2: [5, 8]  j=3: [0, 9]
+        assert_eq!(b.pos.as_ref().unwrap(), &[5, 6, 5, 7, 5, 8, 0, 9]);
+    }
+
+    /// The seq_first_embd rule (0bb496dbd, llama-batch.cpp:332-363): in a
+    /// mixed M-RoPE batch, the first entry of each sequence picks whether the
+    /// token rule (strictly past the memory) or the embd rule (overlap
+    /// allowed) applies.
+    #[test]
+    fn mixed_batch_seq_first_embd_position_rule() {
+        struct Mem(i32);
+        impl BatchMemory for Mem {
+            fn seq_pos_min(&self, _s: i32) -> i32 {
+                0
+            }
+            fn seq_pos_max(&self, _s: i32) -> i32 {
+                self.0
+            }
+        }
+        // embd-first sequence overlapping the memory (p0 == smin) is allowed
+        let mem = Mem(3);
+        let mut ext = LlamaBatchExt::new(2, 4, 4, 1, Some(&mem as &dyn BatchMemory), 100, 4);
+        let e0 = ext.add_token(0);
+        let row = [0.0f32; 4];
+        assert!(ext.set_token_embd(e0, LlamaEmbd { data: &row, n_rows: 1, n_embd: 4 }));
+        assert!(ext.set_token_pos(e0, &[3, 3, 3, 3]));
+        let e1 = ext.add_token(0);
+        assert!(ext.set_token_id(e1, 7));
+        assert!(ext.set_token_pos(e1, &[4, 0, 0, 0]));
+        let mut a = BatchAllocr::new(4, true);
+        assert!(a.init(&ext, 100, false).is_ok());
+
+        // token-first sequence at the memory head (p0 == smin) is rejected
+        let mem = Mem(3);
+        let mut ext = LlamaBatchExt::new(2, 4, 4, 1, Some(&mem as &dyn BatchMemory), 100, 4);
+        let e0 = ext.add_token(0);
+        assert!(ext.set_token_id(e0, 7));
+        assert!(ext.set_token_pos(e0, &[3, 0, 0, 0]));
+        let e1 = ext.add_token(0);
+        assert!(ext.set_token_embd(e1, LlamaEmbd { data: &row, n_rows: 1, n_embd: 4 }));
+        assert!(ext.set_token_pos(e1, &[3, 3, 3, 3]));
+        let mut a = BatchAllocr::new(4, true);
+        assert!(a
+            .init(&ext, 100, false)
+            .unwrap_err()
+            .contains("inconsistent sequence positions"));
     }
 }

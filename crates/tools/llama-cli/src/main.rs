@@ -1235,6 +1235,7 @@ fn main() {
             | llama::arch::LlmArch::EUROBERT
             | llama::arch::LlmArch::T5ENCODER
             | llama::arch::LlmArch::GEMMA_EMBEDDING
+            | llama::arch::LlmArch::GEMMA_EMBEDDING2
             | llama::arch::LlmArch::LLAMA_EMBED
             | llama::arch::LlmArch::JINA_BERT_V2
             | llama::arch::LlmArch::JINA_BERT_V3
@@ -1267,6 +1268,7 @@ fn main() {
             | llama::arch::LlmArch::EUROBERT
             | llama::arch::LlmArch::T5ENCODER
             | llama::arch::LlmArch::GEMMA_EMBEDDING
+            | llama::arch::LlmArch::GEMMA_EMBEDDING2
             | llama::arch::LlmArch::LLAMA_EMBED
             | llama::arch::LlmArch::JINA_BERT_V2
             | llama::arch::LlmArch::JINA_BERT_V3
@@ -1322,8 +1324,15 @@ fn main() {
                 // false on the encoder path (llama-context.cpp:1526-1529) —
                 // the no-cache mask fills non-causally
                 let causal = false;
-                // gemma-embedding's symmetric-SWA facts (gemma-embedding.cpp:3-28)
-                let gemma_swa = (model.arch == llama::arch::LlmArch::GEMMA_EMBEDDING).then(|| {
+                // gemma-embedding's symmetric-SWA facts (gemma-embedding.cpp:3-28);
+                // gemma-embedding2 reads the same window pair through the same
+                // plumbing (gemma-embedding2.cpp:4-6 sets swa_type = SYMMETRIC)
+                let gemma_swa = matches!(
+                    model.arch,
+                    llama::arch::LlmArch::GEMMA_EMBEDDING
+                        | llama::arch::LlmArch::GEMMA_EMBEDDING2
+                )
+                .then(|| {
                     let hp = &model.hparams;
                     let rope = hp.rope_runtime();
                     let gr = graph_arch::EurobertRope {
@@ -1369,6 +1378,44 @@ fn main() {
                     }
                     llama::arch::LlmArch::GEMMA_EMBEDDING => {
                         llama::context::EncoderWeights::GemmaEmbedding(model.gemma_embedding_weights())
+                    }
+                    // gemma-embedding2 (gemma-embedding2.cpp:3-19): the
+                    // bundled params carry the per-layer-input facts + the
+                    // SWA rope pair; the mask window rides gemma_swa above
+                    // (the ge2 test assembly, tests/gemma_embedding2_e2e.rs)
+                    llama::arch::LlmArch::GEMMA_EMBEDDING2 => {
+                        let hp = &model.hparams;
+                        let rope = hp.rope_runtime();
+                        let p = graph_arch::GemmaEmbedding2Params {
+                            n_head: hp.n_head(0) as i64,
+                            n_head_kv: hp.n_head_kv(0) as i64,
+                            n_embd_head: hp.n_embd_head_k(0) as i64,
+                            norm_rms_eps: hp.f_norm_rms_eps,
+                            n_embd_per_layer: hp.n_embd_per_layer as i64,
+                            f_attention_scale: hp.f_attention_scale,
+                            is_swa: (0..hp.n_layer() as usize)
+                                .map(|il| hp.is_swa(il))
+                                .collect(),
+                            freq_base_swa: hp.rope_freq_base_train_swa,
+                            freq_scale_swa: hp.rope_freq_scale_train_swa,
+                            rope: graph_arch::EurobertRope {
+                                n_rot: hp.n_rot(0) as i32,
+                                // llama_model_rope_type(GEMMA_EMBEDDING2) =
+                                // NEOX (llama-model.cpp:3184)
+                                rope_mode: hp.rope_type as i32,
+                                n_ctx_orig: rope.n_ctx_orig_yarn,
+                                freq_base: hp.rope_freq_base_train,
+                                freq_scale: rope.freq_scale,
+                                ext_factor: rope.ext_factor,
+                                attn_factor: rope.attn_factor,
+                                beta_fast: rope.beta_fast,
+                                beta_slow: rope.beta_slow,
+                            },
+                        };
+                        llama::context::EncoderWeights::GemmaEmbedding2(
+                            model.gemma_embedding2_weights(),
+                            p,
+                        )
                     }
                     llama::arch::LlmArch::LLAMA_EMBED => {
                         llama::context::EncoderWeights::LlamaEmbed(llama_embed_weights(&model))
@@ -2703,10 +2750,22 @@ fn forward_weights(
             let gp = granite_params(hp, n_trunk, attn);
             llama::context::ForwardWeights::Granite(granite_weights(model, n_trunk), gp)
         }
-        llama::arch::LlmArch::LFM2MOE => {
-            attn = attn_params(hp, first_attn_layer(hp, n_trunk), use_flash_attn);
-            let gp = lfm2_params(hp, n_trunk, attn);
-            llama::context::ForwardWeights::Lfm2(lfm2_weights(model, n_trunk), gp)
+        llama::arch::LlmArch::LFM2 | llama::arch::LlmArch::LFM2MOE => {
+            // the lfm2 build fork (lfm2.cpp:137-139 — build_arch_graph's
+            // graph_decision vs graph dispatch): n_layer_decision > 0 loads
+            // the Decision form (no memory — create_memory's nullptr arm,
+            // llama-model.cpp:2385-2387); lfm2moe ships no decision files
+            // (its loader arm keeps the plain path)
+            if model.arch == llama::arch::LlmArch::LFM2 && hp.n_layer_decision > 0 {
+                llama::context::ForwardWeights::Lfm2Decision(
+                    model.lfm2_decision_weights(),
+                    model.lfm2_decision_params(),
+                )
+            } else {
+                attn = attn_params(hp, first_attn_layer(hp, n_trunk), use_flash_attn);
+                let gp = lfm2_params(hp, n_trunk, attn);
+                llama::context::ForwardWeights::Lfm2(lfm2_weights(model, n_trunk), gp)
+            }
         }
         llama::arch::LlmArch::QWEN35 => {
             // per-layer head geometry (the GDN layers differ from the attention
@@ -3610,6 +3669,13 @@ fn forward_weights(
             llama::context::ForwardWeights::Glm5Next(
                 glm5_weights(model, n_trunk),
                 glm5_params(hp, n_trunk, a),
+            )
+        }
+        // ---- batch 20 (the c35b66744 sync): k2-horizon (dense + MoVA) ----
+        llama::arch::LlmArch::K2_HORIZON => {
+            llama::context::ForwardWeights::K2Horizon(
+                model.k2_horizon_weights(),
+                k2_horizon_params(hp, attn),
             )
         }
         // ---- arch batch 11b (2026-10): the long-tail queue, second half ----
@@ -5401,6 +5467,25 @@ fn lfm2_weights(m: &LlamaModel, n_trunk: usize) -> graph_arch::Lfm2ModelWeights 
                 ffn_exp_probs_b: l.ffn_exp_probs_b,
             })
             .collect(),
+    }
+}
+
+/// k2-horizon.cpp:3-49 — the loader-side facts of the dense + MoVA hybrid
+/// (the same derivation tests/k2_horizon_e2e.rs::k2_params pins; `attn` is
+/// the uniform layer-0 geometry, NEOX via llama_model_rope_type).
+fn k2_horizon_params(hp: &LlamaHparams, attn: AttnParams) -> graph_arch::K2HorizonParams {
+    graph_arch::K2HorizonParams {
+        attn,
+        n_norm_groups: hp.n_norm_groups as i64,
+        norm_rms_eps: hp.f_norm_rms_eps,
+        n_layer_dense_lead: hp.n_layer_dense_lead,
+        n_expert: hp.n_expert as i64,
+        n_expert_used: hp.n_expert_used(0) as i64,
+        n_value_expert: hp.n_value_expert as i64,
+        n_value_expert_used: hp.n_value_expert_used as i64,
+        expert_gating_func: hp.expert_gating_func as i32,
+        expert_weights_norm: hp.expert_weights_norm,
+        expert_weights_scale: hp.expert_weights_scale,
     }
 }
 

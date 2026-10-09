@@ -316,6 +316,12 @@ impl<'a> LlamaModelSaver<'a> {
         self.add_kv_f32(LlmKv::ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps); // :265
         self.add_kv_f32(LlmKv::ATTENTION_GROUPNORM_EPS, hparams.f_norm_group_eps); // :266
         self.add_kv_u32(LlmKv::ATTENTION_GROUPNORM_GROUPS, hparams.n_norm_groups); // :267
+        // MoVA value experts (462524043, llama-model-saver.cpp:282-283)
+        self.add_kv_u32(LlmKv::ATTENTION_VALUE_EXPERT_COUNT, hparams.n_value_expert);
+        self.add_kv_u32(
+            LlmKv::ATTENTION_VALUE_EXPERT_USED_COUNT,
+            hparams.n_value_expert_used,
+        );
         self.add_kv_bool(LlmKv::ATTENTION_CAUSAL, hparams.causal_attn); // :268
         self.add_kv_u32(LlmKv::ATTENTION_Q_LORA_RANK, hparams.n_lora_q); // :269
         self.add_kv_u32(LlmKv::ATTENTION_KV_LORA_RANK, hparams.n_lora_kv); // :270

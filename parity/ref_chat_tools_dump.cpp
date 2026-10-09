@@ -82,6 +82,13 @@ int main(int argc, char ** argv) {
         inputs.reasoning_format       = common_reasoning_format_from_name(cj.value("reasoning_format", "none"));
         inputs.json_schema            = cj.value("json_schema", std::string());
         inputs.enable_thinking        = cj.value("enable_thinking", true);
+        // chat_template_kwargs: {key: json-encoded value string} (5de733437
+        // era parsers read reasoning_effort / tool_call_format / language
+        // codes from here); the json must outlive the items() view
+        const json kwargs = cj.value("chat_template_kwargs", json::object());
+        for (const auto & kw : kwargs.items()) {
+            inputs.chat_template_kwargs[kw.key()] = kw.value().dump();
+        }
         inputs.now = std::chrono::system_clock::time_point(std::chrono::seconds(PINNED_EPOCH));
 
         common_chat_templates_ptr & tmpls_case = tmpls.at(cj.at("template").get<std::string>());
@@ -122,7 +129,7 @@ int main(int argc, char ** argv) {
                 common_peg_arena arena;
                 arena.load(params.parser);
                 parse_params.parser = arena;
-                common_chat_msg msg = common_chat_parse(cj.at("parse_input").get<std::string>(),
+                common_chat_msg msg = common_chat_parse(common_chat_input(cj.at("parse_input").get<std::string>()),
                                                         cj.value("parse_partial", false), parse_params);
                 result["parse"] = common_chat_msgs_to_json_oaicompat({msg}).at(0);
             }

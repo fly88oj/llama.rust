@@ -1639,7 +1639,7 @@ impl ChatPegBuilder {
     ) -> ParserId {
         let mut tool_choices: Vec<ParserId> = Vec::new();
 
-        for tool_def in tools.iter() {
+        for (tool_index, tool_def) in tools.iter().enumerate() {
             let Some(function) = tool_def.at("function") else {
                 continue;
             };
@@ -1705,7 +1705,7 @@ impl ChatPegBuilder {
                 let j = self.p.json();
                 let sch = self
                     .p
-                    .schema(j, &format!("tool-{name}-schema"), &params, false);
+                    .schema(j, &format!("tool-{tool_index}-schema"), &params, false);
                 self.tool_args(sch)
             } else {
                 let key = self.p.literal(&format!("\"{effective_args_key}\""));
@@ -1715,7 +1715,7 @@ impl ChatPegBuilder {
                 let j = self.p.json();
                 let sch = self
                     .p
-                    .schema(j, &format!("tool-{name}-schema"), &params, false);
+                    .schema(j, &format!("tool-{tool_index}-schema"), &params, false);
                 let ta = self.tool_args(sch);
                 self.p.sequence(&[key, sp, colon, sp2, ta])
             };
@@ -1768,7 +1768,7 @@ impl ChatPegBuilder {
                 self.tool(seq)
             };
 
-            let r = self.p.rule(&format!("tool-{name}"), tool_parser, false);
+            let r = self.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
             tool_choices.push(r);
         }
 
@@ -1809,7 +1809,7 @@ impl ChatPegBuilder {
             effective_args_key.to_string()
         };
 
-        for tool_def in tools.iter() {
+        for (tool_index, tool_def) in tools.iter().enumerate() {
             let Some(function) = tool_def.at("function") else {
                 continue;
             };
@@ -1841,7 +1841,7 @@ impl ChatPegBuilder {
                 let j = self.p.json();
                 let sch = self
                     .p
-                    .schema(j, &format!("tool-{name}-schema"), &params, false);
+                    .schema(j, &format!("tool-{tool_index}-schema"), &params, false);
                 let ta = self.tool_args(sch);
                 self.p.sequence(&[key, sp, colon, sp2, ta])
             };
@@ -1926,7 +1926,7 @@ impl ChatPegBuilder {
                 .sequence(&[tool_parser_body, nested_field, sp, close]);
 
             let t = self.tool(tool_parser_body);
-            let r = self.p.rule(&format!("tool-{name}"), t, false);
+            let r = self.p.rule(&format!("tool-{tool_index}"), t, false);
             tool_choices.push(r);
         }
 
@@ -1952,7 +1952,7 @@ impl ChatPegBuilder {
         let name_key_parser = self.p.literal(&format!("\"{effective_name_key}\""));
         let args_key_parser = self.p.literal(&format!("\"{effective_args_key}\""));
 
-        for tool_def in tools.iter() {
+        for (tool_index, tool_def) in tools.iter().enumerate() {
             let Some(function) = tool_def.at("function") else {
                 continue;
             };
@@ -1982,7 +1982,7 @@ impl ChatPegBuilder {
                 let j = self.p.json();
                 let sch = self
                     .p
-                    .schema(j, &format!("tool-{name}-schema"), &params, false);
+                    .schema(j, &format!("tool-{tool_index}-schema"), &params, false);
                 let ta = self.tool_args(sch);
                 self.p.sequence(&[args_key_parser, sp, colon, sp2, ta])
             };
@@ -2083,7 +2083,7 @@ impl ChatPegBuilder {
             let ordered_body = self.p.sequence(&[ordered_body, sp, close]);
 
             let t = self.tool(ordered_body);
-            let r = self.p.rule(&format!("tool-{name}"), t, false);
+            let r = self.p.rule(&format!("tool-{tool_index}"), t, false);
             tool_choices.push(r);
         }
 
@@ -2123,7 +2123,7 @@ impl ChatPegBuilder {
 
         let mut tool_choice_alts: Vec<ParserId> = Vec::new();
 
-        for tool_def in tools.iter() {
+        for (tool_index, tool_def) in tools.iter().enumerate() {
             let Some(function) = tool_def.at("function") else {
                 continue;
             };
@@ -2179,7 +2179,7 @@ impl ChatPegBuilder {
             let seq = self.p.sequence(&[t_open, sp, ta, sp2, t_close]);
             let tool_parser = self.tool(seq);
 
-            let r = self.p.rule(&format!("tool-{name}"), tool_parser, false);
+            let r = self.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
             tool_choice_alts.push(r);
         }
 
@@ -2230,7 +2230,7 @@ impl ChatPegBuilder {
 
         let mut tool_choice_alts: Vec<ParserId> = Vec::new();
 
-        for tool_def in tools.iter() {
+        for (tool_index, tool_def) in tools.iter().enumerate() {
             let Some(function) = tool_def.at("function") else {
                 continue;
             };
@@ -2313,7 +2313,7 @@ impl ChatPegBuilder {
             let seq = self.p.sequence(&[t_open, sp, ta, sp2, t_close]);
             let tool_parser = self.tool(seq);
 
-            let r = self.p.rule(&format!("tool-{name}"), tool_parser, false);
+            let r = self.p.rule(&format!("tool-{tool_index}"), tool_parser, false);
             tool_choice_alts.push(r);
         }
 
@@ -6058,23 +6058,24 @@ fn build_func_parser(
     func_parser
 }
 
-/// `foreach_function` (chat-peg-parser.h-adjacent helper): iterate a tools
-/// array's function objects.
-pub(crate) fn foreach_function<F: FnMut(&Json)>(tools: &Json, mut f: F) {
+/// `foreach_function` (parsers.cpp:4-14, 5de733437): iterate a tools array's
+/// function objects, passing each tool with its index in the array.
+pub(crate) fn foreach_function<F: FnMut(usize, &Json)>(tools: &Json, mut f: F) {
     if !tools.is_array() {
         return;
     }
-    for tool in tools.iter() {
+    for (i, tool) in tools.iter().enumerate() {
         if let Some(function) = tool.at("function") {
-            f(function);
+            f(i, function);
         }
     }
 }
 
-/// `foreach_parameter` (chat-auto-parser-generator.cpp:374-392 helper):
-/// iterate a function's schema properties with their owning document.
+/// `foreach_parameter` (parsers.cpp:16-30, 5de733437): iterate a function's
+/// schema properties, passing each parameter with its index and the document
+/// that owns it.
 pub(crate) fn foreach_parameter<
-    F: FnMut(&crate::json_schema::SchemaProperty, &Rc<SchemaDocument>),
+    F: FnMut(usize, &crate::json_schema::SchemaProperty, &Rc<SchemaDocument>),
 >(
     function: &Json,
     mut f: F,
@@ -6086,8 +6087,8 @@ pub(crate) fn foreach_parameter<
     };
     if let Some(node) = doc.nodes.get(doc.root) {
         if let SchemaKind::Object { properties, .. } = &node.kind {
-            for prop in properties {
-                f(prop, &doc);
+            for (i, prop) in properties.iter().enumerate() {
+                f(i, prop, &doc);
             }
         }
     }
@@ -6102,7 +6103,7 @@ fn build_tool_parser_tag_json(
 ) -> ParserId {
     let mut tool_choice_alts: Vec<ParserId> = Vec::new();
 
-    foreach_function(&inputs.tools, |func| {
+    foreach_function(&inputs.tools, |tool_index, func| {
         let name = func
             .at("name")
             .and_then(|v| v.get_str().ok())
@@ -6137,7 +6138,7 @@ fn build_tool_parser_tag_json(
         let mut args_parser = {
             let j = p.p.json();
             let sch =
-                p.p.schema(j, &format!("tool-{name}-schema"), &schema, false);
+                p.p.schema(j, &format!("tool-{tool_index}-schema"), &schema, false);
             p.tool_args(sch)
         };
         if !tools.arguments.start.is_empty() {
@@ -6164,7 +6165,7 @@ fn build_tool_parser_tag_json(
             args_parser,
             atomic_peek,
         );
-        tool_choice_alts.push(p.p.rule(&format!("tool-{name}"), func_parser, false));
+        tool_choice_alts.push(p.p.rule(&format!("tool-{tool_index}"), func_parser, false));
     });
 
     let tool_choice = p.p.choice(&tool_choice_alts);
@@ -6250,7 +6251,7 @@ fn build_tool_parser_tag_tagged(
 
     let mut tool_choice_alts: Vec<ParserId> = Vec::new();
 
-    foreach_function(&inputs.tools, |func| {
+    foreach_function(&inputs.tools, |tool_index, func| {
         let name = func
             .at("name")
             .and_then(|v| v.get_str().ok())
@@ -6260,7 +6261,7 @@ fn build_tool_parser_tag_tagged(
         // Build parser for each argument, separating required and optional
         let mut required_parsers: Vec<ParserId> = Vec::new();
         let mut optional_parsers: Vec<ParserId> = Vec::new();
-        foreach_parameter(func, |param, doc| {
+        foreach_parameter(func, |param_index, param, doc| {
             let arg = {
                 let open_name = p.p.literal(&tools.arguments.name_prefix);
                 let nm = p.p.literal(&param.name);
@@ -6282,7 +6283,7 @@ fn build_tool_parser_tag_tagged(
                     let j = p.p.json();
                     let sch = p.p.schema_node(
                         j,
-                        &format!("tool-{name}-arg-{}-schema", param.name),
+                        &format!("tool-{tool_index}-arg-{param_index}-schema"),
                         Rc::clone(doc),
                         param.schema,
                         false,
@@ -6297,7 +6298,7 @@ fn build_tool_parser_tag_tagged(
             };
 
             let named_arg =
-                p.p.rule(&format!("tool-{name}-arg-{}", param.name), arg, false);
+                p.p.rule(&format!("tool-{tool_index}-arg-{param_index}"), arg, false);
             if param.required {
                 required_parsers.push(named_arg);
             } else {
@@ -6375,7 +6376,7 @@ fn build_tool_parser_tag_tagged(
             args_seq,
             atomic_peek,
         );
-        tool_choice_alts.push(p.p.rule(&format!("tool-{name}"), func_parser, false));
+        tool_choice_alts.push(p.p.rule(&format!("tool-{tool_index}"), func_parser, false));
     });
 
     let tool_choice = p.p.choice(&tool_choice_alts);
@@ -6758,12 +6759,147 @@ pub fn chat_templates_apply(
 // parsing model output — common_chat_parse / common_chat_peg_parse (chat.cpp:1441-1523)
 // ---------------------------------------------------------------------------
 
+/// `common_chat_input` (chat.h:285-306, 18b5f8b18) — text with the generating
+/// tokens aligned byte-by-byte (`LLAMA_TOKEN_NULL` on continuation bytes). The
+/// server accumulates the generated text *and* tokens here so the model-output
+/// parsers can attribute parsed pieces back to tokens.
+#[derive(Clone, Debug, Default)]
+pub struct ChatInput {
+    pub text: String,
+    pub tokens: Vec<i32>,
+}
+
+impl ChatInput {
+    /// plain text, with no tokens — `explicit common_chat_input(std::string)`
+    /// (chat.h:293): every byte gets `LLAMA_TOKEN_NULL`
+    pub fn from_plain(text: String) -> ChatInput {
+        let n = text.len();
+        ChatInput {
+            tokens: vec![crate::batch::LLAMA_TOKEN_NULL; n],
+            text,
+        }
+    }
+
+    /// `size()` (chat.h:305)
+    pub fn size(&self) -> usize {
+        self.text.len()
+    }
+
+    /// `empty()` (chat.h:306)
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    /// `append(piece, token)` (chat.cpp:1455-1462): the token id lands on the
+    /// piece's first byte, the rest get `LLAMA_TOKEN_NULL`
+    pub fn append_piece(&mut self, piece: &str, token: i32) {
+        if piece.is_empty() {
+            return;
+        }
+        self.tokens.push(token);
+        self.tokens
+            .resize(self.tokens.len() + piece.len() - 1, crate::batch::LLAMA_TOKEN_NULL);
+        self.text.push_str(piece);
+    }
+
+    /// `append(chunk)` (chat.cpp:1464-1467)
+    pub fn append_chunk(&mut self, chunk: &ChatInput) {
+        self.tokens.extend_from_slice(&chunk.tokens);
+        self.text.push_str(&chunk.text);
+    }
+
+    /// `truncate(pos)` (chat.cpp:1469-1474)
+    pub fn truncate(&mut self, pos: usize) {
+        if pos < self.text.len() {
+            self.text.truncate(pos);
+            self.tokens.truncate(pos);
+        }
+    }
+
+    /// `substr(pos, n)` (chat.cpp:1476-1481) — `None` = to the end
+    /// (`std::string::npos`)
+    pub fn substr(&self, pos: usize, n: Option<usize>) -> ChatInput {
+        let text = match n {
+            Some(n) => self.text[pos..pos + n].to_string(),
+            None => self.text[pos..].to_string(),
+        };
+        let end = pos + text.len();
+        ChatInput {
+            tokens: self.tokens[pos..end].to_vec(),
+            text,
+        }
+    }
+
+    /// `prepend(prefix)` — string overload (chat.cpp:1490-1493)
+    pub fn prepend_str(&mut self, prefix: &str) {
+        self.tokens
+            .splice(0..0, std::iter::repeat(crate::batch::LLAMA_TOKEN_NULL).take(prefix.len()));
+        self.text = format!("{prefix}{}", self.text);
+    }
+
+    /// `prepend(prefix)` — chunk overload (chat.cpp:1495-1498)
+    pub fn prepend_chunk(&mut self, prefix: &ChatInput) {
+        let mut tokens = prefix.tokens.clone();
+        tokens.extend_from_slice(&self.tokens);
+        self.tokens = tokens;
+        self.text = format!("{}{}", prefix.text, self.text);
+    }
+}
+
+impl From<&str> for ChatInput {
+    fn from(text: &str) -> ChatInput {
+        ChatInput::from_plain(text.to_string())
+    }
+}
+
+impl From<String> for ChatInput {
+    fn from(text: String) -> ChatInput {
+        ChatInput::from_plain(text)
+    }
+}
+
+/// `std::isspace` on a byte (C locale: space, \t, \n, \v, \f, \r)
+fn c_isspace(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+/// `common_chat_input_tokenize` (chat.cpp:1500-1516, 18b5f8b18) — tokenize
+/// `text` and align the tokens with its bytes. Some tokenizers add a space
+/// before the first special token; that leading space is excluded (as long as
+/// `text` itself does not start with whitespace). If re-assembling the pieces
+/// does not give back the same text, the tokens are dropped (plain text with
+/// `LLAMA_TOKEN_NULL`s).
+pub fn chat_input_tokenize(vocab: &crate::vocab::Vocab, text: &str) -> ChatInput {
+    let mut input = ChatInput::default();
+    let tokens = vocab.tokenize(text, false, true);
+    for (i, &token) in tokens.iter().enumerate() {
+        // `common_token_to_piece(vocab, tokens[i], true)` — special = true
+        let piece = String::from_utf8_lossy(&vocab.token_to_piece_special(token, true)).into_owned();
+        if i == 0
+            && !piece.is_empty()
+            && c_isspace(piece.as_bytes()[0])
+            && !text.is_empty()
+            && !c_isspace(text.as_bytes()[0])
+        {
+            // "Some tokenizers will add a space before the first special token, need to exclude"
+            continue;
+        }
+        input.append_piece(&piece, token);
+    }
+    if input.text != text {
+        // "the pieces do not give back the same text, keep the text without tokens"
+        return ChatInput::from_plain(text.to_string());
+    }
+    input
+}
+
 /// `common_chat_parser_params` (chat.h:287-303)
 pub struct ChatParserParams {
     pub format: ChatFormat,
     pub reasoning_format: ReasoningFormat,
     pub reasoning_in_content: bool,
-    pub generation_prompt: String,
+    /// `generation_prompt` — `common_chat_input` since 18b5f8b18 (chat.h:317)
+    pub generation_prompt: ChatInput,
     pub parse_tool_calls: bool,
     pub is_continuation: bool,
     pub echo: bool,
@@ -6772,7 +6908,9 @@ pub struct ChatParserParams {
 }
 
 impl ChatParserParams {
-    /// from a [`ChatParams`] (chat.h:299-302) — loads the serialized parser
+    /// from a [`ChatParams`] (chat.h:299-302) — loads the serialized parser;
+    /// `generation_prompt` becomes a plain-text `common_chat_input`
+    /// (chat.h:317-318, 18b5f8b18)
     pub fn from_chat_params(params: &ChatParams) -> Result<ChatParserParams, String> {
         let mut parser = PegArena::default();
         parser.load(&params.parser)?;
@@ -6780,7 +6918,7 @@ impl ChatParserParams {
             format: params.format,
             reasoning_format: ReasoningFormat::None,
             reasoning_in_content: false,
-            generation_prompt: params.generation_prompt.clone(),
+            generation_prompt: ChatInput::from_plain(params.generation_prompt.clone()),
             parse_tool_calls: true,
             is_continuation: false,
             echo: false,
@@ -6796,7 +6934,7 @@ impl Default for ChatParserParams {
             format: ChatFormat::ContentOnly,
             reasoning_format: ReasoningFormat::None,
             reasoning_in_content: false,
-            generation_prompt: String::new(),
+            generation_prompt: ChatInput::default(),
             parse_tool_calls: true,
             is_continuation: false,
             echo: false,
@@ -6806,10 +6944,11 @@ impl Default for ChatParserParams {
     }
 }
 
-/// `common_chat_peg_parse` (chat.cpp:1447-1523)
+/// `common_chat_peg_parse` (chat.cpp:1447-1523) — takes a
+/// [`ChatInput`] (text + aligned tokens) since 18b5f8b18
 pub fn chat_peg_parse(
     src_parser: &PegArena,
-    input: &str,
+    input: &ChatInput,
     is_partial: bool,
     params: &ChatParserParams,
 ) -> Result<ChatMsg, String> {
@@ -6827,18 +6966,19 @@ pub fn chat_peg_parse(
         src_parser
     };
 
-    let effective_input = if params.generation_prompt.is_empty() {
-        input.to_string()
-    } else {
-        format!("{}{}", params.generation_prompt, input)
-    };
+    // `common_chat_input effective_input = input;
+    //  effective_input.prepend(params.generation_prompt)` (chat.cpp:1526-1530)
+    let mut effective_input = input.clone();
+    effective_input.prepend_chunk(&params.generation_prompt);
 
     let mut flags: ParseFlags = PARSE_FLAG_LENIENT;
     if params.debug {
         flags |= PARSE_FLAG_DEBUG;
     }
 
-    let mut ctx = ParseContext::new(&effective_input, flags);
+    // `common_peg_parse_context ctx(std::move(effective_input.text),
+    //  std::move(effective_input.tokens), flags)` (chat.cpp:1540-1541)
+    let mut ctx = ParseContext::new_with_tokens(effective_input.text, effective_input.tokens, flags);
     let result = parser.parse(&mut ctx, 0).map_err(|e| {
         format!("The model produced output that does not match the expected format: {e}")
     })?;
@@ -6853,7 +6993,7 @@ pub fn chat_peg_parse(
             map_by_format(params.format, &mut msg, &ctx, &result);
             return Ok(msg);
         }
-        let unparsed = &effective_input[result.end..];
+        let unparsed = &ctx.input[result.end..];
         return Err(format!(
             "The model produced output that does not match the expected {} format (unparsed: {unparsed})",
             chat_format_name(params.format).unwrap_or("Content-only"),
@@ -6883,9 +7023,9 @@ fn map_by_format(format: ChatFormat, msg: &mut ChatMsg, ctx: &ParseContext, resu
     }
 }
 
-/// `common_chat_parse` (chat.cpp:1441-1445)
+/// `common_chat_parse` (chat.cpp:1557-1561, 18b5f8b18)
 pub fn chat_parse(
-    input: &str,
+    input: &ChatInput,
     is_partial: bool,
     params: &ChatParserParams,
 ) -> Result<ChatMsg, String> {

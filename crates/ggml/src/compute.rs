@@ -4585,26 +4585,61 @@ impl<'a> Cpu<'a> {
         self.par_rows(nr, nth, team, run);
     }
 
-    /// ggml_compute_forward_clamp_f32 (ops.cpp:5821): `MAX(MIN(x, max), min)`, one
-    /// row per thread iteration (`j = ith; j < n; j += nth`).
+    /// ggml_compute_forward_clamp_f32 (ops.cpp:6049-6083 @c35b66744) and
+    /// ..._clamp_f16 (ops.cpp:6085-6119), dispatched by
+    /// ggml_compute_forward_clamp (ops.cpp:6122, F32/F16 only):
+    /// `MAX(MIN(x, max), min)`, one row per thread iteration
+    /// (`j = ith; j < n; j += nth`). 65840ed53 ("fix CLAMP on non-contiguous
+    /// views") replaced the flat `j*nb1` row addressing with the i1/i2/i3
+    /// decomposition (GGML_TENSOR_UNARY_OP_LOCALS, ops.cpp:6063/6099) — the
+    /// old addressing read the wrong rows of non-contiguous 3D/4D views.
     fn forward_clamp(&self, dst: TensorId, nth: usize, team: &Team<'_>) {
         let s0 = self.t(dst).src[0].unwrap();
         let t0 = self.t(s0);
         let td = self.t(dst);
-        assert_eq!(t0.ty, GgmlType::F32, "clamp: F32 only");
-        assert_eq!(td.nb[0], 4, "clamp: nb0 == sizeof(float)");
-        assert_eq!(t0.nb[0], 4, "clamp: src0 nb0 == sizeof(float)");
+        // the dispatcher's only two cases (ops.cpp:6127-6137)
+        assert!(matches!(t0.ty, GgmlType::F32 | GgmlType::F16), "clamp: F32/F16 only");
+        let is_f16 = t0.ty == GgmlType::F16;
+        let el: usize = if is_f16 { 2 } else { 4 };
+        assert_eq!(td.nb[0] as usize, el, "clamp: nb0 == sizeof(element)");
+        assert_eq!(t0.nb[0] as usize, el, "clamp: src0 nb0 == sizeof(element)");
         let min = f32::from_bits(td.op_params[0] as u32);
         let max = f32::from_bits(td.op_params[1] as u32);
         let nc = t0.ne[0] as usize;
         let n = t0.nrows() as usize;
-        let nb01 = t0.nb[1] as usize;
-        let nb1 = td.nb[1] as usize;
+        // GGML_TENSOR_UNARY_OP_LOCALS: ne01/ne02 of src0, nb01..nb03 of src0,
+        // nb1..nb3 of dst (ops.cpp:6063-6065 / 6099-6101)
+        let ne01 = t0.ne[1] as usize;
+        let ne02 = t0.ne[2] as usize;
+        let (nb01, nb02, nb03) = (t0.nb[1] as usize, t0.nb[2] as usize, t0.nb[3] as usize);
+        let (nb1, nb2, nb3) = (td.nb[1] as usize, td.nb[2] as usize, td.nb[3] as usize);
         let run = |ir0: usize, ir1: usize| {
             for j in ir0..ir1 {
-                for i in 0..nc {
-                    let x = self.rd_f32s(s0, j * nb01 + i * 4, 1)[0];
-                    self.wr_f32s(dst, j * nb1 + i * 4, 1)[0] = x.min(max).max(min);
+                // 65840ed53: decompose the flat row index over ne01/ne02 —
+                // `j*nb1` was only correct when nb2 == ne1*nb1 and
+                // nb3 == ne2*nb2 (contiguous dims)
+                let i1 = j % ne01;
+                let i2 = (j / ne01) % ne02;
+                let i3 = j / (ne01 * ne02);
+                let soff = i1 * nb01 + i2 * nb02 + i3 * nb03;
+                let doff = i1 * nb1 + i2 * nb2 + i3 * nb3;
+                if is_f16 {
+                    // f16 kernel (ops.cpp:6108-6112): round-trip through f32
+                    for i in 0..nc {
+                        let b = self.rd(s0, soff + i * 2, 2);
+                        let v = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]]))
+                            .to_f32()
+                            .min(max)
+                            .max(min);
+                        self.wr(dst, doff + i * 2, 2)
+                            .copy_from_slice(&half::f16::from_f32(v).to_bits().to_le_bytes());
+                    }
+                } else {
+                    // f32 kernel (ops.cpp:6073-6076)
+                    for i in 0..nc {
+                        let x = self.rd_f32s(s0, soff + i * 4, 1)[0];
+                        self.wr_f32s(dst, doff + i * 4, 1)[0] = x.min(max).max(min);
+                    }
                 }
             }
         };
@@ -7834,6 +7869,131 @@ mod tests {
             assert_eq!(scaled[i].to_bits(), (x0[i] * -2.5).to_bits());
             assert_eq!(silud[i].to_bits(), ggml_silu_f32(scaled[i]).to_bits());
             assert_eq!(gelud[i].to_bits(), ggml_vec_gelu_f32(silud[i]).to_bits());
+        }
+    }
+
+    // ==================================================================
+    // CLAMP non-contiguous-view parity vs the NEW reference build
+    // (parity/ref_clamp_dump.c → parity/clamp_ref.bin, upstream 65840ed53
+    // "ggml: fix CLAMP on non-contiguous views (CPU, CUDA)")
+    // ==================================================================
+
+    struct ClampSection {
+        kind: u32,
+        min: f32,
+        max: f32,
+        pne: [i64; 4],
+        ne: [i64; 4],
+        nb: [u64; 4],
+        off: usize,
+        is_f16: bool,
+        parent: Vec<u8>,
+        out: Vec<u8>,
+    }
+
+    fn read_clamp_dump() -> Vec<ClampSection> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/clamp_ref.bin");
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|_| panic!("missing {path}: build via parity/ref_clamp_dump.c"));
+        let mut c = &bytes[..];
+        let mut sections = Vec::new();
+        loop {
+            let magic = u32::from_le_bytes(c[..4].try_into().unwrap());
+            c = &c[4..];
+            if magic == 0xFFFF_FFFF {
+                break;
+            }
+            assert_eq!(magic, 0x314D_4C43, "section magic 'CLM1'");
+            let kind = u32::from_le_bytes(c[..4].try_into().unwrap());
+            let min = f32::from_bits(u32::from_le_bytes(c[4..8].try_into().unwrap()));
+            let max = f32::from_bits(u32::from_le_bytes(c[8..12].try_into().unwrap()));
+            c = &c[12..];
+            let mut i64x4 = [0i64; 4];
+            for x in i64x4.iter_mut() {
+                *x = i64::from_le_bytes(c[..8].try_into().unwrap());
+                c = &c[8..];
+            }
+            let pne = i64x4;
+            let mut ne = [0i64; 4];
+            for x in ne.iter_mut() {
+                *x = i64::from_le_bytes(c[..8].try_into().unwrap());
+                c = &c[8..];
+            }
+            let mut nb = [0u64; 4];
+            for x in nb.iter_mut() {
+                *x = u64::from_le_bytes(c[..8].try_into().unwrap());
+                c = &c[8..];
+            }
+            let off = u64::from_le_bytes(c[..8].try_into().unwrap()) as usize;
+            let is_f16 = u32::from_le_bytes(c[8..12].try_into().unwrap()) != 0;
+            c = &c[12..];
+            let pn = u32::from_le_bytes(c[..4].try_into().unwrap()) as usize;
+            c = &c[4..];
+            let parent = c[..pn].to_vec();
+            c = &c[pn..];
+            let on = u32::from_le_bytes(c[..4].try_into().unwrap()) as usize;
+            c = &c[4..];
+            let out = c[..on].to_vec();
+            c = &c[on..];
+            sections.push(ClampSection { kind, min, max, pne, ne, nb, off, is_f16, parent, out });
+        }
+        assert!(c.is_empty(), "trailing bytes in clamp_ref.bin");
+        sections
+    }
+
+    /// Replay every section of parity/clamp_ref.bin through the port's graph
+    /// compute and compare bit-for-bit. Kinds: 0 f32 3D view, 1 f32 4D view,
+    /// 2 f32 inplace 3D view, 3 f16 3D view, 4 f16 4D view, 5 f16 inplace 3D
+    /// view, 6/7 contiguous controls. Sections 0-5 only match after the
+    /// 65840ed53 row-decomposition fix (verified: the pre-fix j*nb1
+    /// addressing reproduces none of them); 6/7 pin the contiguous bytes.
+    #[test]
+    fn clamp_noncontig_views_bit_exact_vs_reference() {
+        let sections = read_clamp_dump();
+        assert_eq!(sections.len(), 8, "8 probe sections expected");
+        for s in &sections {
+            let mut ctx = Context::new();
+            let ty = if s.is_f16 { GgmlType::F16 } else { GgmlType::F32 };
+            let parent = ctx.new_tensor_4d(ty, s.pne[0], s.pne[1], s.pne[2], s.pne[3]);
+            ctx.arena_resize_tensor(parent);
+            ctx.data_bytes_mut(parent).unwrap().copy_from_slice(&s.parent);
+
+            let view = if s.ne[2] == 1 && s.ne[3] == 1 {
+                ctx.view_2d(parent, s.ne[0], s.ne[1], s.nb[1] as usize, s.off)
+            } else if s.ne[3] == 1 {
+                ctx.view_3d(parent, s.ne[0], s.ne[1], s.ne[2], s.nb[1] as usize, s.nb[2] as usize, s.off)
+            } else {
+                ctx.view_4d(
+                    parent,
+                    s.ne[0],
+                    s.ne[1],
+                    s.ne[2],
+                    s.ne[3],
+                    s.nb[1] as usize,
+                    s.nb[2] as usize,
+                    s.nb[3] as usize,
+                    s.off,
+                )
+            };
+            let inplace = matches!(s.kind, 2 | 5);
+            let r = if inplace {
+                ctx.clamp_inplace(view, s.min, s.max)
+            } else {
+                ctx.clamp(view, s.min, s.max)
+            };
+            let mut g = Graph::new(8);
+            g.build_forward(&ctx, r);
+            graph_compute(&mut ctx, &mut g, 1);
+
+            let got = if inplace { ctx.data_bytes(parent).unwrap() } else { ctx.data_bytes(r).unwrap() };
+            assert_eq!(
+                got,
+                s.out.as_slice(),
+                "clamp section kind {} (f16={}, inplace={}) diverged from the reference",
+                s.kind,
+                s.is_f16,
+                inplace
+            );
         }
     }
 
