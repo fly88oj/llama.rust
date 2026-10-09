@@ -8299,3 +8299,289 @@ Wiring（llama-cli 的既有模式搬到 server 的 load_engine）: 目标上下
 - **f0c41e016 的 19-builder 裁剪接线**: B 需把 embeddings_nextn(_masked) 下放 builder——现有驱动路径值不变（域内回归佐证）, embeddings-nextn 上下文的行为差待接。
 - **mtmd cohere2 视觉**（siglip 塔+llava-uhd, 既有缺口）; **d1/pplx/omni e2e**（协议面已单测, 待驱动接线）; **sysffi copy callback**（ForeignExecutor GPU 路径, D 落地 Rust 侧）; **prompt-cache 检查点生成/回滚**（T2 复用类断言）。
 - **上游 bug 待报**: dsv4 全 SWA base 半 SIGFPE（§2）; 参考 llama-cli 驱动决策文件挂起。
+
+## mtmd cohere2 视觉收尾: siglip 塔 + llava-uhd 方形切片族 + cohere2v 投影器全链（代理 V-COH2, 2026-10-09, 基线 c35b66744）
+
+批次 3 开档的 "mtmd cohere2 视觉阻塞"（50a6c5cf7 + a657f7e98 的 mtmd 面）本轮关闭。
+真 cohere2 mmproj 本地不可得（HF gated, [TAG_HF_EXAMPLE_GATED] command-a-vision）→
+验证协议 = 批次 19/20 音频投影器的合成双端协议（`parity/cohere2v_parity.sh`）。
+
+### 1. 上游依据 → 移植位点（每行 C 行号）
+
+- **clip-impl.h:513/:583** `PROJECTOR_TYPE_COHERE2V` "cohere2v" → clip.rs `ProjectorType::Cohere2V`
+  （from_str/name）; **clip-impl.h:492/:562** `D1OMNI_A` → `D1OmniA`。d1omni_v（视觉）未入枚举——
+  需 lfm2 视觉塔族, 开档（见 §4）。
+- **clip-model.h:70-80** llava-uhd hparams（`preproc_max_tiles` + `image_resize_algo_{rf,ov}` +
+  `image_pad_{rf,ov}` + `image_pad_color_{rf,ov}`）→ `ClipHparams` 新字段 + Default（PAD_CEIL rf /
+  PAD_NONE ov 同 C 初始化）。**clip-model.h:626-629** `mm_{5,6}_{w,b}` → `ClipModel` 新字段。
+- **clip.cpp:1520-1528** cohere2v hparams 臂（PAD_NONE rf; KEY_PROJ_SCALE_FACTOR→n_merge;
+  KEY_PREPROC_MAX_TILES 必填 + [1,256] 校验）→ `load_hparams` Cohere2V 臂。**clip.cpp:1704-1713**
+  qwen2.5-vl 可选 `clip.vision.image_{min,max}_pixels`（custom 值优先）→ Qwen2Vl 臂（真
+  qwen3.8 mmproj 无此键, 读取为 no-op——行为不变已证）。**clip-impl.h:58** `KEY_IMAGE_RESIZE_ALGO`
+  → keys 常量 + `parse_resize_algo`（clip.cpp:1533-1543 的 if/else 链, 单测钉契约; 其读取臂
+  = lfm2/d1omni_v 视觉族, 开档）。
+- **clip.cpp:2802-2809** cohere2v 装载臂（TN_LLAVA_PROJ `mm.{1,2}.{weight,bias}` 四个必填）→
+  `load_tensors`。**clip.cpp:412-437** 分离 q/k/v（HF SigLIP 无转换期融合）——装载器的
+  "separate q/k/v not ported" 拒绝对 Cohere2V 解除, 换 siglip 塔自身的完备性校验。
+- **models/siglip.cpp:3-16**（build_inp → build_vit(NORM_TYPE_NORMAL, ffn_op, learned_pos, 无
+  resize——cohere2 tiles 恰为 image_size 方形）+ **:48-56** cohere2v 尾巴 → `build_siglip_graph` +
+  `build_siglip_inp`（clip.cpp:572-585, conv2d/reshape/transpose/patch_bias）。build_vit 复用音频族
+  已位验的 `build_vit_audio_opts`（= clip.cpp:337-566 全量 build_vit）。尾巴:
+  `build_patch_merge_permute`（clip.cpp:901-931 像素洗牌）→ mm_1(+bias) → `ggml_swiglu_swapped`
+  （线性 [x,gate], HF silu(gate)*x——复用音频轮已验的 `swiglu_swapped`）→ mm_2(+bias)。
+- **mtmd-image.cpp:613-641** `slice_image`（overview 用 *_ov, refined 用 *_rf, crop 切片）+
+  **:1145-1163** cohere2v `preprocess`（先切片后缩略图, 无切片时仅缩略图）+
+  **:1166-1213** `get_slice_instructions`（最少上采样优先, 全需下采样时取最少下采样; 网格按
+  tile 数后宽度序访问, 平局同 HF）→ clip.rs `slice_image`/`get_slice_instructions_cohere2v`/
+  `image_preprocess_full`; **mtmd-image.cpp:127-148** `img_tool::crop`; **mtmd-image.h:11**
+  `mtmd_image_preproc_out`（entries+overview+grid）→ `ImagePreprocOut`。基类 llava-uhd 的
+  pinpoints/minicpm 网格搜索未移植（cohere2v 覆写 get_slice_instructions, 不经过）。
+- **mtmd.cpp:801-810** 标记族（`<|START_OF_IMG|>`/(tile)`<|IMG_LINE_BREAK|>`…/`<|END_OF_IMG|>`,
+  ov_img_first=false）→ mtmd.rs 字段 + **:652** `lookup_token` 逐 token 精确 piece 扫描
+  （无 vocab/未命中 → -1 同 LLAMA_TOKEN_NULL）+ **:1440-1537** llava-uhd 分块装配
+  （split_batch_to_chunk :1676 — 每 tile 一 chunk, overview 末位; tok_sli_img_end 逐 tile,
+  cohere2v 的 mid/row-end/slices-start 标记集为空）。
+- **a657f7e98 连带**: **conformer.cpp:210-216** d1omni_a 投影器后残差块（LN 1e-5 → GELU-ERF
+  down/up → add）+ **:167** sigmoid 前 cont（CUDA 连续性）+ **clip.cpp:3439-3447** mm.a.mlp.{4,5,6}
+  装载 + **clip.cpp:6124** n_mmproj_embd=mm_3_w→ne[1] + **clip.cpp:4424** n_output_tokens 同 lfm2a
+  + **mtmd-audio.cpp:998-1032** d1omni 音频预处理（30 s 截断/0.5 s 补零/逐 hop 帧截断）→
+  mtmd_audio.rs `D1omniPreproc` + mtmd.rs `AudioPreproc::D1omni`。**clip.cpp:1990/:3423** d1omni_a
+  并入 lfm2a hparams/装载臂。
+
+### 2. 验证（`parity/cohere2v_parity.sh`, 合成协议）
+
+端口 GGUF writer 写合成 cohere2v mmproj（siglip 塔: 分离 attn_{q,k,v}+bias/ln1/ln2/ffn_up/
+ffn_down、pre/post_ln、patch bias、位置方格; mm.1/mm.2 含 bias; kv: scale_factor=2,
+preproc_max_tiles=4, use_gelu; PROJ=896 对齐 qwen2.5-0.5b 文本宽——mtmd_init 的宽度校验）:
+
+- **参考接受**: `llama-mtmd-debug -p encode -n 64 --image cb`（fa off + fa on）exit 0×2,
+  banner `n_merge: 2 / preproc_tiles: 0 - 4 / image_size: 64`。
+- **位比（嵌入）**: cb 64×64 原始 f32 直灌（跳过预处理, mtmd_parity 的 clip_cb_parity 协议）:
+  **16 tok × 896 embd = 14336 f32 双 FA 路径全部逐位相同（BIT-EXACT）**
+  （faoff: soft_max_ext 路; faon: flash_attn_ext 路）。真权重数值不可本地验证（无真模型,
+  诚实记录）——但图的每个节点类（conv2d/分离 qkv 注意力/两 LN/gelu FFN/像素洗牌/mul_mat/
+  swapped-swiglu/bias-add）都被位比覆盖。
+- **切片几何**: 参考 `-p preproc --verbose`: 150×150 → **4 entries 每个 64×64**; 50×50 →
+  **0 entries（仅缩略图）**——与端口单测断言一致（150×100→grid(2,2)/refined 128×128/4 切片+
+  缩略图; 50×40→仅缩略图; 700×500→(2,2); 100×150→(2,2) 手算对照）。
+- **单测**: `synth_cohere2v_load_preprocess_encode`（kv/张量表/切片几何/编码 896×16/
+  重复编码位同/FA-off 路）+ `cohere2v_slice_instructions`（网格选择）+ `resize_algo_parse`。
+
+### 3. 回归（本轮实测）
+
+- `parity/mtmd_parity.sh`（真 qwen3.8 mmproj）: cb448 faoff 位同 178/1003520 L2 1.265e-4
+  cos 0.9999999920 / faon 160 L2 1.266e-4 / fixture PNG 46/358400 L2 2.082e-4 cos 0.99999998
+  ——均在 §mtmd 记录带内（基线 172/1.20e-4; 参考侧线程调度致 run-to-run 位同计数小幅漂移,
+  带宽不变）。真 mmproj 无 image_{min,max}_pixels 键 → 新可选读取为 no-op, qwen3vl 路径不变。
+  e2e 贪心文本在 1e-4 嵌入噪声带上不稳定（记录基线已归因文本路径; 参考 bin 已随批次 3 更换）。
+- `parity/audio_mtmd_parity.sh`: whisper 六族双 FA 路**全部 BIT-EXACT**（qwen2a/ultravox/
+  voxtral/meralion/glma/musicflamingo, 67 万级 f32 逐位同）。`parity/audio_mtmd_parity2.sh`:
+  qwen3a 34944 / gemma4ua 57344 BIT-EXACT; lfm2a NEAR-EXACT max|Δ|=4.77e-06（已档带宽内,
+  conformer conv 模块 ULP 尺度——本轮 sigmoid 前 cont 改动数值中性已证）。`parity/audio_mtmd_parity3.sh`:
+  gemma4a/mimo/qwen3tts_spkenc/pockettts_spkenc BIT-EXACT; granite_speech fa-off 4.8e-07 /
+  fa-on 4.09e-04、parakeet 9.54e-07——均在已档带内（参考自身 ssm_conv 向量化, D 节）。
+- `parity/tts_pipeline_parity.sh`: **h-states 2592/2592 与 640/640 逐位同**（qwen3tts/pockettts
+  的 gen 图——本域 clip.rs 面）; PCM/主干终态与参考漂移（q3t 466/640, pt 15355/15360;
+  trunk state 14468 vs 14476 字节）——定位为**并行 M 域代理未提交改动**（context.rs +161 /
+  graph_arch.rs +414 在共享树在途, 状态序列化尺寸差不在我域文件内）; 端口侧 tts_pipeline_e2e 3/3 绿。
+- 全量门禁: `cargo test --workspace --release --no-fail-fast -- --test-threads 1` →
+  **922 passed / 0 failed / 140 ignored, exit 0**（共享树含并行域代理在途新增;
+  本轮贡献 +3: cohere2v 单测×2 + resize_algo_parse; 基线 909/0/131）。
+
+### 4. 未做（开档）
+
+- **lfm2/d1omni_v 视觉族**（siglip.cpp:58-80 尾巴 + resize_position_embeddings 路 +
+  lfm2 切片预处理 mtmd-image.cpp:914-1038 + KEY_IMAGE_RESIZE_ALGO 读取臂 clip.cpp:1530-1551）:
+  cohere2 之外的 siglip 塔投影器; KEY_IMAGE_RESIZE_ALGO 的解析已移植钉契约, 读取臂随此族落位。
+- **siglip.cpp 其余尾巴**（gemma3/idefics3/janus_pro/phi4, :17-46/:81-95）: 对应枚举不在端口,
+  维持 "recognised-but-no-graph" 策略。
+- **真 cohere2 mmproj 位比**: 本地不可得（gated）; 合成协议即本轮验收（诚实记录）。
+- **mtmd e2e（llama-mtmd-cli 全 turn）**: 参考侧 qwen2.5 词表无 `<|IMG_LINE_BREAK|>` →
+  lookup_token 返回 LLAMA_TOKEN_NULL(-1), 文本 chunk 带 -1 token 无法过 llama_decode;
+  端口行为与 C 逐字段一致（同样 -1）。真 cohere2 文本模型到位后补 e2e。
+
+## server 决策 e2e + prompt-cache 检查点收尾（域 D, 2026-10-09, 基线 c35b66744）
+
+批次 3 的两项 D 域余项关闭。参考 = NEW build（c35b66744）; 每行 C 行号注于代码。
+
+### 1. d1/pplx/omni 决策模型 e2e 驱动（88dcc460d + a657f7e98 + da263e727）
+
+**上游依据 → 移植位点**:
+- lfm2.cpp:2383-2386 `create_memory` 对非因果 decision 干返回 nullptr →
+  llama-context.cpp:1729-1732 decode 无内存时改走 encode。端口 `DecodeContext` 只有
+  混合内存解码图 → engine.rs 新增 `Core::Decision(D1OmniCore)`: 状态less 驱动
+  `graph_arch::build_lfm2_decision_forward`（tests/lfm2_decision_e2e.rs 的 D1Driver
+  上提, 权重/hparams 泛化于 weights.rs `lfm2_decision_weights/params`）。路由条件
+  镜像上游（LFM2 && !causal && n_layer_decision>0; 因果 d1-3B 无 decision 块,
+  走普通解码核）。omni 的 [3,T] 分数按 token 主序读出 = `llama_get_embeddings_ith`
+  行布局。
+- **共享前缀子任务的真实缺陷（本轮修复）**: `run_decision` 的子任务原把 tail 在
+  清空序列后裸解码（无前缀 KV）。上游 server-context.cpp:3828-3854+: 父槽批次停在
+  `n_tokens_shared`（:3926-3932）, `copy_prompt_to`（seq_cp）把前缀态交给子槽, 父再
+  续自己的 tail。端口单上下文仿真: 前缀解码后在边界做全量态快照
+  （`state_seq_get_data(0,false)`——端口的 partial blob 不含 recurrent 半,
+  context.rs:3306-3313, 全量是超集）, 父/每子从快照续。修复前 d1 的
+  urgency/angry（子任务）概率偏 ~0.2; 修复后 ≤1.6e-4（父 2-批漂移带）。
+- common.cpp:1285-1290 omni 强制 embeddings+pooling NONE（main.rs 既有）;
+  pplx 走 labels 族（末 token logits）无需改。
+
+**验证**（`parity/systemone_d1_parity.sh`, 33/33 MATCH）: 三个合成件
+（tests/systemone_d1_parity.rs 生成: 因果 lfm2+gpt2 词表的 d1、非因果 decision 头
++SPM 词表 `<|mask|>` 重写 token 31999 的 omni、llama 载体+qwen2 词表的 pplx——
+pplx 的真实载体 qwen35 的张量集未造合成件, 协议面（标签码/末 token logits/共享
+前缀子任务）与 arch 无关, 记录于下）: 3 问请求 + 2 桶温度请求 + null-state（d1 族
+200 / pplx 400）+ 5 条非法请求 400 + 图片 501, 概率逐字段（1e-3 容差, 实测最差
+1.6e-4）, usage 逐 token 相等。
+
+### 2. prompt-cache 检查点生成/回滚（033df86b6 T2 余项）
+
+**上游依据 → 移植位点**:
+- `--ctx-checkpoints/-ctxcp/--swa-checkpoints`（arg.cpp:1700-1707, 默认 32）与
+  `--checkpoint-min-step/-cms`（:1708-1718, 默认 8192, 负值拒绝）→ main.rs Args;
+  Engine 增 n_ctx_checkpoints/checkpoint_min_step/n_swa/seq_rm_bounded。
+  seq_rm 能力 = `common_context_can_seq_rm`（common.cpp:1553-1596）的结构判定:
+  recurrent 半（ForwardWeights::recurrent_dims）或 n_rs_seq>0 → FULL/RS。
+- 创建时机（server-context.cpp:3865-4061）: 完成任务 + (FULL/RS || n_swa>0);
+  批次在 user-start 边界（:3977-3983, message_spans）与 {4+n_ubatch, 4} 尾偏移
+  （:3985-3999）断开; 批头非 user-start 且非近尾则跳过（:4031-4035）; pos_min<0
+  跳过; 间距门（:4050-4055）; `create_checkpoint`（:2521-2584）在解码**前**取态。
+  端口 partial/full 选择: 非 recurrent 用 partial（与上游 blob 同形）, recurrent
+  用全量（端口 partial 丢 recurrent 半——超集, 已注）。
+- 回滚（:3666-3786）: `pos_min_thold = max(0, pos_next-n_swa-…)`, 混合内存的
+  pos_min = 两半 min 的 MAX（llama-memory-hybrid.cpp:172-175, recurrent 单胞在
+  序列末端）→ engine.rs `mem_pos_min/max`（live 胞位 = kv pos_max）; 新到旧找
+  `pos_max<=pos_next && (pos_min<thold || pos_min==0)`, 恢复 tgt+dft,
+  `pos_next=min(pos_next, max(pos_min+1,pos_max))`, 失败回退全量重处理
+  （id_task==-1 的槽文件态）/任务态失败报 500（GGML_ABORT 对应）; 之后清
+  pos_max>pos_next 的检查点。
+- message_spans: `message_delimiters`（请求原生或 chat 路径 autoparser 注入,
+  chat.rs 既有）→ main.rs `message_user_starts`（common/chat.cpp:126-165 split 的
+  USER 半）; TaskParams.message_user_starts。
+- context_shift 后 `prompt.clear()` 连检查点一起清（server-task.h:611-616）。
+- **附带修复（既有缺口）**: ① timings.prompt_n 恒 0——stats.n_prompt_processed
+  从未累加（上游 :4595-4606 每批行计数）→ 解码后按 ProcessingPrompt 槽计数;
+  ② engine.rs/api.rs 两处 now_us 的 OnceLock 惰性纪元——首请求 t_start=0 使
+  `is_set` 门失效且首请求 timings 全错 → run() 起始钉住两纪元。
+
+**验证**（`parity/checkpoint_parity.sh`, 14/14 MATCH, tinylfm2d1 合成件——
+混合 recurrent 使 seq_rm=FULL; 场景 = "USER: "+base+"USER: "+结尾 的多轮 +
+message_delimiters, 使检查点落在分歧点下）: turn B 只处理结尾（16 vs 210, 两端
+一致）; 擦除→重跑→save（SCKP 附录在, n_written==文件大小）→无关提示占槽→
+restore（n_read==n_written）→turn B 复用同值 16; `--ctx-checkpoints 0` 时两端
+都全量重处理（参考日志 "forcing full prompt re-processing"）。内容逐字节一致。
+
+### 3. 契约项与记录
+
+- **M 域契约**: ① omni 媒体输入（a657f7e98 的 input_audio/图片）需
+  `llm_graph_input_attn_media` 的媒体行注入（批次混合 token+嵌入行, 批面）+
+  mtmd 音频 data-url→conformer mel→嵌入流接线（mtmd_audio.rs 同源）; 端口
+  D1OmniCore 目前文本专属（媒体在 systemone 门 501）。② 端口 partial 态不含
+  recurrent 半（context.rs:3306）: 检查点用全量超集绕过; 若 M 域补 recurrent 进
+  partial blob, 可回到与上游同形。
+- **CommonSpeculative get/set_state 未移植**: 检查点的 data_spec 留空
+  （eagle3 deferred g_embd 暂存; 端口回滚路径不读它, 槽文件双端互读不受影响——
+  附录空 blob 双端语义一致）。
+- **pplx 载体**: e2e 用 llama-arch 合成件（qwen2 词表）; qwen35 载体的张量集
+  合成件未造（协议面已全验证, 载体加载另有批次 1 的 qwen35 回归覆盖）。
+- **参考缺陷确认**: 参考对 d1 合成件的 /v1/systemone 路径无缺陷（批次 3 发现的
+  llama-cli 挂起不涉及 server 路径, 本轮全对照通过）。
+- **预存偏差（非本轮引入, 旧二进制同样 500）**: 畸形 JSON 的 /completion 参考
+  400 / 端口 500（run_server_parity.sh 的 badjson 项; json 解析错误映射在
+  handle_completion 开头, ERROR_TYPE_SERVER——待后续批次对齐）。
+
+## 批次 M-close（收尾代理 M 域 6 项, 2026-10-09, 基线 c35b66744）
+
+范围: M 域开档遗留 6 项清零。全部对照 NEW 参考（`/home/jeffrey/llm/llama.cpp-next
+@ c35b66744`）。并发说明: 本批与 clip/mtmd/ggml/server 域代理并行, 门禁以目标测试
++ 双锚 + 域内回归为准（全套件由集成者跑）。
+
+### 1. glm5-next graph_mtp 构建器 + 驱动接线（b9acf138a）
+
+| 上游依据 | 移植位点 | 验证证据 |
+|---|---|---|
+| glm5-next.cpp:543-666 `graph_mtp`（eh_proj concat→DSA→MoE→shared_head 回退链） | graph_arch.rs `Glm5NextMtpWeights`+`build_glm5_mtp_forward`（复用 trunk 的 build_glm5_dsa_layer/kpool_select, il=n_layer 命名+寻址两用） | **值位比 PASS**: parity/gen_glm5_mtp_ref.sh → ref_mtp2_dump 12 步链（logits+h_nextn 全链）1,539,140 字节逐字节相同（tests/glm5_mtp_e2e.rs glm5_mtp_reference_bitcompare） |
+| llama-model.cpp:2501-2508 MTP 过滤（attn/idx 只留 nextn, recurrent 空） | context.rs `MtpForward::Glm5Next` + `new_mtp`（n_layer_all 宽 0 行 kv[K-only] + 仅末层 is_idx 的 HybridIdxCache[3,kpool,顺序池]） | **mtp2 全格 PASS**: parity/glm5_mtp_parity.sh — ref plain==ref spec==port plain==port spec 16/16, acceptance 0/39 与参考同（合成头不收稿的不变量） |
+| b9acf138a 的 MTP 上下文 kpool 步进（apply() 逐 ubatch） | context.rs `step_ubatch` 增 `build_idx_step` 钩（decode_batch 路径——草稿与 spec 目标共用; glm5 trunk 经 decode_batch 的 kpool 步进此前缺失, 一并修复） | port 自洽 16/16 + 计数 drafted 48/accepted 0（同参考） |
+
+### 2. qwen4exp graph_mtp 驱动接线（批次 42f 遗留）
+
+| 上游依据 | 移植位点 | 验证证据 |
+|---|---|---|
+| qwen4exp.cpp:526-612 `graph_mtp`（hc-wide eh_proj + QSA/dense 一轮 + nextn hc 头折叠; n_embd_out=n_embd*hc） | graph_arch.rs `Qwen4ExpMtpWeights`+`build_qwen4exp_mtp_forward`（复用 build_qwen4exp_hc_mix/combine/attn_layer_qsa/ffn; 参数面向量由装配端扩至 n_layer_all——bailingmoe3 clamp 先例） | **值位比 PASS**: parity/gen_qwen4exp_mtp_ref.sh + 新探针 parity/ref_mtp2h_dump.c（h 行取 n_embd_out 宽; 原 ref_mtp2_dump 按 n_embd 截断 hc 行）→ 12 步链逐字节相同 |
+| llama-model.cpp:2750-2756（attn+idx 留 MTP 块, recurrent 空——批次 42e 的 is_empty 语义） | context.rs `MtpForward::Qwen4Exp` + `new_mtp`（idx 缓存 kpool_row=2/by_order; 无 compress_ratios 文件走 dense 臂） | **mtp2 全格 PASS**: parity/qwen4exp_mtp_parity.sh — 四流 16/16, acceptance 0/39 同参考 |
+
+### 3. f0c41e016 的 19-builder 裁剪接线
+
+- **审计结论**: 端口 19 个 nextn 家族 builder 的尾部早已是 **crop_after 形**（先捕获
+  全行 t_h_nextn 再 gather 喂 lm 头——`out_rows` 恒后置; crop_before 的提前窄化仅省
+  计算, 值等价）, graph.rs:110-138 的谓词与上游 llama-graph.h:1061-1068 逐字相同。
+  行为差只在三处 t_h_nextn 非 result_norm 的 arch:
+- **mimo2**: 尾部换为 f0c41e016 的无条件发射（mimo2.cpp:236-243, PRE-norm inpL 作
+  t_h_nextn, "set even when extraction is off"; 旧端口给的是 gather 后 post-norm）。
+- **qwen4exp**: trunk 尾加 t_h_nextn=扁平 hc 残差（qwen4exp.cpp:498-503）, embd 槽
+  按 unmasked 旗切换（deepseek4 先例, context.rs 转发旗）; **glm5**: gather 移到
+  hc_mean/norm 之后（族形）。
+- **验证**: 新探针 parity/ref_nextn_crop_dump.c（set_embeddings_nextn(true,false) +
+  仅末行 logits=1 的部分输出批——唯一让 crop 谓词改变图形的组合）vs 端口孪生
+  tests/nextn_crop_dump.rs: **18 个具名节点位同**（含 h_nextn 载荷; 110 节点两侧同
+  数）; parity/nextn_crop_parity.sh 重生成; 存档 parity/mimo2/nextn_crop_nodes_ref.bin。
+- qwen4exp 的存量节点流（parity/qwen4exp_qsa_nodes*.bin）按 c35b66744 重生成（旧档
+  早于 f0c41e016, 无 h_nextn 节点）: qwen4exp_qsa_fa_parity.sh 全绿。
+
+### 4. clef 混合批守卫
+
+| 上游依据 | 移植位点 | 验证证据 |
+|---|---|---|
+| clef.cpp:126-165 `clef_get_spans` 的 token 存在性（:128 `ubatch.token != nullptr`）+ 混合批媒体走查（:159-162 `!type[i] \|\| order[i]==NONE`） | clef.rs `clef_get_spans_ubatch`（原 2 参形式保留为 token 批特化） | tests/clef_e2e.rs `clef_get_spans_mixed_batch_guards`: span 内 EMBD 行作废/span 外(order NONE)不作废/embd-only 批退化 |
+| clef.cpp:186-187 `no_tokens` 0 填充 | `ClefDecisionInputs::{build,set_input}_ubatch` + `n_tokens` 字段 | `clef_decision_inputs_no_tokens_fallback`: 0 填充落地 + token 批原样; clef_e2e 5/5（原 3 保持） |
+
+### 5. gemma-embedding2 tok_scale 混合形态
+
+| 上游依据 | 移植位点 | 验证证据 |
+|---|---|---|
+| gemma-embedding2.cpp:86 `build_inp_embd(model.tok_embd, sqrtf(n_embd))` + llama-graph.cpp:2553-2570（token 行缩放/raw embd 行不缩放, 混合批按行 scale_rows 乘） | graph_arch.rs ge2 构建器换 `graph::build_inp_embd(…, tok_scale=sqrt(n_embd), InpEmbdScale)` + 新 `mixed` 参数（context.rs 转发 None——编码驱动当前只造 token 批） | tests/gemma_embedding2_e2e.rs `ge2_mixed_batch_tok_scale_rows`（llm_graph_input_embd 层级构造: token 行 ×sqrt / raw embd 行不动, 读回 inp_scaled 逐元素断言）; ge2 e2e 位比保持（156 节点 55 具名全同）; **族审计**: gemma3/3n/4/v1 的内联形记注释（graph_arch.rs [TASK5-FAMILY-AUDIT]——token 批逐 op 相同, 这些 arch 的端口解码路径尚不构造混合批, 无可达输入面） |
+
+### 6. nemotron-h nextn 装载（批次 22-24 审计存量）
+
+- 审计核对: **nextn 张量装载臂已在**（model.rs NEMOTRON_H|NEMOTRON_H_MOE 臂的
+  i∈[n_layer,n_layer_all) 块, nemotron-h.cpp:144-181 1:1——AUDIT 行 179 的"已移"注
+  释属实）。本批补的是 **448147d42 nextn_flags 语义**: 臂内 `nextn_flags(ATTN_NORM
+  probe)` + treq!/mreq! 宏把 trunk/mtp NOT_REQUIRED 下放全部 create（trunk-only 文件
+  可载; MTP-only 同理; 端口无 TENSOR_SKIP, 退化 NOT_REQUIRED=deepseek4 约定）。
+- 验证: hybrid_e2e 4/4（flags=0 路径无回归; trunk-only 文件的 mskip 路径与 qwen35
+  已审计臂同型, 编译+模式核对）。
+
+### 门禁与回归（全部亲跑）
+
+- 双锚 `bash parity/anchor_newref.sh cmp`: qwen25 + gptoss **IDENTICAL**。
+- 域内回归: mtp2_e2e 5/5（含 n_max∈{0,3} spec 自洽）、mtp_e2e 4/4、
+  glm5_dump 5/5、qwen4exp_qsa_dump 2/2（重生成后）、clef_e2e 5/5、
+  gemma_embedding2_e2e 2/2、nextn_crop_dump 1/1、glm5_mtp_e2e 1/1、
+  qwen4exp_mtp_e2e 1/1、hybrid_e2e 4/4、qwen35_e2e 4/4、gemma4_assistant 0+1i、
+  mtp_real_spec_e2e 2+1i —— **0 失败**。
+- mtp2_parity.sh 九 arch 全格: **ALL CELLS PASS**（mimo2 新 h_nextn 形下保持）。
+
+### 未做项（诚实记录）
+
+- **qwen4exp MTP 图的 `--nodes` 节点流位比**: 值位比（MTP2P 链 dump）+ mtp2 全格已
+  覆盖; glm5 侧已出 nodes-ref 流（/tmp/mtp2/glm5-next-nodes-ref.bin, 未入库存档——
+  值位比为该 arch 的验收主锚, 节点流留 bisect 用）。
+- **gemma3/3n/4/v1 的混合批换形**: 无可达输入面（见上）, 记注释未换。
+- **nemotron-h trunk-only 文件的专门 e2e**: 未造新夹具; 语义与 qwen35 臂同型。
+- **llm_graph_input_embd 层级的参考对照探针**: 参考侧无导出符号面（llama-graph.h
+  内部类）, 按任务预案以端口层级构造验证。
+
+## 收尾批次 X（ggml API 面 + LoRA 精度 + imatrix NextN, 域 X, 2026-10-09, 基线 c35b66744）
+
+- **ggml_prec_set_acc**（b56f34ab1 的 API 面）: ops.rs `GgmlPrec` enum + `Context::prec_set_acc`（ggml.c:3291-3315 逐行; MUL_MAT/MUL_MAT_ID 写 slot0, FLASH_ATTN_EXT 写 slot3 与 hadamard hint 共存）; adapter.rs 两处 NVFP4→BF16 接入（llama-graph.cpp:1560/:1604）。CPU 后端无 op_params 消费=无行为差（纯 GPU W4A4 提示）。**证据**: 单测编码位 + 探针 parity/prec_acc_probe.c 对参考 .so 的 op_params 字节逐字段同（mul_mat [0]=15/[1]=1、mul_mat_id [0]=10、flash [3]=15、ADD 拒绝）。
+- **sysffi copy-callback ForeignExecutor 绑定**（批次 3 B 移交）: backend_emit.rs `ForeignSchedCopyCallback`（C→Rust trampoline + Box 槽保活）+ moe_cache.rs `install_copy_callback_foreign`/`sched_copy_experts_foreign`（llama-context.cpp:2667-2737 的 C 指针 1:1: 首节点 MUL_MAT_ID gate + ids 回读 + used 位图 + 连续段合组 + 512B padding）; sysffi 软解析（pinned 构建无该符号, 硬解析会毁 pinned 测试）。**证据**: stub 往返（parity/sched_copy_stub.c）+ 子进程对 c35b66744 真 .so 注册成功（**坑: 同进程混载 pinned/next 两套 ggml 在 ggml_gallocr_new_n 下 SIGSEGV 且 SONAME 相同被 glibc 去重——fresh 进程验证**）; GPU e2e 不可（无 GPU, 诚实记录; 当前 foreign 回调=上游 cache-disabled 语义, expert-id 位图半边完整）。
+- **imatrix -md NextN 草稿上下文**（批次 42c 移交）: tools/imatrix 的 -md 从报错改为完整构造（imatrix.cpp:1968-2038: 草稿装载走 nextn_flags MTP-only probe + own_lm_head 探测 + NextnCollector sizing-only stub——new_eagle3 weights_stub 先例 + trunk 开 embeddings_nextn tap）; 顺补 build_weights 的 **QWEN35 臂**（此前主路径 exit 的前置缺口）。**证据**: parity/imatrix_md_parity.sh **4 MATCH/0 DIFF**——双侧 md==nextn 逐字节 IDENTICAL + --show-statistics stdout 37 行逐字节（9 cell 数值 5e-4 末位差=qwen35 trunk 既有 1ulp 激活差已开档, 非 -md 路径引入）。
+
+## 收尾轮集成总账（集成者, 2026-10-09）
+
+- **契约接线**: ForeignCopyExpertsReset 落进 DecodeContext GPU 构造（moe_cache_size>0 安装）与 run_graph 复位点（llama-context.cpp:2643 双态语义）; X→M 的 lora_mm prec 接入对 eh_proj 调用自动生效。
+- **独立复验（亲跑）**: glm5_mtp_parity **ALL CELLS PASS**（四流 16/16, acceptance 0/39 同参考）/ systemone_d1 **33 MATCH/0 DIFF** / checkpoint **14 MATCH/0 DIFF** / imatrix_md **4 MATCH/0 DIFF** / cohere2v **BIT-EXACT 14336×2 FA 路** / tts_pipeline 3/3（V 报的 PCM 漂移= M 在途编辑, 收官后消除）。
+- **门禁**: 全量串行 `--no-fail-fast --test-threads 1` → **922 passed / 0 failed / 140 ignored**（基线 909→922, +13 本轮: cohere2v 3 + d1/checkpoint server 测试 + glm5/qwen4exp MTP e2e + 裁剪 dump + clef 2 + 混合缩放）; **双锚 IDENTICAL×2**。
+- **本轮清零的遗留账**: glm5 graph_mtp、qwen4exp graph_mtp 驱动、f0c41e016 裁剪接线、clef 混合守卫、ge2 tok_scale 混合形态、nemotron-h nextn flags、d1/pplx/omni e2e、prompt-cache 检查点生成/回滚、mtmd cohere2 视觉、sysffi copy-callback、prec_set_acc、imatrix -md。
+- **新开档（本轮产生）**: omni 媒体输入（llm_graph_input_attn_media 批注入+mtmd 音频 data-url 接线, 文本面已全验）; partial 态不含 recurrent 半（检查点用全量超集绕过）; CommonSpeculative get/set_state（检查点 data_spec 空 blob 双端一致）; lfm2/d1omni_v 视觉族（siglip 增量+lfm2 切片）; cohere2 mtmd-cli 级 e2e（qwen2.5 词表无 IMG_LINE_BREAK, C 同 -1）; prec_set_src（沿用批次 42 决定）; moe_cache C 侧 banks（GPU enablement 后续）; qwen35 trunk 1ulp 激活差（blk.1 ffn 级, 建议独立批次二分）。
+- **永久范围外（维持）**: N 卡 CUDA 实测（无 N 卡）、mrope-2D 重排（无输入面）、畸形 JSON 400/500 映射（预存偏差已档）、GPU 域后端零转写。
