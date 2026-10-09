@@ -123,6 +123,23 @@ fn apply_case(all: &Json, case: &Json) -> Result<ChatParams, String> {
             .to_string(),
         enable_thinking: !matches!(case.at("enable_thinking"), Some(Json::Bool(false))),
         now: Some(PINNED_EPOCH),
+        chat_template_kwargs: match case.at("chat_template_kwargs") {
+            Some(Json::Object(fields)) => fields
+                .iter()
+                .map(|(k, v)| {
+                    // the value is a json-encoded string, like the C's
+                    // `chat_template_kwargs["k"] = "\"xml\""`
+                    (
+                        k.clone(),
+                        match v {
+                            Json::String(s) => s.clone(),
+                            other => other.dump(),
+                        },
+                    )
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
         ..TemplatesInputs::default()
     };
 
@@ -634,8 +651,8 @@ fn chat_tools_parity_prompts_and_parsers() {
             let is_partial = matches!(case.input.at("parse_partial"), Some(Json::Bool(true)));
             let mut params = ChatParserParams::from_chat_params(&got)
                 .unwrap_or_else(|e| panic!("{}: load parser: {e}", case.name));
-            params.generation_prompt = got.generation_prompt.clone();
-            let msg = match chat_parse(parse_input, is_partial, &params) {
+            params.generation_prompt = ChatInput::from_plain(got.generation_prompt.clone());
+            let msg = match chat_parse(&ChatInput::from(parse_input), is_partial, &params) {
                 Ok(m) => m,
                 Err(e) => {
                     failures.push(format!("{}: chat_parse failed: {e}", case.name));
@@ -863,7 +880,7 @@ fn ref_standard_json_tools_roundtrip() {
     let mut params = ChatParserParams::default();
     params.parser = arena;
     let msg = chat_parse(
-        r#"Sure!<tool_call>{"name": "get_weather", "arguments": {"city": "Tokyo"}}</tool_call>"#,
+        &ChatInput::from(r#"Sure!<tool_call>{"name": "get_weather", "arguments": {"city": "Tokyo"}}</tool_call>"#),
         false,
         &params,
     )
@@ -907,7 +924,7 @@ fn parser_serialization_roundtrip() {
 
     let mut params = ChatParserParams::default();
     params.parser = reloaded;
-    let msg = chat_parse(r#"[{"name": "f", "arguments": {"x": 7}}]"#, false, &params).unwrap();
+    let msg = chat_parse(&ChatInput::from(r#"[{"name": "f", "arguments": {"x": 7}}]"#), false, &params).unwrap();
     assert_eq!(msg.tool_calls[0].name, "f");
     assert_eq!(msg.tool_calls[0].arguments, r#"{"x": 7}"#);
 }
@@ -944,7 +961,7 @@ fn partial_parse_streams_tool_args() {
     let mut params = ChatParserParams::default();
     params.parser = arena;
     let msg = chat_parse(
-        r#"<tool_call>{"name": "get_weather", "arguments": {"city": "Tok"#,
+        &ChatInput::from(r#"<tool_call>{"name": "get_weather", "arguments": {"city": "Tok"#),
         true,
         &params,
     )
@@ -1056,8 +1073,8 @@ fn ref_server_tool_call_parse() {
     // the parser the port generates for this template+tools parses the raw
     // server output into the same tool_calls the reference reported
     let mut pparams = ChatParserParams::from_chat_params(&params).unwrap();
-    pparams.generation_prompt = params.generation_prompt.clone();
-    let msg = chat_parse(&raw_text, false, &pparams).unwrap();
+    pparams.generation_prompt = ChatInput::from_plain(params.generation_prompt.clone());
+    let msg = chat_parse(&ChatInput::from(raw_text.as_str()), false, &pparams).unwrap();
 
     let ref_name = ref_calls
         .at_idx(0)

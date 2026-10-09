@@ -199,4 +199,75 @@ kill $SRV 2>/dev/null || true
 wait $SRV 2>/dev/null || true
 trap - EXIT
 
+# ---- 3) cross-read: each server restores the other's save file -------------
+# (033df86b6 file compatibility: same header/version/payload layout; the
+# reference's mamba2 files carry the checkpoint appendix, so the port's
+# appendix skip is exercised there. float payloads differ from the reference
+# in the last bits — the RESTORE response and the continuation tokens are the
+# check, not raw bytes)
+echo "== cross-read: port restores the reference's file and vice versa"
+xread_pair() { # model tag port_rust port_ref
+  local model=$1 tag=$2 pr=$3 pf=$4
+  ./target/release/llama-server -m "$model" -c "$CTX" -t "$THREADS" -np 1 \
+    --port "$pr" --host 127.0.0.1 --slot-save-path "$SAVEPATH" >"$OUT/port-xread-$tag.log" 2>&1 &
+  local p1=$!
+  "$REF/llama-server" -m "$model" -c "$CTX" -t "$THREADS" -np 1 \
+    --port "$pf" --host 127.0.0.1 --slot-save-path "$SAVEPATH" >"$OUT/ref-xread-$tag.log" 2>&1 &
+  local p2=$!
+  if wait_ready "$pr" && wait_ready "$pf"; then
+    # port warms + saves; the REFERENCE restores that file
+    curl -s "http://127.0.0.1:$pr/completion" -H 'Content-Type: application/json' \
+      -d "$(body "$PROMPT" 8 1)" -o "$OUT/xreadp-$tag-warm.json"
+    curl -s -X POST "http://127.0.0.1:$pr/slots/0?action=save" \
+      -H 'Content-Type: application/json' -d "{\"filename\":\"xread-from-port-$tag.bin\"}" -o "$OUT/xreadp-$tag-save.json"
+    curl -s -X POST "http://127.0.0.1:$pf/slots/0?action=restore" \
+      -H 'Content-Type: application/json' -d "{\"filename\":\"xread-from-port-$tag.bin\"}" -o "$OUT/xreadp-$tag-restore.json"
+    curl -s "http://127.0.0.1:$pf/completion" -H 'Content-Type: application/json' \
+      -d @"$OUT/continue-body.json" -o "$OUT/xreadp-$tag-continue.json"
+    # reference warms + saves; the PORT restores that file
+    curl -s "http://127.0.0.1:$pf/completion" -H 'Content-Type: application/json' \
+      -d "$(body "$PROMPT" 8 1)" -o "$OUT/xreadr-$tag-warm.json"
+    curl -s -X POST "http://127.0.0.1:$pf/slots/0?action=save" \
+      -H 'Content-Type: application/json' -d "{\"filename\":\"xread-from-ref-$tag.bin\"}" -o "$OUT/xreadr-$tag-save.json"
+    curl -s -X POST "http://127.0.0.1:$pr/slots/0?action=restore" \
+      -H 'Content-Type: application/json' -d "{\"filename\":\"xread-from-ref-$tag.bin\"}" -o "$OUT/xreadr-$tag-restore.json"
+    curl -s "http://127.0.0.1:$pr/completion" -H 'Content-Type: application/json' \
+      -d @"$OUT/continue-body.json" -o "$OUT/xreadr-$tag-continue.json"
+  fi
+  kill $p1 $p2 2>/dev/null || true
+  wait $p1 $p2 2>/dev/null || true
+}
+
+xread_check() { # tag -> 0 on success
+  python3 - "$OUT" "$1" <<'PY'
+import json, sys
+out, tag = sys.argv[1], sys.argv[2]
+for who in ("xreadp", "xreadr"):
+    restore = json.load(open(f"{out}/{who}-{tag}-restore.json"))
+    assert "n_restored" in restore, f"{who}-{tag} restore failed: {restore}"
+    saved = json.load(open(f"{out}/{who}-{tag}-save.json"))
+    assert restore["n_restored"] == saved["n_saved"], (restore, saved)
+cont = {}
+for who in ("xreadp", "xreadr"):
+    cont[who] = json.load(open(f"{out}/{who}-{tag}-continue.json")).get("tokens")
+assert cont["xreadp"] and cont["xreadr"], f"missing continuation tokens: {cont}"
+assert cont["xreadp"] == cont["xreadr"], f"cross-read continuations disagree: {cont}"
+print(f"cross-read[{tag}]: both restores ok, continuations identical")
+PY
+}
+
+XREAD_OK=1
+xread_pair "$MODEL" qwen $PORT_RUST $PORT_REF
+xread_check qwen || XREAD_OK=0
+# the recurrent arch: the reference's save files carry the SCKP checkpoint
+# appendix (a recurrent state cannot be rewound), so this leg exercises the
+# port's appendix handling on restore
+xread_pair "$RECUR_MODEL" recur $PORT_RUST $PORT_REF
+xread_check recur || XREAD_OK=0
+if [ "$XREAD_OK" = "1" ]; then
+  echo "MATCH  cross-read (port file -> ref, ref file -> port; qwen + mamba2)"
+else
+  echo "DIFF   cross-read (port file -> ref, ref file -> port; qwen + mamba2)"
+fi
+
 python3 parity/server_slots_cmp.py "$OUT"

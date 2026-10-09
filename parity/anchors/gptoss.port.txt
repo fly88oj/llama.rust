@@ -1,5 +1,5 @@
 prompt tokens: [976, 9029, 328, 10128, 382]
-The capital of France is [prompt: 5 tokens in 2.202510993s = 2.3 t/s]
+The capital of France is [prompt: 5 tokens in 2.523939882s = 2.0 t/s]
  Paris."
     ]
     # Process the documents

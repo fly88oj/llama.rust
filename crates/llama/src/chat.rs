@@ -6132,8 +6132,11 @@ mod caps_impl {
         v
     }
 
-    /// `caps_try_execute` (caps.cpp:35-72): render with synthetic inputs,
-    /// ignore execution errors, then analyze the value stats.
+    /// `caps_try_execute` (caps.cpp:35-93, 462524043): render with synthetic
+    /// inputs, ignore execution errors, then analyze the value stats. Some
+    /// templates require a thinking field on every assistant turn (e.g. K2
+    /// Horizon): a failure retries once with an empty `reasoning_content` on
+    /// the assistant turns that lack one.
     fn try_execute(
         prog: &[super::mini_jinja::Node],
         mut inputs: RenderInputs,
@@ -6141,14 +6144,41 @@ mod caps_impl {
         inputs.bos_token = String::new();
         inputs.eos_token = String::new();
         inputs.add_generation_prompt = true;
-        let messages = inputs.messages.clone();
-        let tools = inputs.tools.clone();
-        let (success, result) = match render_inputs(prog, &inputs) {
-            Ok(s) => (true, s),
-            Err(_) => (false, String::new()),
-        };
-        let _ = (&messages, &tools);
-        (success, result, inputs)
+        for attempt in 0..2 {
+            let (success, result) = match render_inputs(prog, &inputs) {
+                Ok(s) => (true, s),
+                Err(_) => (false, String::new()),
+            };
+            if success || attempt == 1 {
+                return (success, result, inputs);
+            }
+            // retry once with an empty reasoning_content on the assistant
+            // turns that lack one (only when one was actually added)
+            let mut added = false;
+            if let ValKind::List(items) = inputs.messages.kind() {
+                for msg in items.borrow().iter() {
+                    if let ValKind::Object(fields) = msg.kind() {
+                        let is_assistant = fields
+                            .borrow()
+                            .iter()
+                            .any(|(k, v)| {
+                                k == "role" && v.as_str_val().as_deref() == Some("assistant")
+                            });
+                        let has_reasoning = fields.borrow().iter().any(|(k, _)| k == "reasoning_content");
+                        if is_assistant && !has_reasoning {
+                            fields
+                                .borrow_mut()
+                                .push(("reasoning_content".to_string(), json_str("")));
+                            added = true;
+                        }
+                    }
+                }
+            }
+            if !added {
+                return (false, String::new(), inputs);
+            }
+        }
+        unreachable!()
     }
 
     fn json_str(s: &str) -> Val {

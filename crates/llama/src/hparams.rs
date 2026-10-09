@@ -135,6 +135,20 @@ pub enum LlmFfnOpType {
     SITU = 9,
 }
 
+/// `LLM_CLS_ACT_TYPES_FROM_STRING` (37ac63456, llama-model.cpp:1081-1086) —
+/// transformers names, "gelu" is the *exact* (erf) variant. Returns `None`
+/// for an unknown name — the C's `GGML_ASSERT(it != end && "unsupported
+/// classifier activation")` (llama-model.cpp:1348-1352) fires at the loader.
+pub fn cls_act_type_from_string(name: &str) -> Option<i32> {
+    match name {
+        // transformers names, "gelu" is the exact (erf) variant
+        "gelu" => Some(ggml::ops::GGML_UNARY_OP_GELU_ERF),
+        "silu" => Some(ggml::ops::GGML_UNARY_OP_SILU),
+        "tanh" => Some(ggml::ops::GGML_UNARY_OP_TANH),
+        _ => None,
+    }
+}
+
 /// `struct llama_hparams_posnet` (WavTokenizer)
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LlamaHparamsPosnet {
@@ -202,6 +216,9 @@ pub struct LlamaHparams {
     pub nanbeige_skip_loop_final_norm: bool,
     pub n_expert: u32,
     pub n_rel_attn_bkts: u32,
+    /// MoVA value experts (K2 Horizon) — llama-hparams.h:75-76 (462524043)
+    pub n_value_expert: u32,
+    pub n_value_expert_used: u32,
 
     /// if non-negative, the first n_layer_kv_from_start layers have KV cache
     /// TODO: this needs to be reworked (as in C)
@@ -522,6 +539,15 @@ pub struct LlamaHparams {
     /// how rope_scaling_type_train is handled.
     pub llm_ffn_op: LlmFfnOpType,
 
+    /// `hparams.act_cls` (37ac63456, llama-hparams.h:374) — activation of
+    /// the classifier head (RANK pooling), a `ggml_unary_op` code
+    /// (`ggml::ops::GGML_UNARY_OP_*`). Default TANH; `%s.classifier.
+    /// activation` overrides it ("gelu" = the *exact* erf variant / "silu" /
+    /// "tanh", LLM_CLS_ACT_TYPES_FROM_STRING, llama-model.cpp:1081-1086 —
+    /// `cls_act_type_from_string`). `build_pooling` applies it where the
+    /// modern_bert gelu special case used to be (llama-graph.cpp:3906).
+    pub act_cls: i32,
+
     // Step35: optional per-layer clamps for (Swi)GLU
     /// clamping for expert FFN
     pub swiglu_clamp_exp: Vec<f32>,
@@ -637,6 +663,8 @@ impl LlamaHparams {
             nanbeige_skip_loop_final_norm: false,
             n_expert: 0,
             n_rel_attn_bkts: 0,
+            n_value_expert: 0,
+            n_value_expert_used: 0,
             n_layer_kv_from_start: -1,
             n_embd_head_k_full: 0,
             n_embd_head_v_full: 0,
@@ -805,6 +833,8 @@ impl LlamaHparams {
             rope_type: LlamaRopeType::NONE,
             rope_scaling_type_train: LlamaRopeScalingType::NONE,
             llm_ffn_op: LlmFfnOpType::NONE,
+            // GGML_UNARY_OP_TANH (the C member initialiser, llama-hparams.h:374)
+            act_cls: ggml::ops::GGML_UNARY_OP_TANH,
             swiglu_clamp_exp: Vec::new(),
             swiglu_clamp_shexp: Vec::new(),
         };

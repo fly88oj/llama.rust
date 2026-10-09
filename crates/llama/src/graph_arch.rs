@@ -2296,8 +2296,10 @@ pub fn build_lfm2_forward(
 
     // token_embd_norm + tied output (lfm2.cpp:283-292, build_lora_mm at :288)
     let cur = build_norm_rms(ctx, cur, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -3940,6 +3942,57 @@ fn attn_no_cache_ext(
     cur
 }
 
+/// The cb-naming twin of [`attn_no_cache`] — build_attn_mha's four named
+/// nodes (kq / kq_soft_max / kqv / kqv_out, llama-graph.cpp:2672/2707/2716/
+/// 2733) so the dump comparators can pair them; used by the builders whose
+/// acceptance is the named-node stream (gemma-embedding2, the lfm2 decision
+/// graphs).
+#[allow(clippy::too_many_arguments)]
+fn attn_no_cache_il(
+    ctx: &mut Context,
+    q: TensorId,
+    k: TensorId,
+    v: TensorId,
+    kq_b: Option<TensorId>,
+    kq_mask: TensorId,
+    kq_scale: f32,
+    wo: Option<TensorId>,
+    wo_b: Option<TensorId>,
+    il: i32,
+) -> TensorId {
+    let q = ctx.permute(q, 0, 2, 1, 3); // [n_embd_head, n_tokens, n_head]
+    let k = ctx.permute(k, 0, 2, 1, 3); // [n_embd_head, n_tokens, n_head_kv]
+    let v = ctx.permute(v, 0, 2, 1, 3); // [n_embd_head, n_tokens, n_head_kv]
+
+    let mut kq = ctx.mul_mat(k, q);
+    if let Some(b) = kq_b {
+        kq = ctx.add(kq, b);
+    }
+    ctx.set_name(kq, &format!("kq-{il}")); // cb :2672
+    let kq = ctx.soft_max_ext(kq, Some(kq_mask), kq_scale, 0.0);
+    ctx.set_name(kq, &format!("kq_soft_max-{il}")); // cb :2707
+
+    let v = ctx.transpose(v);
+    let v = ctx.cont(v);
+    let kqv = ctx.mul_mat(v, kq);
+    ctx.set_name(kqv, &format!("kqv-{il}")); // cb :2716
+
+    let kqv = ctx.permute(kqv, 0, 2, 1, 3);
+    let kqv = ctx.cont(kqv);
+    let ne = *ctx.ne(kqv);
+    let kqv = ctx.reshape_2d(kqv, ne[0] * ne[1], ne[2] * ne[3]);
+    ctx.set_name(kqv, &format!("kqv_out-{il}")); // cb :2733 (post-reshape)
+
+    let mut cur = match wo {
+        Some(w) => crate::adapter::lora_mm(ctx, w, kqv),
+        None => kqv,
+    };
+    if let Some(b) = wo_b {
+        cur = ctx.add(cur, b);
+    }
+    cur
+}
+
 /// `build_pooling` (llama-graph.cpp:3677-3772) for NONE / MEAN / CLS / LAST.
 ///
 ///   * NONE — `cur = inp` (no node at all, llama-graph.cpp:3698-3700); the
@@ -4011,9 +4064,12 @@ pub struct RankHead {
     /// test survives via modern-bert's loader defaulting the field to MEAN,
     /// modern-bert.cpp:23-26)
     pub mean_first: bool,
-    /// `arch == LLM_ARCH_MODERN_BERT` — GELU activation instead of tanh
-    /// (llama-graph.cpp:3764-3768)
+    /// `arch == LLM_ARCH_MODERN_BERT` — kept for the mean_first
+    /// documentation above (the activation itself moved to `act_cls`)
     pub modern_bert: bool,
+    /// `hparams.act_cls` (37ac63456) — the classifier activation:
+    /// gelu_erf on modern-bert files without the key, tanh elsewhere
+    pub act_cls: i32,
 }
 
 /// `build_pooling`'s RANK arm (llama-graph.cpp:3722-3766). `inp_mean` /
@@ -4048,12 +4104,14 @@ pub fn build_pooling_rank(
         if let Some(b) = head.cls_b {
             cur = ctx.add(cur, b);
         }
-        // modern-bert: ggml_gelu; the roberta-style heads: ggml_tanh
-        // (llama-graph.cpp:3764-3768)
-        cur = if head.modern_bert {
-            ctx.gelu(cur)
-        } else {
-            ctx.tanh(cur)
+        // ggml_unary(cur, hparams.act_cls) (37ac63456,
+        // llama-graph.cpp:3764-3768): the classifier activation — gelu_erf
+        // on modern-bert files without the key (its loader default), tanh
+        // elsewhere; `head.act_cls` carries hparams.act_cls
+        cur = match head.act_cls {
+            ggml::ops::GGML_UNARY_OP_GELU_ERF => ctx.gelu_erf(cur),
+            ggml::ops::GGML_UNARY_OP_SILU => ctx.silu(cur),
+            _ => ctx.tanh(cur),
         };
         if let Some(n) = head.cls_norm {
             // head norm — build_norm(cur, cls_norm, NULL, LLM_NORM, -1)
@@ -5620,8 +5678,10 @@ pub fn build_gpt2_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -5889,8 +5949,10 @@ pub fn build_starcoder2_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -6176,8 +6238,10 @@ pub fn build_gptneox_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -6322,8 +6386,10 @@ pub fn build_olmo2_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -6474,8 +6540,10 @@ pub fn build_codeshell_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -6606,8 +6674,10 @@ pub fn build_orion_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -6725,8 +6795,10 @@ pub fn build_olmo_forward(
 
     // olmo.cpp:128-130
     let cur = build_norm(ctx, inp_l, None, None, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -6831,8 +6903,10 @@ pub fn build_xverse_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -6937,8 +7011,10 @@ pub fn build_internlm2_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -7066,8 +7142,10 @@ pub fn build_exaone_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -7185,8 +7263,10 @@ pub fn build_gemma1_forward(
 
     // gemma.cpp:125-136 — no logit softcap in v1
     let cur = build_norm_rms_gemma(ctx, inp_l, w.output_norm, ones, ap.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -7307,8 +7387,10 @@ pub fn build_falcon_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -7533,8 +7615,10 @@ pub fn build_baichuan_forward(
 
     // output_norm + lm_head (baichuan.cpp:110-118)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -7675,8 +7759,10 @@ pub fn build_bloom_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -7856,8 +7942,10 @@ pub fn build_mpt_forward(
         w.output_norm_b,
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -7991,8 +8079,10 @@ pub fn build_starcoder_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -8112,8 +8202,10 @@ pub fn build_refact_forward(
 
     // output_norm + lm_head (refact.cpp:126-136)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -8223,8 +8315,10 @@ pub fn build_plamo_forward(
 
     // output_norm + lm_head (plamo.cpp:116-126)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -8372,8 +8466,10 @@ pub fn build_stablelm_forward(
         Some(w.output_norm_b),
         p.attn.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -8629,8 +8725,10 @@ pub fn build_qwen2moe_forward(
 
     // final norm + lm_head (qwen2moe.cpp:180-191)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -8814,8 +8912,10 @@ pub fn build_qwen3moe_forward(
 
     // final norm + lm_head (qwen3moe.cpp:165-178)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -9193,8 +9293,10 @@ pub fn build_arctic_forward(
 
     // final norm + lm_head (arctic.cpp:166-178)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -9375,8 +9477,10 @@ pub fn build_olmoe_forward(
 
     // final norm + lm_head (olmoe.cpp:159-171)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -9574,8 +9678,10 @@ pub fn build_ernie45_moe_forward(
 
     // final norm + lm_head (ernie4-5-moe.cpp:119-131)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -9721,8 +9827,10 @@ pub fn build_smollm3_forward(
 
     // final norm + lm_head (smollm3.cpp:138-150)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -9863,8 +9971,10 @@ pub fn build_seed_oss_forward(
 
     // final norm + lm_head (seed-oss.cpp:137-149)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -10047,8 +10157,10 @@ pub fn build_openelm_forward(
 
     // final norm + lm_head (openelm.cpp:157-168)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -12228,8 +12340,10 @@ pub fn build_nemotron_forward(
         Some(w.output_norm_b),
         a.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -13023,8 +13137,10 @@ pub fn build_deci_forward(
 
     // final norm + lm_head (deci.cpp:177-188)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -13166,8 +13282,10 @@ pub fn build_jais_forward(
         Some(w.output_norm_b),
         a.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -13391,8 +13509,10 @@ pub fn build_falcon_h1_forward(
 
     // final norm + lm_head (falcon-h1.cpp:195-206)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -13534,8 +13654,10 @@ pub fn build_plamo2_forward(
 
     // final norm + lm_head (plamo2.cpp:183-198)
     let cur = build_norm_rms(ctx, cur, w.output_norm, p.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -16311,8 +16433,10 @@ pub fn build_hunyuan_moe_forward(
 
     // final norm + lm_head (hunyuan-moe.cpp:174-184)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -16535,8 +16659,10 @@ pub fn build_dots1_forward(
 
     // final norm + lm_head (dots1.cpp:181-190)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -16701,8 +16827,10 @@ pub fn build_bailingmoe_forward(
 
     // final norm + lm_head (bailingmoe.cpp:164-178)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -16922,8 +17050,10 @@ pub fn build_bailingmoe2_forward(
 
     // final norm + lm_head (bailingmoe2.cpp:197-209)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -17133,8 +17263,10 @@ pub fn build_glm4_moe_forward(
 
     // final norm + lm_head (glm4-moe.cpp:424-441)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -17323,8 +17455,10 @@ pub fn build_minimax_m2_forward(
 
     // final norm + lm_head (minimax-m2.cpp:152-166)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -17874,8 +18008,10 @@ pub fn build_exaone_moe_forward(
 
     // final norm + lm_head (exaone-moe.cpp:226-236)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -18096,8 +18232,10 @@ pub fn build_plamo3_forward(
 
     // final norm + lm_head (plamo3.cpp:184-190, build_lora_mm at :187)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -18246,8 +18384,10 @@ pub fn build_qwen3next_forward(
     // final norm + lm_head (qwen3next.cpp:203-222; the t_h_nextn tap and the
     // inp_out_ids get_rows reduce rows only — the port's decode picks its own)
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -20173,8 +20313,10 @@ pub fn build_smallthinker_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -20417,8 +20559,10 @@ pub fn build_llada_moe_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -20804,8 +20948,10 @@ pub fn build_minimax01_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -21347,8 +21493,10 @@ pub fn build_apertus_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -21670,8 +21818,10 @@ pub fn build_grovemoe_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -21819,8 +21969,10 @@ pub fn build_qwen35moe_forward(
 
     // final norm (t_h_nextn, qwen35moe.cpp:230-234) + lm_head
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.attn.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -24183,8 +24335,10 @@ pub fn build_minimax_m3_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -25207,8 +25361,10 @@ pub fn build_arcee_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -25363,8 +25519,10 @@ pub fn build_jais2_forward(
         Some(w.output_norm_b),
         a.norm_eps,
     );
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -25707,8 +25865,10 @@ pub fn build_nanbeige_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -26005,8 +26165,10 @@ pub fn build_rnd1_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -26458,8 +26620,10 @@ pub fn build_hrm_text_forward(
     // result_norm + the lm_head (hrm-text.cpp:198-210; the weightless final
     // norm already ran inside the last stack)
     let cur = z_h;
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -26765,8 +26929,10 @@ pub fn build_laguna_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, base.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -26958,8 +27124,10 @@ pub fn build_maple_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, a.norm_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -27664,8 +27832,10 @@ pub fn build_chatglm_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -27910,8 +28080,10 @@ pub fn build_dbrx_forward(
     }
 
     let cur = build_norm(ctx, inp_l, Some(w.output_norm), None, p.norm_ln_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -28133,8 +28305,10 @@ pub fn build_mistral3_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -28523,8 +28697,10 @@ pub fn build_glm4_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -28697,8 +28873,10 @@ pub fn build_exaone4_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -28910,8 +29088,10 @@ pub fn build_llama4_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -29127,8 +29307,10 @@ pub fn build_qwen2vl_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -29348,8 +29530,10 @@ pub fn build_qwen3vl_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -35808,8 +35992,10 @@ pub fn build_qwen1_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -35945,8 +36131,10 @@ pub fn build_maincoder_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -36080,8 +36268,10 @@ pub fn build_pangu_embed_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -36250,8 +36440,10 @@ pub fn build_cogvlm_forward(
     ctx.set_name(cur, "result_norm");
     // cogvlm has no last-layer inp_out_ids gather (its graph expands all
     // rows); out_rows is the value-identical row selection of the driver
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -36396,8 +36588,10 @@ pub fn build_spark25_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -36935,8 +37129,10 @@ pub fn build_plm_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -37116,8 +37312,10 @@ pub fn build_hunyuan_vl_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -37590,8 +37788,10 @@ pub fn build_afmoe_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -37763,8 +37963,10 @@ pub fn build_mellum_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -37927,8 +38129,10 @@ pub fn build_paddleocr_forward(
     }
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -38677,8 +38881,10 @@ pub fn build_mimo2_forward(
     graph.build_forward(ctx, inp_l);
 
     let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :353
     let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
@@ -42175,17 +42381,18 @@ pub struct Glm5KpoolStep {
     /// I32 [kpool-1, n_tokens] — the incomplete tail cells
     pub tail_idxs: TensorId,
     /// F32 [n_sel, 1, 1, n_tokens] — 0 for live selection slots, -inf dead
-    pub gather_mask: TensorId,
+    /// (310991409 renamed the old `gather_mask`; the scatter path maps its
+    /// dead slots to dump rows, glm5-next.cpp:273)
+    pub sel_mask: TensorId,
     /// I32 [kpool, n_new] — members of the pools completed this ubatch
     /// (n_new >= 1: a dummy entry keeps the graph shape stable, :297-299)
     pub new_pool_idxs: TensorId,
-    /// I64 [n_new] — cell to write each new pooled key into (cache_safe
-    /// only, :345-348)
-    pub new_pool_rep: Option<TensorId>,
+    /// I64 [n_new] — cell to write each new pooled key into — one scatter
+    /// row per new pool, each a distinct rep row (310991409 dropped the
+    /// cache_safe gate: the graph always scatters, glm5-next.cpp:345-348)
+    pub new_pool_rep: TensorId,
     pub n_new: u32,
     pub n_sel: u32,
-    pub gather: bool,
-    pub cache_safe: bool,
     /// `cparams.fused_lid` (default true) — the F16 pool_mask / the fused
     /// lightning indexer score (glm5-next.cpp:303, :841-843)
     pub fused_lid: bool,
@@ -42723,23 +42930,14 @@ fn build_glm5_kpool_select(
     pooled_new = ctx.reshape_2d(pooled_new, n_e_idx, n_new);
     ctx.set_name(pooled_new, &format!("indexer_pool_k_new-{il}"));
 
-    // write before the pool gather (:817-820)
-    if let Some(rep) = kpool_step.new_pool_rep {
-        let sr = ctx.set_rows(pooled_v, pooled_new, rep);
-        graph.build_forward(ctx, sr);
-    }
+    // scatter the fresh pooled keys into their rep rows, then gather all
+    // n_pool of them by cell: the older pools come from the rows earlier
+    // ubatches wrote (310991409 dropped the cache_safe=false fresh-pool
+    // fallback, glm5-next.cpp:936-942)
+    let sr = ctx.set_rows(pooled_v, pooled_new, kpool_step.new_pool_rep);
+    graph.build_forward(ctx, sr);
 
-    let pooled = if kpool_step.cache_safe {
-        ctx.get_rows(pooled_v, kpool_step.pool_cells)
-    } else {
-        // (:826-830) — a shared-cell sequence cannot trust the cache; pool
-        // everything fresh: the new pools plus a zero pad to n_pool
-        assert!(n_new <= n_pool, "glm5 kpool: n_new <= n_pool");
-        let pad_t = ctx.new_tensor_2d(GgmlType::F32, n_e_idx, n_pool - n_new);
-        ctx.arena_resize_tensor(pad_t);
-        let pad = ctx.fill(pad_t, 0.0);
-        ctx.concat(pooled_new, pad, 1)
-    };
+    let pooled = ctx.get_rows(pooled_v, kpool_step.pool_cells);
     let pooled = ctx.reshape_3d(pooled, n_e_idx, 1, n_pool);
     ctx.set_name(pooled, &format!("indexer_pool_k-{il}"));
 
@@ -42797,17 +42995,6 @@ fn build_glm5_kpool_select(
     };
     let n_sel = ctx.ne(sel_idx)[0];
 
-    // gather returns selected cell indices and masks padding separately
-    // (:883-887)
-    if kpool_step.gather {
-        assert!(
-            ctx.ne(kpool_step.gather_mask)[0] == n_sel
-                && ctx.ne(kpool_step.gather_mask)[3] == t
-        );
-        ctx.set_name(sel_idx, &format!("indexer_sel_idx-{il}"));
-        return sel_idx;
-    }
-
     // keep sel_idx in the graph, then build the -inf / zero scatters from
     // their own typed tensors (a7b94df2c glm5-next.cpp:886-900, commit
     // 4e2713c16 "qwen4exp : optimize mask constructions" — the old code
@@ -42834,9 +43021,9 @@ fn build_glm5_kpool_select(
     // row n_kv + slot, so the scatter indices of a token are unique:
     // idx = dump + live*(idx - dump), live = exp(mask) (:901-908)
     assert!(
-        ctx.ne(kpool_step.gather_mask)[0] == n_sel && ctx.ne(kpool_step.gather_mask)[3] == t
+        ctx.ne(kpool_step.sel_mask)[0] == n_sel && ctx.ne(kpool_step.sel_mask)[3] == t
     );
-    let gm2 = ctx.reshape_2d(kpool_step.gather_mask, n_sel, t);
+    let gm2 = ctx.reshape_2d(kpool_step.sel_mask, n_sel, t);
     let live = ctx.exp(gm2);
     let dump = ctx.arange(n_kv as f32, (n_kv as i64 + n_sel) as f32, 1.0);
     let idx_f = ctx.cast(sel_idx, GgmlType::F32);
@@ -42935,88 +43122,46 @@ fn build_glm5_dsa_layer(
     let k_dst = ctx.set_rows(kv.layers[il].k, k_rows, inp.row_idx);
     graph.build_forward(ctx, k_dst);
 
-    let out = if kpool_step.gather {
-        // attend over gathered latents with the token dimension in ne[3]
-        // (:971-996)
-        graph.build_forward(ctx, kq_mask);
+    let out = {
+    // the scatter selection already includes the causal mask
+    // (:998-1005)
+    let mne = *ctx.ne(kq_mask);
+    let mask = ctx.reshape_4d(sel, mne[0], mne[1], mne[2], mne[3]);
+    ctx.set_name(mask, &format!("kq_mask_dsa-{il}"));
 
-        let sel_idx = sel; // I32 [n_sel, n_tokens]
-        let n_sel = ctx.ne(sel_idx)[0];
+    let k = kv.get_k(ctx, il, kv_lora_rank, 1, n_kv);
+    let kne = *ctx.ne(k);
+    let knb = *ctx.nb(k);
+    let v = ctx.view_4d(
+        k,
+        kv_lora_rank,
+        kne[1],
+        kne[2],
+        kne[3],
+        knb[1] as usize,
+        knb[2] as usize,
+        knb[3] as usize,
+        0,
+    );
 
-        // gather_mla_rows (llama-memory-hybrid-idx.cpp:965-973): the whole
-        // MLA K storage viewed [kv_lora, size] and gathered by row
-        let k_store = kv.layers[il].k;
-        let kne = *ctx.ne(k_store);
-        let knb = *ctx.nb(k_store);
-        let rows = ctx.view_2d(
-            k_store,
-            kne[0],
-            kne[1] * kne[2],
-            knb[1] as usize,
-            0,
-        );
-        let sel_flat = ctx.reshape_1d(sel_idx, n_sel * t);
-        let mut k_g = ctx.get_rows(rows, sel_flat);
-        k_g = ctx.reshape_4d(k_g, kv_lora_rank, n_sel, 1, t);
-        ctx.set_name(k_g, &format!("kv_gathered-{il}"));
+    // build_attn_mha's non-FA branch with the v_mla decompression
+    // (llama-graph.cpp:2670-2727) — the mask is `sel`
+    let q_p = ctx.permute(q_absorbed, 0, 2, 1, 3);
+    let k_p = ctx.permute(k, 0, 2, 1, 3);
+    let kq = ctx.mul_mat(k_p, q_p);
+    let kq = ctx.soft_max_ext(kq, Some(mask), kq_scale, 0.0);
 
-        let q_g = ctx.permute(q_absorbed, 0, 2, 3, 1); // [kv_lora, 1, n_head, T]
+    let v_p = ctx.permute(v, 0, 2, 1, 3);
+    let v_t = ctx.transpose(v_p);
+    let v_c = ctx.cont(v_t);
+    let kqv = ctx.mul_mat(v_c, kq); // [kv_lora, T, H]
 
-        // (ggml_prec_set_acc F32 — the CUDA W4A4 accumulator hint, no CPU
-        // surface, llama-model.cpp's llama_prec_policy GPU-only note)
-        let kq = ctx.mul_mat(k_g, q_g); // [n_sel, 1, n_head, T]
-        let kq = ctx.soft_max_ext(kq, Some(kpool_step.gather_mask), kq_scale, 0.0);
-        ctx.set_name(kq, &format!("kq_soft_max_gathered-{il}"));
+    // "decompress" from MQA back to MHA (:2718-2722)
+    let kqv = ctx.mul_mat(lw.wv_b.expect("wv_b"), kqv); // [v_head, T, H]
+    let out = ctx.permute(kqv, 0, 2, 1, 3);
+    let out = ctx.cont(out);
+    ctx.reshape_2d(out, ctx.ne(kqv)[0] * n_head, t)
 
-        let v_t = ctx.transpose(k_g); // [n_sel, kv_lora, 1, T]
-        let v_t = ctx.cont(v_t);
-        let mut kqv = ctx.mul_mat(v_t, kq); // [kv_lora, 1, n_head, T]
-        kqv = ctx.mul_mat(lw.wv_b.expect("wv_b"), kqv); // [v_head, 1, n_head, T]
-        ctx.set_name(kqv, &format!("kqv_gathered-{il}"));
-
-        let out = ctx.permute(kqv, 0, 2, 1, 3); // [v_head, n_head, 1, T]
-        let out = ctx.cont(out);
-        let out = ctx.reshape_2d(out, ctx.ne(kqv)[0] * n_head, t);
-        out
-    } else {
-        // the scatter selection already includes the causal mask
-        // (:998-1005)
-        let mne = *ctx.ne(kq_mask);
-        let mask = ctx.reshape_4d(sel, mne[0], mne[1], mne[2], mne[3]);
-        ctx.set_name(mask, &format!("kq_mask_dsa-{il}"));
-
-        let k = kv.get_k(ctx, il, kv_lora_rank, 1, n_kv);
-        let kne = *ctx.ne(k);
-        let knb = *ctx.nb(k);
-        let v = ctx.view_4d(
-            k,
-            kv_lora_rank,
-            kne[1],
-            kne[2],
-            kne[3],
-            knb[1] as usize,
-            knb[2] as usize,
-            knb[3] as usize,
-            0,
-        );
-
-        // build_attn_mha's non-FA branch with the v_mla decompression
-        // (llama-graph.cpp:2670-2727) — the mask is `sel`
-        let q_p = ctx.permute(q_absorbed, 0, 2, 1, 3);
-        let k_p = ctx.permute(k, 0, 2, 1, 3);
-        let kq = ctx.mul_mat(k_p, q_p);
-        let kq = ctx.soft_max_ext(kq, Some(mask), kq_scale, 0.0);
-
-        let v_p = ctx.permute(v, 0, 2, 1, 3);
-        let v_t = ctx.transpose(v_p);
-        let v_c = ctx.cont(v_t);
-        let kqv = ctx.mul_mat(v_c, kq); // [kv_lora, T, H]
-
-        // "decompress" from MQA back to MHA (:2718-2722)
-        let kqv = ctx.mul_mat(lw.wv_b.expect("wv_b"), kqv); // [v_head, T, H]
-        let out = ctx.permute(kqv, 0, 2, 1, 3);
-        let out = ctx.cont(out);
-        ctx.reshape_2d(out, ctx.ne(kqv)[0] * n_head, t)
     };
     ctx.set_name(out, &format!("kqv_out-{il}"));
 
@@ -43823,3 +43968,1129 @@ fn build_qwen4exp_attn_layer_qsa(
     ctx.set_name(cur, &format!("attn_output-{il}"));
     cur
 }
+
+// ----------------------------------------------------------------------
+// k2-horizon — src/models/k2-horizon.cpp:119-362 (462524043): dense + MoVA
+// hybrid — the group-RMS norm over n_norm_groups slices, the optional
+// softplus-gated attention output (log2(1 + 2^x)), and the MoVA routed
+// value experts (V = sum_k w_k * silu(W_k x))
+// ----------------------------------------------------------------------
+
+pub struct K2HorizonLayerWeights {
+    pub attn_norm: TensorId,
+    pub wq: TensorId,
+    pub wk: TensorId,
+    /// `blk.%d.attn_q_norm.weight` viewed {n_embd_head_k, n_head} — one norm
+    /// weight per head, stored flat (k2-horizon.cpp:75, TENSOR_ALLOW_RESHAPE)
+    pub attn_q_norm: Option<TensorId>,
+    /// `blk.%d.attn_k_norm.weight` viewed {n_embd_head_k, n_head_kv} (:76)
+    pub attn_k_norm: Option<TensorId>,
+    /// MoVA: the value-expert router gate `blk.%d.attn_v_gate.weight`
+    /// [n_embd, n_value_expert] (:79) — replaces wv on the MoVA layers
+    pub attn_v_gate: Option<TensorId>,
+    /// `blk.%d.attn_v_gate.bias` [n_value_expert] (:80) — steers the top-k
+    /// selection only, never the weights (:154-159)
+    pub attn_v_gate_b: Option<TensorId>,
+    /// `blk.%d.attn_v_exps.weight` [n_embd, n_embd_v_gqa, n_value_expert]
+    /// (:81) — the routed value experts
+    pub attn_v_exps: Option<TensorId>,
+    /// plain value projection [n_embd, n_embd_v_gqa] for the non-MoVA layers
+    /// (:83)
+    pub wv: Option<TensorId>,
+    pub wo: TensorId,
+    pub wo_b: Option<TensorId>,
+    /// `blk.%d.attn_gate.weight` [n_embd, n_embd_head_v*n_head] (:87,
+    /// TENSOR_NOT_REQUIRED) — the softplus output gate; when present the
+    /// o_proj runs after the gating (:275-295)
+    pub wqkv_gate: Option<TensorId>,
+    pub ffn_norm: TensorId,
+    // ---- dense layers: the SwiGLU FFN ----
+    pub ffn_gate: Option<TensorId>,
+    pub ffn_up: Option<TensorId>,
+    pub ffn_down: Option<TensorId>,
+    // ---- MoE layers ----
+    pub ffn_gate_inp: Option<TensorId>,
+    pub ffn_exp_probs_b: Option<TensorId>,
+    pub ffn_gate_exps: Option<TensorId>,
+    pub ffn_up_exps: Option<TensorId>,
+    pub ffn_down_exps: Option<TensorId>,
+    pub ffn_gate_shexp: Option<TensorId>,
+    pub ffn_up_shexp: Option<TensorId>,
+    pub ffn_down_shexp: Option<TensorId>,
+}
+
+pub struct K2HorizonModelWeights {
+    pub tok_embd: TensorId,
+    pub output_norm: TensorId,
+    /// optional lm_head with the tok_embd tie fallback (k2-horizon.cpp:58-62)
+    pub output: TensorId,
+    pub layers: Vec<K2HorizonLayerWeights>,
+}
+
+pub struct K2HorizonParams {
+    pub attn: AttnParams,
+    /// hparams.n_norm_groups — the group-RMS slice count (k2-horizon.cpp:8-10;
+    /// 1 = the plain full-width norm)
+    pub n_norm_groups: i64,
+    pub norm_rms_eps: f32,
+    pub n_layer_dense_lead: u32,
+    pub n_expert: i64,
+    pub n_expert_used: i64,
+    /// hparams.n_value_expert / n_value_expert_used — the MoVA geometry
+    pub n_value_expert: i64,
+    pub n_value_expert_used: i64,
+    pub expert_gating_func: i32,
+    pub expert_weights_norm: bool,
+    pub expert_weights_scale: f32,
+}
+
+/// `k2_horizon_group_rms_norm` (k2-horizon.cpp:124-135) — RMS norm over
+/// `n_groups` equal slices of ne[0], then one full-width weight.
+fn k2_horizon_group_rms_norm(
+    ctx: &mut Context,
+    cur: TensorId,
+    weight: TensorId,
+    n_groups: i64,
+    eps: f32,
+) -> TensorId {
+    let n_embd = ctx.ne(cur)[0];
+    let n_tokens = ctx.ne(cur)[1];
+    assert!(n_groups > 0 && n_embd % n_groups == 0, "k2 group rms norm");
+    let cur = ctx.reshape_3d(cur, n_embd / n_groups, n_groups, n_tokens);
+    let cur = ctx.rms_norm(cur, eps);
+    let cur = ctx.reshape_2d(cur, n_embd, n_tokens);
+    ctx.mul(cur, weight)
+}
+
+/// `llama_model_k2_horizon::graph::build_routed_value`
+/// (k2-horizon.cpp:138-211) — MoVA: route each token to
+/// `n_value_expert_used` value experts, `V = sum_k w_k * silu(W_k x)`.
+fn k2_build_routed_value(
+    ctx: &mut Context,
+    graph: &mut Graph,
+    lw: &K2HorizonLayerWeights,
+    p: &K2HorizonParams,
+    cur: TensorId,
+    n_embd_gqa: i64,
+    il: usize,
+) -> TensorId {
+    let n_embd = ctx.ne(cur)[0];
+    let n_tokens = ctx.ne(cur)[1];
+    let n_values = p.n_value_expert;
+    let n_used = p.n_value_expert_used;
+
+    let logits = crate::adapter::lora_mm(ctx, lw.attn_v_gate.expect("k2 mova gate"), cur);
+    ctx.set_name(logits, &format!("v_moe_logits-{il}")); // cb :180 // cb(logits, "v_moe_logits", il) :180
+
+    // the router gating func (:148-152); the loader forced SIGMOID on NONE
+    // (k2-horizon.cpp:21-23)
+    let probs = match p.expert_gating_func {
+        EXPERT_GATING_SOFTMAX => ctx.soft_max(logits),
+        EXPERT_GATING_SIGMOID => ctx.sigmoid(logits),
+        other => unimplemented!("K2 Horizon value-router gating func {other}"),
+    };
+
+    // the bias only affects which experts are selected, not their weights
+    // (:154-159)
+    let selection_probs = match lw.attn_v_gate_b {
+        Some(b) => {
+            let sp = ctx.add(probs, b);
+            ctx.set_name(sp, &format!("v_moe_probs_biased-{il}")); // cb :158 // cb :158
+            sp
+        }
+        None => probs,
+    };
+
+    let selected_experts = ctx.argsort_top_k(selection_probs, n_used as i32);
+    // cb(selected_experts->src[0], "v_moe_argsort", il) :182 — the argsort
+    // under the top-k view
+    if let Some(arg) = ctx.src(selected_experts)[0] {
+        ctx.set_name(arg, &format!("v_moe_argsort-{il}")); // cb :182
+    }
+    ctx.set_name(selected_experts, &format!("v_moe_topk-{il}")); // cb :183
+
+    // weights of the selected experts (:163-164): rows of the unbiased probs
+    let probs3 = ctx.reshape_3d(probs, 1, n_values, n_tokens);
+    ctx.set_name(probs3, &format!("v_moe_probs-{il}")); // cb :181 (post-reshape)
+    let mut weights = ctx.get_rows(probs3, selected_experts);
+
+    // renormalize the weights to sum 1 (:166-173) — clamp guards the div
+    if p.expert_weights_norm {
+        let w2 = ctx.reshape_2d(weights, n_used, n_tokens);
+        let sum = ctx.sum_rows(w2);
+        let sum = ctx.clamp(sum, 6.103515625e-5, f32::INFINITY);
+        let w2 = ctx.div(w2, sum);
+        weights = ctx.reshape_3d(w2, 1, n_used, n_tokens);
+        ctx.set_name(weights, &format!("v_moe_weights_norm-{il}")); // cb :172 // cb :172
+    }
+
+    // the routed scaling (:175-178)
+    if p.expert_weights_scale != 0.0 && p.expert_weights_scale != 1.0 {
+        weights = ctx.scale(weights, p.expert_weights_scale);
+        ctx.set_name(weights, &format!("v_moe_weights_scaled-{il}")); // cb :177 // cb :177
+    }
+    ctx.set_name(weights, &format!("v_moe_weights-{il}")); // cb :184 // cb :184
+
+    // the selected experts' outputs (:186-189)
+    let cur3 = ctx.reshape_3d(cur, n_embd, 1, n_tokens);
+    let values = crate::adapter::lora_mm_id(
+        ctx,
+        lw.attn_v_exps.expect("k2 mova exps"),
+        cur3,
+        selected_experts,
+    );
+    let values = ctx.silu(values);
+    let values = ctx.mul(values, weights);
+    ctx.set_name(values, &format!("v_moe_weighted-{il}")); // cb :189 // cb :189
+
+    // sum the selected experts (:191-207): 3D views of {n_embd_gqa, 1,
+    // n_tokens} keep the strides of values so the tensor-parallel backend can
+    // follow its split through the views; order the views before the adds so
+    // backends can fuse the sum (ggml_build_forward_expand per view/add)
+    let (nb1, nb2) = {
+        let nb = ctx.nb(values);
+        (nb[1] as usize, nb[2] as usize)
+    };
+    let mut value_views = Vec::with_capacity(n_used as usize);
+    for i in 0..n_used {
+        let v = ctx.view_3d(values, n_embd_gqa, 1, n_tokens, nb1, nb2, i as usize * nb1);
+        graph.build_forward(ctx, v);
+        value_views.push(v);
+    }
+    let mut value_out = value_views[0];
+    for v in &value_views[1..] {
+        value_out = ctx.add(value_out, *v);
+        graph.build_forward(ctx, value_out);
+    }
+    if n_used == 1 {
+        value_out = ctx.cont(value_out);
+    }
+    ctx.set_name(value_out, &format!("Vcur_routed-{il}")); // cb :208
+    value_out
+}
+
+/// verify against src/models/k2-horizon.cpp:213-362 `graph` — the dense/MoVA
+/// pre-norm body with: the group-RMS norms (:241/:306/:352), per-head Q/K
+/// RMS norms before rope (:257-262), the softplus(log2) attention output
+/// gate (:275-295 — `log2(1 + 2^x)`, o_proj after the gate), the MoVA value
+/// routing on the MoVA layers (:250), build_moe_ffn + the optional shared
+/// expert (:309-333) and the YaRN rope pair.
+#[allow(clippy::too_many_arguments)]
+pub fn build_k2_horizon_forward(
+    ctx: &mut Context,
+    w: &K2HorizonModelWeights,
+    p: &K2HorizonParams,
+    kv: &KvCache,
+    inp: &DecodeInputs,
+    _sinfo: SlotInfo,
+    n_kv: u32,
+    n_tokens: usize,
+) -> ForwardResult {
+    let a = &p.attn;
+    let t = n_tokens as i64;
+    let n_layer = w.layers.len();
+    // k2-horizon.cpp:214-215
+    assert_eq!(
+        a.n_embd_head_v, a.n_embd_head_k,
+        "k2-horizon: head_v == head_k"
+    );
+    let n_embd_head = a.n_embd_head_v;
+    let kq_scale = 1.0 / (n_embd_head as f32).sqrt(); // :229
+
+    let mut inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
+    inp_l = crate::adapter::lora_embd(ctx, w.tok_embd, inp_l, inp.tokens);
+    ctx.set_name(inp_l, "embd"); // build_inp_embd's cb(cur, "embd", -1)
+
+    let mut graph = Graph::new(8192);
+
+    for il in 0..n_layer {
+        let lw = &w.layers[il];
+        let inp_sa = inp_l;
+
+        let is_moe_layer = p.n_expert > 0 && il as u32 >= p.n_layer_dense_lead; // :238
+        let is_mova_layer = is_moe_layer && p.n_value_expert > 0; // :239
+
+        let cur = k2_horizon_group_rms_norm(
+            ctx,
+            inp_l,
+            lw.attn_norm,
+            p.n_norm_groups,
+            p.norm_rms_eps,
+        );
+        ctx.set_name(cur, &format!("attn_norm-{il}")); // cb :242
+
+        // self-attention (:245-296)
+        let cur = {
+            let attn_inp = cur; // saved for the output gate (:246)
+
+            let q = crate::adapter::lora_mm(ctx, lw.wq, cur);
+            let k = crate::adapter::lora_mm(ctx, lw.wk, cur);
+            let v = if is_mova_layer {
+                k2_build_routed_value(
+                    ctx,
+                    &mut graph,
+                    lw,
+                    p,
+                    cur,
+                    a.n_embd_head_v * a.n_head_kv,
+                    il,
+                )
+            } else {
+                crate::adapter::lora_mm(ctx, lw.wv.expect("k2 dense wv"), cur)
+            };
+
+            let mut q = ctx.reshape_3d(q, n_embd_head, a.n_head, t);
+            let mut k = ctx.reshape_3d(k, n_embd_head, a.n_head_kv, t);
+            let v = ctx.reshape_3d(v, n_embd_head, a.n_head_kv, t);
+
+            // per-head RMS norm with a separate weight for every head
+            // (:257-262) — the loaded {head_dim, n_head} view norms each
+            // head; build_norm cbs the RMS_NORM node as "norm-{il}" (the
+            // weight mul stays unnamed, llama-graph.cpp:1658)
+            if let Some(qn) = lw.attn_q_norm {
+                let n = ctx.rms_norm(q, p.norm_rms_eps);
+                ctx.set_name(n, &format!("norm-{il}"));
+                q = ctx.mul(n, qn);
+            }
+            if let Some(kn) = lw.attn_k_norm {
+                let n = ctx.rms_norm(k, p.norm_rms_eps);
+                ctx.set_name(n, &format!("norm-{il}"));
+                k = ctx.mul(n, kn);
+            }
+
+            let q = ctx.rope_ext(
+                q,
+                inp.pos,
+                None,
+                a.n_rot as i32,
+                a.rope_mode,
+                a.n_ctx_orig,
+                a.freq_base,
+                a.freq_scale,
+                a.ext_factor,
+                a.attn_factor,
+                a.beta_fast,
+                a.beta_slow,
+            );
+            let k = ctx.rope_ext(
+                k,
+                inp.pos,
+                None,
+                a.n_rot as i32,
+                a.rope_mode,
+                a.n_ctx_orig,
+                a.freq_base,
+                a.freq_scale,
+                a.ext_factor,
+                a.attn_factor,
+                a.beta_fast,
+                a.beta_slow,
+            );
+            ctx.set_name(q, &format!("Qcur-{il}")); // cb :271
+            ctx.set_name(k, &format!("Kcur-{il}")); // cb :272
+            ctx.set_name(v, &format!("Vcur-{il}")); // cb :273
+
+            // with an output gate the o_proj is applied after the gating
+            // (:276-280 — wo passed as nullptr)
+            let gated = lw.wqkv_gate.is_some();
+            let mut cur = attn_kv_cached(
+                ctx,
+                &mut graph,
+                kv,
+                il,
+                a,
+                inp,
+                n_kv,
+                q,
+                k,
+                v,
+                kq_scale,
+                0.0,
+                None,
+                None,
+                if gated { None } else { Some(lw.wo) },
+                lw.wo_b,
+            );
+
+            // k2's own graph cbs nothing on the wo output (:278-280 —
+            // build_attn's wo tail stays unnamed); the shared helper's
+            // "attn_out-{il}" belongs to other archs' files, so clear it
+            ctx.set_name(cur, "");
+
+            if let Some(gate_w) = lw.wqkv_gate {
+                // softplus with beta = ln(2): log2(1 + 2^x) (:283-294)
+                const LN2: f32 = 0.693_147_2;
+                let gate = crate::adapter::lora_mm(ctx, gate_w, attn_inp);
+                let gate = ctx.scale(gate, LN2);
+                let gate = ctx.softplus(gate);
+                let gate = ctx.scale(gate, 1.442_695_040_888_963_4); // 1 / ln(2)
+
+                cur = ctx.mul(cur, gate);
+                cur = crate::adapter::lora_mm(ctx, lw.wo, cur);
+                if let Some(b) = lw.wo_b {
+                    cur = ctx.add(cur, b);
+                }
+            }
+            cur
+        };
+
+        let ffn_inp = ctx.add(cur, inp_sa); // :303
+        ctx.set_name(ffn_inp, &format!("ffn_inp-{il}")); // cb :304
+
+        let cur = k2_horizon_group_rms_norm(
+            ctx,
+            ffn_inp,
+            lw.ffn_norm,
+            p.n_norm_groups,
+            p.norm_rms_eps,
+        );
+        ctx.set_name(cur, &format!("ffn_norm-{il}")); // cb :307
+
+        let cur = if is_moe_layer {
+            // build_moe_ffn + the optional shared expert (:309-333)
+            let n_ff_exp = ctx.ne(lw.ffn_up_exps.expect("k2 moe layer"))[1];
+            let _ = n_ff_exp;
+            let moe_out = build_moe_ffn_silu(
+                ctx,
+                &mut graph,
+                cur,
+                lw.ffn_gate_inp.expect("k2 moe layer"),
+                None,
+                lw.ffn_up_exps.expect("k2 moe layer"),
+                None,
+                lw.ffn_gate_exps,
+                None,
+                lw.ffn_down_exps.expect("k2 moe layer"),
+                None,
+                lw.ffn_exp_probs_b,
+                p.n_expert,
+                p.n_expert_used,
+                p.expert_weights_norm,
+                p.expert_weights_scale,
+                p.expert_gating_func,
+            );
+            if lw.ffn_gate_shexp.is_some() {
+                let ffn_shexp = build_ffn_silu_par(
+                    ctx,
+                    cur,
+                    lw.ffn_gate_shexp.unwrap(),
+                    None,
+                    lw.ffn_up_shexp.unwrap(),
+                    None,
+                    lw.ffn_down_shexp.unwrap(),
+                    None,
+                );
+                ctx.add(moe_out, ffn_shexp)
+            } else {
+                moe_out
+            }
+        } else {
+            build_ffn_silu_par(
+                ctx,
+                cur,
+                lw.ffn_gate.expect("k2 dense layer"),
+                None,
+                lw.ffn_up.expect("k2 dense layer"),
+                None,
+                lw.ffn_down.expect("k2 dense layer"),
+                None,
+            )
+        };
+
+        // build_cvec (:345) — not ported (no-op); residual (:344)
+        ctx.set_name(cur, &format!("ffn_out-{il}")); // cb :342
+        inp_l = ctx.add(cur, ffn_inp);
+        ctx.set_name(inp_l, &format!("l_out-{il}")); // cb :346
+    }
+
+    let cur = k2_horizon_group_rms_norm(
+        ctx,
+        inp_l,
+        w.output_norm,
+        p.n_norm_groups,
+        p.norm_rms_eps,
+    );
+    ctx.set_name(cur, "result_norm"); // cb :353
+    let cur = graph::out_rows(ctx, cur, inp.out_ids);
+    let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output"); // cb :358
+    graph.build_forward(ctx, logits);
+    ForwardResult {
+        logits,
+        graph,
+        embd: Some(cur),
+    }
+}
+
+// ----------------------------------------------------------------------
+// gemma-embedding2 — src/models/gemma-embedding2.cpp:79-234 (4fbc76dec):
+// the text+vision+audio embedding model — the gemma-embedding body (dual
+// post-norms, QK norms, symmetric-SWA no-cache pair) plus the V RMS norm,
+// the per-layer embedding inputs (the model-level projection + the
+// per-layer gate/proj/post-norm), the per-layer out_scale and the final
+// n_embd_out projection
+// ----------------------------------------------------------------------
+
+pub struct GemmaEmbedding2LayerWeights {
+    pub attn_norm: TensorId,
+    pub wq: TensorId,
+    pub wk: TensorId,
+    pub wv: TensorId,
+    pub wo: TensorId,
+    pub attn_q_norm: TensorId,
+    pub attn_k_norm: TensorId,
+    pub attn_post_norm: TensorId,
+    pub ffn_norm: TensorId,
+    pub ffn_gate: TensorId,
+    pub ffn_down: TensorId,
+    pub ffn_up: TensorId,
+    pub ffn_post_norm: TensorId,
+    /// `blk.%d.per_layer_inp_gate.weight` [n_embd, n_embd_per_layer] (:67)
+    pub per_layer_inp_gate: TensorId,
+    /// `blk.%d.per_layer_proj.weight` [n_embd_per_layer, n_embd] (:68)
+    pub per_layer_proj: TensorId,
+    /// `blk.%d.per_layer_post_norm.weight` [n_embd] (:69)
+    pub per_layer_post_norm: TensorId,
+    /// `blk.%d.layer_out_scale.weight` [1] (:71)
+    pub out_scale: TensorId,
+}
+
+pub struct GemmaEmbedding2ModelWeights {
+    pub tok_embd: TensorId,
+    /// `per_layer_model_proj.weight` [n_embd, n_embd_per_layer * n_layer] (:36)
+    pub per_layer_model_proj: TensorId,
+    /// `per_layer_proj_norm.weight` [n_embd_per_layer] (:37)
+    pub per_layer_proj_norm: TensorId,
+    pub output_norm: TensorId,
+    /// the final projection [n_embd, n_embd_out] (:41)
+    pub output: TensorId,
+    pub layers: Vec<GemmaEmbedding2LayerWeights>,
+}
+
+#[derive(Clone)]
+pub struct GemmaEmbedding2Params {
+    /// flat head geometry (EncoderParams-shaped; the loader asserts
+    /// n_embd_head_k == n_embd_head_v and their _swa twins, :27-32)
+    pub n_head: i64,
+    pub n_head_kv: i64,
+    pub n_embd_head: i64,
+    pub norm_rms_eps: f32,
+    /// hparams.n_embd_per_layer
+    pub n_embd_per_layer: i64,
+    /// hparams.f_attention_scale (= 1.0 on this arch — the q_norm makes the
+    /// scaling unnecessary, :8); passed as build_attn's kq_scale (:141)
+    pub f_attention_scale: f32,
+    /// the symmetric-SWA facts (swa layers read the window mask + the *_swa
+    /// rope pair, gemma-embedding.cpp:94-95 semantics carried over)
+    pub is_swa: Vec<bool>,
+    pub freq_base_swa: f32,
+    pub freq_scale_swa: f32,
+    /// the rope pair (rope_type = NEOX, llama-model.cpp:3184)
+    pub rope: EurobertRope,
+}
+
+/// `build_inp_per_layer` (gemma-embedding2.cpp:221-234) — equivalent to
+/// EmbeddingGemma2TextPLE: no per-layer token embeddings, the per-layer
+/// inputs come only from the projection. inpL [n_embd, n_tokens] ->
+/// [n_embd_per_layer, n_tokens, n_layer].
+fn gemma_embedding2_inp_per_layer(
+    ctx: &mut Context,
+    w: &GemmaEmbedding2ModelWeights,
+    p: &GemmaEmbedding2Params,
+    inp_l: TensorId,
+    n_layer: usize,
+) -> TensorId {
+    let n_per = p.n_embd_per_layer;
+    let t = ctx.ne(inp_l)[1];
+    let n_embd = ctx.ne(inp_l)[0];
+
+    let cur = ctx.mul_mat(w.per_layer_model_proj, inp_l); // [n_per*n_layer, T]
+    let cur = ctx.scale(cur, 1.0 / (n_embd as f32).sqrt()); // :225
+    let cur = ctx.reshape_3d(cur, n_per, n_layer as i64, t); // :226
+
+    let cur = build_norm_rms(ctx, cur, w.per_layer_proj_norm, p.norm_rms_eps); // :228
+    ctx.set_name(cur, "inp_per_layer"); // cb(cur, "inp_per_layer", -1) :229
+
+    // permute to [n_embd_per_layer, n_tokens, n_layer] (:232)
+    let cur = ctx.permute(cur, 0, 2, 1, 3);
+    ctx.cont(cur)
+}
+
+/// verify against src/models/gemma-embedding2.cpp:79-234 `graph` — the
+/// gemma-embedding body (non-causal no-cache attention over the
+/// symmetric-SWA mask pair, QK norms then rope, the dual post-norms, the
+/// residual joining the PRE-norm inpL) plus: the **weightless V RMS norm**
+/// (:127), kq_scale = f_attention_scale (:141, no Q pre-scale), the
+/// per-layer embedding input (gate*view -> proj -> post-norm -> residual,
+/// :172-193), the per-layer `out_scale` multiply (:196) and the final
+/// n_embd_out projection (:210). `inpL` is scaled by sqrt(n_embd) — the
+/// token-batch half of build_inp_embd(tok_scale); raw-embedding rows stay
+/// unscaled (the B-side mixed-batch machinery owns that path).
+pub fn build_gemma_embedding2_forward(
+    ctx: &mut Context,
+    w: &GemmaEmbedding2ModelWeights,
+    p: &GemmaEmbedding2Params,
+    inp: &EncodeInputs,
+    n_tokens: usize,
+) -> EncodeResult {
+    let t = n_tokens as i64;
+    let n_layer = w.layers.len();
+    let eps = p.norm_rms_eps;
+    let hd = p.n_embd_head;
+    let mut graph = Graph::new(4096);
+
+    // inpL x sqrt(n_embd) (gemma-embedding2.cpp:86; encode batches carry
+    // tokens — the tts/encode driver shape)
+    let mut inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
+    inp_l = crate::adapter::lora_embd(ctx, w.tok_embd, inp_l, inp.tokens);
+    inp_l = ctx.scale(inp_l, (ctx.ne(w.tok_embd)[0] as f32).sqrt());
+    ctx.set_name(inp_l, "inp_scaled"); // cb(inpL, "inp_scaled", -1) :87
+
+    let swa_mask = inp.kq_mask_swa.expect("gemma-embedding2 needs the swa mask");
+
+    // inp_per_layer [n_embd_per_layer, n_tokens, n_layer] (:97)
+    let inp_per_layer = gemma_embedding2_inp_per_layer(ctx, w, p, inp_l, n_layer);
+    let per_nb = *ctx.nb(inp_per_layer);
+
+    let mut layer_outs = Vec::new();
+    for il in 0..n_layer {
+        let lw = &w.layers[il];
+
+        let (freq_base_l, freq_scale_l) = if p.is_swa[il] {
+            (p.freq_base_swa, p.freq_scale_swa)
+        } else {
+            (p.rope.freq_base, p.rope.freq_scale)
+        };
+
+        // norm (:109)
+        let cur = build_norm_rms(ctx, inp_l, lw.attn_norm, eps);
+        ctx.set_name(cur, &format!("attn_norm-{il}")); // cb :110
+
+        // self-attention (:113-142)
+        let q = crate::adapter::lora_mm(ctx, lw.wq, cur);
+        let k = crate::adapter::lora_mm(ctx, lw.wk, cur);
+        let v = crate::adapter::lora_mm(ctx, lw.wv, cur);
+        let mut q = ctx.reshape_3d(q, hd, p.n_head, t);
+        let mut k = ctx.reshape_3d(k, hd, p.n_head_kv, t);
+        let v = ctx.reshape_3d(v, hd, p.n_head_kv, t);
+
+        q = build_norm_rms(ctx, q, lw.attn_q_norm, eps); // :125
+        k = build_norm_rms(ctx, k, lw.attn_k_norm, eps); // :126
+        let v = ctx.rms_norm(v, eps); // :127 — the weightless V norm
+        ctx.set_name(q, &format!("Qcur_normed-{il}")); // cb :128
+        ctx.set_name(k, &format!("Kcur_normed-{il}")); // cb :129
+        ctx.set_name(v, &format!("Vcur_normed-{il}")); // cb :130
+
+        let r = |ctx: &mut Context, x: TensorId| {
+            ctx.rope_ext(
+                x,
+                inp.pos.unwrap(),
+                None,
+                p.rope.n_rot,
+                p.rope.rope_mode,
+                p.rope.n_ctx_orig,
+                freq_base_l,
+                freq_scale_l,
+                p.rope.ext_factor,
+                p.rope.attn_factor,
+                p.rope.beta_fast,
+                p.rope.beta_slow,
+            )
+        };
+        let q = r(ctx, q);
+        let k = r(ctx, k);
+        ctx.set_name(q, &format!("Qcur_pos-{il}")); // cb :136
+        ctx.set_name(k, &format!("Kcur_pos-{il}")); // cb :137
+
+        // the per-layer mask of the no-cache pair (llama-graph.cpp:2796)
+        let mask = if p.is_swa[il] { swa_mask } else { inp.kq_mask };
+        let cur = attn_no_cache_il(
+            ctx,
+            q,
+            k,
+            v,
+            None,
+            mask,
+            p.f_attention_scale,
+            Some(lw.wo),
+            None,
+            il as i32,
+        );
+
+        // attn_post_norm (:149)
+        let cur = build_norm_rms(ctx, cur, lw.attn_post_norm, eps);
+        ctx.set_name(cur, &format!("attn_post_norm-{il}")); // cb :150
+        let attn_out = ctx.add(cur, inp_l); // :152
+        ctx.set_name(attn_out, &format!("attn_out-{il}")); // cb :153
+
+        // feed-forward (:156-170) — GELU + PAR
+        let cur = build_norm_rms(ctx, attn_out, lw.ffn_norm, eps);
+        ctx.set_name(cur, &format!("ffn_norm-{il}")); // cb :157
+        let cur = build_ffn_gelu_par(ctx, cur, lw.ffn_up, lw.ffn_gate, lw.ffn_down);
+        let cur = build_norm_rms(ctx, cur, lw.ffn_post_norm, eps);
+        ctx.set_name(cur, &format!("ffn_post_norm-{il}")); // cb :168 (il = -1)
+        let cur = ctx.add(cur, attn_out); // :170
+
+        // per-layer embedding (:172-193)
+        let pe_in = cur;
+        ctx.set_name(pe_in, &format!("pe_in-{il}")); // cb :175
+
+        let gate = crate::adapter::lora_mm(ctx, lw.per_layer_inp_gate, cur); // [n_per, T]
+        let gate = ctx.gelu(gate); // :178
+
+        // the layer's slice of inp_per_layer (a [n_per, T] view at il*nb[2])
+        let per_ne = ctx.ne(inp_per_layer);
+        let inp_this = ctx.view_2d(
+            inp_per_layer,
+            per_ne[0],
+            per_ne[1],
+            per_nb[1] as usize,
+            il * per_nb[2] as usize,
+        ); // :180-181
+
+        let cur = ctx.mul(gate, inp_this); // :187
+        let cur = crate::adapter::lora_mm(ctx, lw.per_layer_proj, cur); // :188
+        let cur = build_norm_rms(ctx, cur, lw.per_layer_post_norm, eps); // :189
+        ctx.set_name(cur, &format!("per_layer_embd_out-{il}")); // cb :190
+        let cur = ctx.add(pe_in, cur); // :192
+
+        // layer_scalar (:196) — out_scale is [1]
+        let cur = ctx.mul(cur, lw.out_scale);
+        ctx.set_name(cur, &format!("out_scaled-{il}")); // cb :197
+        // build_cvec (:199) is a no-op returning cur, so the following
+        // cb(cur, "l_out", il) renames the same tensor — the dump carries
+        // "l_out" only
+        ctx.set_name(cur, &format!("l_out-{il}")); // cb :200
+
+        inp_l = cur;
+        layer_outs.push(inp_l);
+    }
+
+    let cur = build_norm_rms(ctx, inp_l, w.output_norm, eps);
+    ctx.set_name(cur, "result_norm"); // cb :207
+    // projecting per token is equivalent to projecting after mean pooling
+    // (:209-210) — the final [n_embd_out, T] embedding
+    let embd = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(embd, "result_embd"); // cb :211
+    graph.build_forward(ctx, embd);
+    EncodeResult {
+        embd,
+        layer_outs,
+        graph,
+    }
+}
+
+// ----------------------------------------------------------------------
+// lfm2 decision (d1 / d1-omni) — src/models/lfm2.cpp:348-583 (88dcc460d +
+// a657f7e98, c35b66744): the non-causal trunk without memory followed by
+// the 3-question-type decision head (choice / score / noul — one token type
+// each). The trunk mixes shortconv (the centered 3-tap conv gated by the
+// neighbor masks, stateless — no rolling conv state on this path) and
+// no-cache attention over the media mask; the head blocks are plain
+// pre-norm LayerNorm blocks with biases, no positional encoding, evaluated
+// once per question type and concatenated into [3, n_out] scores.
+// ----------------------------------------------------------------------
+
+/// one decision-head block (lfm2.cpp:56-79)
+pub struct Lfm2DecisionHeadLayerWeights {
+    pub attn_norm: TensorId,
+    pub attn_norm_b: TensorId,
+    pub wqkv: TensorId,
+    pub wqkv_b: TensorId,
+    pub wo: TensorId,
+    pub wo_b: TensorId,
+    pub ffn_norm: TensorId,
+    pub ffn_norm_b: TensorId,
+    pub ffn_up: TensorId,
+    pub ffn_up_b: TensorId,
+    pub ffn_down: TensorId,
+    pub ffn_down_b: TensorId,
+}
+
+pub struct Lfm2DecisionModelWeights {
+    pub tok_embd: TensorId,
+    /// `token_embd_norm` (OUTPUT_NORM_LFM2) — the trunk's final norm
+    pub output_norm: TensorId,
+    /// `token_types.weight` [n_embd, 3] — one row per question type
+    pub type_embd: TensorId,
+    pub cls_norm: TensorId,
+    pub cls_norm_b: TensorId,
+    pub cls: TensorId,
+    pub cls_b: TensorId,
+    /// `cls.weight` [n_embd, 1] — one score per entry
+    pub cls_out: TensorId,
+    pub cls_out_b: TensorId,
+    /// the trunk blocks (layers[0..n_layer - n_layer_decision])
+    pub trunk_layers: Vec<Lfm2LayerWeights>,
+    pub head_layers: Vec<Lfm2DecisionHeadLayerWeights>,
+}
+
+#[derive(Clone)]
+pub struct Lfm2DecisionParams {
+    /// the trunk facts (lfm2.cpp's graph_decision reads the same hparams
+    /// members the decode graph does)
+    pub n_embd: i64,
+    pub is_recr: Vec<bool>,
+    pub n_shortconv_l_cache: i64,
+    pub norm_rms_eps: f32,
+    /// per-trunk-layer head geometry (hparams.n_head(il) / n_head_kv /
+    /// head dims — build_qkv's reads)
+    pub n_head: Vec<i64>,
+    pub n_head_kv: Vec<i64>,
+    pub n_embd_head: i64,
+    /// the rope pair of the trunk attention layers (rope_type = NEOX)
+    pub rope: EurobertRope,
+    /// the head LayerNorm eps (LLM_KV_ATTENTION_LAYERNORM_EPS)
+    pub f_norm_eps: f32,
+    /// per-head-layer head counts (hparams.n_head(il) of the head blocks)
+    pub head_n_head: Vec<i64>,
+    pub head_n_head_kv: Vec<i64>,
+    pub n_layer_decision: usize,
+}
+
+/// `graph_decision`'s inputs — the two no-cache masks of
+/// `llm_graph_input_attn_media` (enc: the media never reads the text; head:
+/// text and media read their own kind only) and the `llm_graph_input_conv_mask`
+/// neighbor taps (lfm2.cpp:352-394).
+pub struct Lfm2DecisionInputs {
+    pub tokens: TensorId,
+    pub pos: TensorId,
+    /// F32 [n_tokens, n_tokens] — the enc mask (media-aware)
+    pub kq_mask_enc: TensorId,
+    /// F32 [n_tokens, n_tokens] — the head mask (own kind only)
+    pub kq_mask_head: TensorId,
+    /// F32 [1, n_tokens] — 1 where the previous token is the left neighbor
+    /// in the same sequence (the last media entry does not read the text on
+    /// its right)
+    pub conv_left: TensorId,
+    pub conv_right: TensorId,
+    pub out_ids: Option<TensorId>,
+}
+
+/// the d1-omni mask rule (lfm2.cpp:352-356 + set_input :360-384) — the
+/// host-side twin the driver/test fills. `is_media[i]`: an image or audio
+/// prefix entry; text entries are tokens.
+pub fn lfm2_media_mask_rule(is_head: bool, is_media: &[bool], seq: &[u32], n: usize) -> Vec<f32> {
+    let mut m = vec![0.0f32; n * n];
+    for i1 in 0..n {
+        for i0 in 0..n {
+            let mut visible = seq[i0] == seq[i1];
+            if is_head {
+                visible = visible && is_media[i0] == is_media[i1];
+            } else {
+                visible = visible && !(is_media[i1] && !is_media[i0]);
+            }
+            m[i1 * n + i0] = if visible { 0.0 } else { f32::NEG_INFINITY };
+        }
+    }
+    m
+}
+
+/// the d1-omni conv-mask rule (lfm2.cpp:386-401): 1 where the previous
+/// (next) token is the left (right) neighbor in the same sequence; the last
+/// media entry does not read the text on its right.
+pub fn lfm2_conv_mask_rule(
+    is_media: &[bool],
+    seq: &[u32],
+    pos: &[i32],
+    n: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut left = vec![0.0f32; n];
+    let mut right = vec![0.0f32; n];
+    for i in 0..n.saturating_sub(1) {
+        let is_next = seq[i] == seq[i + 1] && pos[i] + 1 == pos[i + 1];
+        right[i] = f32::from(is_next && !(is_media[i] && !is_media[i + 1]));
+        left[i + 1] = f32::from(is_next);
+    }
+    (left, right)
+}
+
+/// the centered 3-tap shortconv of `graph_decision` (lfm2.cpp:428-452) —
+/// `ggml_pad_ext`-padded taps gated by the neighbor masks (the stateless
+/// twin of the decode path's rolling conv state).
+fn lfm2_decision_shortconv(
+    ctx: &mut Context,
+    lw: &Lfm2LayerWeights,
+    conv_left: TensorId,
+    conv_right: TensorId,
+    cur: TensorId,
+    n_embd: i64,
+    t: i64,
+    il: usize,
+) -> TensorId {
+    let es = 4usize; // F32 element size
+    let bcx = crate::adapter::lora_mm(ctx, lw.shortconv_in_proj.expect("lfm2 shortconv"), cur);
+    ctx.set_name(bcx, &format!("model.layers.{{}}.conv.in_proj-{il}"));
+
+    let nb1 = ctx.nb(bcx)[1] as usize;
+    let b = ctx.view_2d(bcx, n_embd, t, nb1, 0);
+    let c = ctx.view_2d(bcx, n_embd, t, nb1, 1 * n_embd as usize * es);
+    let x = ctx.view_2d(bcx, n_embd, t, nb1, 2 * n_embd as usize * es);
+
+    // centred 3-tap conv, a tap outside the sequence reads 0
+    let bx = ctx.mul(b, x);
+    let bxp = ctx.pad_ext(bx, 0, 0, 1, 1, 0, 0, 0, 0);
+    let bxp_nb1 = ctx.nb(bxp)[1] as usize;
+    let prv = ctx.view_2d(bxp, n_embd, t, bxp_nb1, 0);
+    let nxt = ctx.view_2d(bxp, n_embd, t, bxp_nb1, 2 * bxp_nb1);
+
+    // taps = cont(transpose(conv)); conv is [l_cache, n_embd]
+    let conv = lw.shortconv_conv.expect("lfm2 shortconv conv");
+    let tr = ctx.transpose(conv);
+    let taps = ctx.cont(tr);
+    let taps_nb1 = ctx.nb(taps)[1] as usize;
+    let tap0 = ctx.view_1d(taps, n_embd, 0);
+    let tap1 = ctx.view_1d(taps, n_embd, 1 * taps_nb1);
+    let tap2 = ctx.view_1d(taps, n_embd, 2 * taps_nb1);
+
+    let y0 = ctx.mul(bx, tap1);
+    let cl = ctx.reshape_2d(conv_left, 1, t);
+    let cr = ctx.reshape_2d(conv_right, 1, t);
+    let m0 = ctx.mul(prv, tap0);
+    let m0 = ctx.mul(m0, cl);
+    let y = ctx.add(y0, m0);
+    let m2 = ctx.mul(nxt, tap2);
+    let m2 = ctx.mul(m2, cr);
+    let y = ctx.add(y, m2);
+    ctx.set_name(y, &format!("model.layers.{{}}.conv.conv-{il}"));
+
+    let cy = ctx.mul(c, y);
+    let out = crate::adapter::lora_mm(ctx, lw.shortconv_out_proj.expect("lfm2 shortconv"), cy);
+    ctx.set_name(out, &format!("model.layers.{{}}.conv.out_proj-{il}"));
+    out
+}
+
+/// verify against src/models/lfm2.cpp:396-500 `graph_decision::graph_decision`
+/// + :502-583 `build_decision_head` (same as modern-bert's head with the head
+/// layers' own head counts): the no-cache trunk (media-aware mask, shortconv
+/// or rope'd attention), `token_embd_norm`, then the per-question-type head
+/// loop (type-row add, pre-norm LayerNorm blocks with biases, fused-qkv
+/// attention without positional encoding, ReLU FFN, the gelu_erf scorer) —
+/// [3, n_out] scores = `res->t_embd`.
+pub struct Lfm2DecisionResult {
+    /// F32 [3, n_out] — one score row per question type
+    pub scores: TensorId,
+    pub graph: Graph,
+}
+
+pub fn build_lfm2_decision_forward(
+    ctx: &mut Context,
+    w: &Lfm2DecisionModelWeights,
+    p: &Lfm2DecisionParams,
+    inp: &Lfm2DecisionInputs,
+    n_tokens: usize,
+) -> Lfm2DecisionResult {
+    let t = n_tokens as i64;
+    let n_layer_enc = w.trunk_layers.len();
+    let n_embd = p.n_embd;
+    let n_embd_head = p.n_embd_head;
+    // lfm2.cpp:447 — the centered tap formulation needs the 3-row cache
+    assert_eq!(p.n_shortconv_l_cache, 3, "lfm2 decision: l_cache == 3");
+    let mut graph = Graph::new(8192);
+
+    let mut cur = ctx.get_rows(w.tok_embd, inp.tokens);
+    cur = crate::adapter::lora_embd(ctx, w.tok_embd, cur, inp.tokens);
+    ctx.set_name(cur, "model.embed_tokens"); // cb(cur, ..., -1) :399
+
+    let kq_scale = 1.0 / (n_embd_head as f32).sqrt(); // :470/:540
+
+    // the trunk (lfm2.cpp:415-481)
+    for il in 0..n_layer_enc {
+        let lw = &w.trunk_layers[il];
+        let inp_l = cur;
+        cur = build_norm_rms(ctx, cur, lw.attn_norm, p.norm_rms_eps);
+
+        cur = if p.is_recr[il] {
+            lfm2_decision_shortconv(
+                ctx,
+                lw,
+                inp.conv_left,
+                inp.conv_right,
+                cur,
+                n_embd,
+                t,
+                il,
+            )
+        } else {
+            // build_qkv's separate branch + the QK norms + rope
+            let q = crate::adapter::lora_mm(ctx, lw.wq.expect("lfm2 wq"), cur);
+            let k = crate::adapter::lora_mm(ctx, lw.wk.expect("lfm2 wk"), cur);
+            let v = crate::adapter::lora_mm(ctx, lw.wv.expect("lfm2 wv"), cur);
+            let mut q = ctx.reshape_3d(q, n_embd_head, p.n_head[il], t);
+            let mut k = ctx.reshape_3d(k, n_embd_head, p.n_head_kv[il], t);
+            let v = ctx.reshape_3d(v, n_embd_head, p.n_head_kv[il], t);
+
+            q = build_norm_rms(ctx, q, lw.attn_q_norm.expect("lfm2 q_norm"), p.norm_rms_eps);
+            k = build_norm_rms(ctx, k, lw.attn_k_norm.expect("lfm2 k_norm"), p.norm_rms_eps);
+
+            let q = ctx.rope_ext(
+                q,
+                inp.pos,
+                None,
+                p.rope.n_rot,
+                p.rope.rope_mode,
+                p.rope.n_ctx_orig,
+                p.rope.freq_base,
+                p.rope.freq_scale,
+                p.rope.ext_factor,
+                p.rope.attn_factor,
+                p.rope.beta_fast,
+                p.rope.beta_slow,
+            );
+            let k = ctx.rope_ext(
+                k,
+                inp.pos,
+                None,
+                p.rope.n_rot,
+                p.rope.rope_mode,
+                p.rope.n_ctx_orig,
+                p.rope.freq_base,
+                p.rope.freq_scale,
+                p.rope.ext_factor,
+                p.rope.attn_factor,
+                p.rope.beta_fast,
+                p.rope.beta_slow,
+            );
+
+            let out = attn_no_cache_il(
+                ctx,
+                q,
+                k,
+                v,
+                None,
+                inp.kq_mask_enc,
+                kq_scale,
+                lw.wo,
+                None,
+                il as i32,
+            );
+            ctx.set_name(out, &format!("model.layers.{{}}.self_attn.out_proj-{il}"));
+            out
+        };
+
+        cur = ctx.add(cur, inp_l);
+
+        // the trunk FFN is the dense SwiGLU on this path (lfm2.cpp:474-478)
+        let normed = build_norm_rms(ctx, cur, lw.ffn_norm, p.norm_rms_eps);
+        let ffn_out = build_ffn_silu_par(
+            ctx,
+            normed,
+            lw.ffn_gate.expect("lfm2 ffn_gate"),
+            None,
+            lw.ffn_up.expect("lfm2 ffn_up"),
+            None,
+            lw.ffn_down.expect("lfm2 ffn_down"),
+            None,
+        );
+        cur = ctx.add(cur, ffn_out);
+        ctx.set_name(cur, &format!("l_out-{il}")); // cb :480
+    }
+
+    // token_embd_norm (lfm2.cpp:483-484)
+    let cur = build_norm_rms(ctx, cur, w.output_norm, p.norm_rms_eps);
+    ctx.set_name(cur, "result_norm"); // cb :484
+
+    // ---- build_decision_head (lfm2.cpp:502-583) ----
+    // the question type is not a graph input, so the head is evaluated for
+    // each of them
+    let head_n_layer = w.head_layers.len();
+    let type_nb1 = ctx.nb(w.type_embd)[1] as usize;
+    let mut scores: Option<TensorId> = None;
+    for it in 0..3i64 {
+        let type_row = ctx.view_1d(w.type_embd, n_embd, it as usize * type_nb1);
+        let mut inp_l = ctx.add(cur, type_row);
+
+        for (hi, lw) in w.head_layers.iter().enumerate() {
+            let il = n_layer_enc + hi;
+
+            let normed = build_norm(ctx, inp_l, Some(lw.attn_norm), Some(lw.attn_norm_b), p.f_norm_eps);
+            ctx.set_name(normed, &format!("attn_norm-{il}")); // cb :523
+
+            // no positional encoding in the head — the fused-qkv branch of
+            // build_qkv with the head layer's own head counts
+            let n_head_il = p.head_n_head[hi];
+            let n_head_kv_il = p.head_n_head_kv[hi];
+            let mut qkv = crate::adapter::lora_mm(ctx, lw.wqkv, normed);
+            ctx.set_name(qkv, &format!("wqkv-{il}")); // cb :1712
+            qkv = ctx.add(qkv, lw.wqkv_b);
+            ctx.set_name(qkv, &format!("wqkv_b-{il}")); // cb :1716
+            let hd_sz = n_embd_head as usize;
+            let qkv_nb1 = ctx.nb(qkv)[1] as usize;
+            let q = ctx.view_3d(qkv, n_embd_head, n_head_il, t, hd_sz * 4, qkv_nb1, 0);
+            let k = ctx.view_3d(
+                qkv,
+                n_embd_head,
+                n_head_kv_il,
+                t,
+                hd_sz * 4,
+                qkv_nb1,
+                (n_embd_head * n_head_il) as usize * 4,
+            );
+            let v = ctx.view_3d(
+                qkv,
+                n_embd_head,
+                n_head_kv_il,
+                t,
+                hd_sz * 4,
+                qkv_nb1,
+                ((n_embd_head * n_head_il) + (n_embd_head * n_head_kv_il)) as usize * 4,
+            );
+
+            let attn_out = attn_no_cache_il(
+                ctx,
+                q,
+                k,
+                v,
+                None,
+                inp.kq_mask_head,
+                kq_scale,
+                Some(lw.wo),
+                Some(lw.wo_b),
+                il as i32,
+            );
+
+            // the last head block narrows to the output rows (lfm2.cpp:542-546)
+            let mut cur_h = attn_out;
+            if hi == head_n_layer - 1 {
+                if let Some(ids) = inp.out_ids {
+                    cur_h = ctx.get_rows(cur_h, ids);
+                    inp_l = ctx.get_rows(inp_l, ids);
+                }
+            }
+
+            let ffn_inp = ctx.add(cur_h, inp_l);
+            ctx.set_name(ffn_inp, &format!("ffn_inp-{il}")); // cb :548
+
+            let normed =
+                build_norm(ctx, ffn_inp, Some(lw.ffn_norm), Some(lw.ffn_norm_b), p.f_norm_eps);
+            ctx.set_name(normed, &format!("ffn_norm-{il}")); // cb :551
+
+            // build_ffn LLM_FFN_RELU + LLM_FFN_SEQ: up(+b) -> relu -> down(+b)
+            let mut up = crate::adapter::lora_mm(ctx, lw.ffn_up, normed);
+            up = ctx.add(up, lw.ffn_up_b);
+            let up = ctx.relu(up);
+            let mut down = crate::adapter::lora_mm(ctx, lw.ffn_down, up);
+            down = ctx.add(down, lw.ffn_down_b);
+
+            inp_l = ctx.add(down, ffn_inp);
+        }
+
+        // the scorer (lfm2.cpp:571-578): LN -> cls(+b) -> gelu_erf -> cls_out(+b)
+        let normed = build_norm(ctx, inp_l, Some(w.cls_norm), Some(w.cls_norm_b), p.f_norm_eps);
+        let mut hidden = crate::adapter::lora_mm(ctx, w.cls, normed);
+        hidden = ctx.add(hidden, w.cls_b);
+        let hidden = ctx.gelu_erf(hidden);
+        let mut s = crate::adapter::lora_mm(ctx, w.cls_out, hidden);
+        s = ctx.add(s, w.cls_out_b);
+
+        scores = Some(match scores {
+            None => s,
+            Some(prev) => ctx.concat(prev, s, 0),
+        });
+    }
+    let scores = scores.unwrap();
+    ctx.set_name(scores, "decision_scores"); // cb :580
+    graph.build_forward(ctx, scores);
+    Lfm2DecisionResult { scores, graph }
+}
+

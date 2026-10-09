@@ -81,6 +81,182 @@ pub struct DecodeInputs {
     pub out_ids: Option<TensorId>,
 }
 
+/// The mixed-batch input bundle of `llm_graph_input_embd` (0bb496dbd,
+/// llama-graph.h:139-142 + llama-graph.cpp:2510-2533) — the per-step tensors
+/// `llm_graph_input_embd::set_input` fills for a type-marked ubatch
+/// (llama-graph.cpp:87-104). Owned by the context step layer (the
+/// `mtp_h_input` pattern) and passed to [`build_inp_embd`] by the builder.
+#[derive(Clone, Debug)]
+pub struct InpMixed {
+    /// `mixed_tokens` — I32 [n_tok_rows]: the ids of the token rows
+    pub tokens: TensorId,
+    /// `mixed_slots` — I64 [n_tok_rows]: the batch index of each token row
+    pub slots: TensorId,
+    /// `mixed_embd` — F32 [n_embd, n_tokens]: the embd rows; the token rows'
+    /// bytes are placeholders (overwritten by the set_rows)
+    pub embd: TensorId,
+    /// the ubatch's `type` array ([n_tokens], 0 = token / 1 = embd) — kept
+    /// beside the tensors so [`build_inp_embd`] can fill the per-row
+    /// `scale_rows` (the C fills it in set_input, llama-graph.cpp:106-115)
+    pub type_: Vec<i8>,
+}
+
+/// `llm_graph_n_tok_rows` (llama-graph.cpp:117-127, 0bb496dbd) — number of
+/// token rows of the mixed path; a non-mixed ubatch is sized for the worst
+/// case (all rows).
+pub fn graph_n_tok_rows(ubatch: &crate::batch::LlamaUbatch) -> usize {
+    if !ubatch.is_mixed() {
+        return ubatch.n_tokens as usize;
+    }
+    ubatch.type_.iter().filter(|&&t| t == 0).count()
+}
+
+/// `llm_graph_context::crop_before_nextn` (f0c41e016, llama-graph.h:1060-
+/// 1063) — true when the last layer must be narrowed to the output rows
+/// *before* the nextn hidden state is captured. Shared by the nextn-capable
+/// builders (the A-domain graphs read it through here; the C's method reads
+/// `cparams.embeddings_nextn(_masked)`, the port passes the two flags).
+pub fn crop_before_nextn(
+    inp_out_ids: Option<TensorId>,
+    embeddings_nextn: bool,
+    embeddings_nextn_masked: bool,
+) -> bool {
+    inp_out_ids.is_some() && (!embeddings_nextn || embeddings_nextn_masked)
+}
+
+/// `llm_graph_context::crop_after_nextn` (f0c41e016, llama-graph.h:1065-
+/// 1068) — true when the nextn hidden state must be narrowed to the output
+/// rows *after* it is captured.
+pub fn crop_after_nextn(
+    inp_out_ids: Option<TensorId>,
+    embeddings_nextn: bool,
+    embeddings_nextn_masked: bool,
+) -> bool {
+    inp_out_ids.is_some() && embeddings_nextn && !embeddings_nextn_masked
+}
+
+/// The hparams inputs of [`build_inp_embd`]'s scale rules — the C reads
+/// them off `hparams` inside the method (llama-graph.cpp:2553-2570).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InpEmbdScale {
+    /// `hparams.f_embedding_scale` (the Granite / deepstack scaling)
+    pub f_embedding_scale: f32,
+    /// `hparams.n_deepstack_layers`
+    pub n_deepstack_layers: u32,
+    /// `hparams.n_embd_inp()` — the width of the graph's embedding input;
+    /// `!= n_embd` pads the gathered rows (llama-graph.cpp:2499-2501)
+    pub n_embd_inp: i64,
+}
+
+/// `llm_graph_context::build_inp_embd` (llama-graph.cpp:2461-2580 @c35b66744,
+/// 0bb496dbd) — the shared embedding-input builder: token rows through
+/// `get_rows(tok_embd, tokens)` (+ lora + pad), raw embd rows through the
+/// input tensor, mixed batches through `set_rows(dup(mixed_embd),
+/// build_tok(mixed_tokens), mixed_slots)`.
+///
+/// The C keeps all arms in the graph and `ggml_build_forward_select` picks
+/// one (`idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1`, :2536); the
+/// port knows the batch kind when the step tensors are created, so
+/// `mixed.is_some()` selects the mixed arm here and its absence keeps the
+/// token arm — the embd-only batches ride the caller's materialized-row
+/// swap (`DecodeContext::decode_embd`'s `set_tok_embd`, whose identity
+/// gather is value-identical to the raw embd arm for a plain trunk,
+/// context.rs:4612-4619).
+///
+/// `tok_scale` (llama-graph.h:1201-1202, default 1.0f in C): applied to
+/// token rows only — gemma3/gemma3n/gemma4/gemma-embedding(2) pass
+/// `sqrtf(n_embd)` (the A-domain gemma builders keep their inline twin for
+/// their token-only graphs; both are value-identical on token batches).
+pub fn build_inp_embd(
+    ctx: &mut Context,
+    tok_embd: TensorId,
+    tokens: TensorId,
+    mixed: Option<&InpMixed>,
+    tok_scale: f32,
+    scale: InpEmbdScale,
+) -> TensorId {
+    let n_embd = ctx.ne(tok_embd)[0];
+
+    // token embeddings with lora and padding — the C's `build_tok` lambda
+    // (llama-graph.cpp:2477-2503)
+    fn build_tok(
+        ctx: &mut Context,
+        tok_embd: TensorId,
+        ids: TensorId,
+        n_embd: i64,
+        n_embd_inp: i64,
+    ) -> TensorId {
+        let cur = ctx.get_rows(tok_embd, ids);
+        // apply lora for embedding tokens if needed (:2483-2497)
+        let cur = crate::adapter::lora_embd(ctx, tok_embd, cur, ids);
+        if n_embd_inp != n_embd {
+            ctx.pad(cur, (n_embd_inp - n_embd) as i32, 0, 0, 0)
+        } else {
+            cur
+        }
+    }
+
+    // select one of the 3 inputs, based on the batch contents (:2505-2537)
+    let mut cur = match mixed {
+        // mixed path: set_rows the token rows into a copy of the embd rows,
+        // with its own inputs (select branches must not share tensors)
+        Some(m) => {
+            let tok_rows = build_tok(ctx, tok_embd, m.tokens, n_embd, scale.n_embd_inp);
+            // note: set_rows writes into its destination, so it gets a copy
+            // of the input (:2533)
+            let dst = ctx.dup(m.embd);
+            ctx.set_rows(dst, tok_rows, m.slots)
+        }
+        // token embeddings path (ubatch.token != nullptr); the embd-only
+        // twin reaches it through the materialized-row swap (see doc)
+        None => build_tok(ctx, tok_embd, tokens, n_embd, scale.n_embd_inp),
+    };
+
+    // NOTE: For deepstack models, only apply scale to token inputs (ie
+    // text-only input). Raw embeddings are assumed to be multimodal inputs
+    // that should not be scaled. (llama-graph.cpp:2553-2554)
+    let scale_tok_only = scale.f_embedding_scale != 0.0 && scale.n_deepstack_layers > 0;
+
+    // For Granite architecture (:2556-2561)
+    if scale.f_embedding_scale != 0.0 && !scale_tok_only {
+        cur = ctx.scale(cur, scale.f_embedding_scale);
+    }
+
+    // scale the token rows only, applied after the select so that the graph
+    // is the same for any batch contents (:2563-2570)
+    let scale_tok = tok_scale * if scale_tok_only {
+        scale.f_embedding_scale
+    } else {
+        1.0
+    };
+    if scale_tok != 1.0 {
+        match mixed {
+            // per-row: F32 [1, n_tokens], `scale_tok` on token rows and 1.0
+            // on embd rows (`llm_graph_input_embd::set_input`, :106-115:
+            // `is_embd = !ubatch->token || (ubatch->is_mixed() &&
+            // ubatch->type[i])` — a mixed ubatch has tokens, so the type
+            // array decides)
+            Some(m) => {
+                let n = m.type_.len() as i64;
+                let rows = ctx.new_tensor_2d(GgmlType::F32, 1, n);
+                ctx.arena_resize_tensor(rows);
+                ctx.with_f32_mut(rows, |p| {
+                    for (i, v) in p.iter_mut().enumerate() {
+                        *v = if m.type_[i] != 0 { 1.0 } else { scale_tok };
+                    }
+                })
+                .unwrap();
+                cur = ctx.mul(cur, rows);
+            }
+            // uniform rows — a plain scale is value-identical to the C's
+            // per-row mul (every row carries the same scale_tok)
+            None => cur = ctx.scale(cur, scale_tok),
+        }
+    }
+
+    cur
+}
+
 /// The `ggml_get_rows(ctx0, cur, inp_out_ids)` every arch graph applies to the
 /// post-output-norm hidden state before its lm_head (`build_lora_mm`/
 /// `ggml_mul_mat` on the gathered rows): gemma4.cpp:416-417,
@@ -121,12 +297,14 @@ pub struct ForwardResult {
 
 /// build_inp_embd + per-layer loop + lm_head, verify against src/models/qwen2.cpp graph()
 /// and the non-FA branch of llama-graph.cpp build_attn_mha
+#[allow(clippy::too_many_arguments)]
 pub fn build_qwen2_forward(
     ctx: &mut Context,
     w: &ModelWeights,
     p: &AttnParams,
     kv: &KvCache,
     inp: &DecodeInputs,
+    mixed: Option<&InpMixed>,
     sinfo: SlotInfo,
     n_kv: u32,
     n_tokens: usize,
@@ -145,11 +323,23 @@ pub fn build_qwen2_forward(
     // must be expanded explicitly or the cache never gets written.
     let mut graph = Graph::new(1024);
 
-    // inpL = embd lookup [n_embd, T]
-    // (`build_inp_embd`, llama-graph.cpp:2387 — the lora delta of :2389-2405
-    // is added on top of the gathered rows)
-    let inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
-    let mut inp_l = crate::adapter::lora_embd(ctx, w.tok_embd, inp_l, inp.tokens);
+    // inpL = embd lookup [n_embd, T] — `build_inp_embd(tok_embd)` with the
+    // default tok_scale (llama-graph.cpp:2461, 0bb496dbd): the token arm is
+    // get_rows + lora (qwen2 has no f_embedding_scale, no n_embd_inp pad, so
+    // the op sequence is the pre-refactor inline); a type-marked ubatch
+    // routes through the mixed set_rows arm
+    let n_embd = ctx.ne(w.tok_embd)[0];
+    let mut inp_l = build_inp_embd(
+        ctx,
+        w.tok_embd,
+        inp.tokens,
+        mixed,
+        1.0,
+        InpEmbdScale {
+            n_embd_inp: n_embd,
+            ..Default::default()
+        },
+    );
 
     for il in 0..n_layer {
         let lw = &w.layers[il];

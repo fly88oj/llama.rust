@@ -16,6 +16,17 @@
 //!   ggml-alloc.c:108-380        — `ggml_dyn_tallocr` (free-block allocator)
 //!   ggml-alloc.c:394-1100       — `ggml_gallocr` (measure/reserve/alloc)
 //!
+//! Sync increment a7b94df2c -> c35b66744 (6753a033f "refactor selective
+//! expert copying to user code"): the scheduler-side selective expert copy
+//! was deleted, input copying was extracted into
+//! `ggml_backend_sched_copy_input` (ggml-backend.cpp:1811-1842 @c35b66744)
+//! behind the `ggml_backend_sched_is_host_weight` predicate (1805-1809),
+//! split inputs are now copied in two passes — non-host-weights first, then
+//! host weights — so the new `ggml_backend_sched_copy_callback`
+//! (ggml-backend.h:317-327, set via `ggml_backend_sched_set_copy_callback`,
+//! ggml-backend.cpp:2140-2143) sees the split's non-weight inputs already
+//! copied; the public sched API now ends at ggml-backend.cpp:2146.
+//!
 //! Adaptations forced by the port's tensor model (see backend.rs header):
 //!   * the C pointer hash set (`hash_id(tensor)`) is a `HashMap<TensorId, _>`
 //!     — TensorId is the port's stable tensor identity;
@@ -770,6 +781,26 @@ struct SchedSplit {
 /// the graph compute.
 pub type SchedEvalCallback = Box<dyn Fn(&Context, TensorId, bool) -> bool + Send>;
 
+/// `ggml_backend_sched_copy_callback` (ggml-backend.h:317-327 @c35b66744,
+/// added by 6753a033f) — callback while copying input weights of a split:
+///   * if the user returns false the scheduler simply copies the entire
+///     weight;
+///   * the callback is called only for input weights in host buffers;
+///   * the callback is called after all non-weight inputs of the split have
+///     been copied;
+///   * `src` is the tensor in the previous split, `dst` is the copy of `src`
+///     in the split, `graph` is the compute graph nodes of the split.
+///
+/// Adaptations (the SchedEvalCallback precedent): the C `user_data` pointer
+/// is captured by the closure, and the `ggml_backend_t`/`ggml_cgraph *`
+/// arguments become `&BackendRef` / `&[TensorId]` (the port's split graph
+/// snapshot). `ctx` is passed mutable so user code can write `dst` through
+/// `backend_tensor_set` — the C callback gets raw pointers and can do the
+/// same.
+pub type SchedCopyCallback = Box<
+    dyn Fn(&BackendRef, &mut Context, TensorId, TensorId, &[TensorId]) -> bool + Send,
+>;
+
 /// `struct ggml_backend_sched` (ggml-backend.cpp:786-841)
 pub struct BackendSched {
     /// true if the scheduler has been reset since the last graph split
@@ -806,6 +837,10 @@ pub struct BackendSched {
     graph_inputs: Vec<TensorId>,
 
     callback_eval: Option<SchedEvalCallback>,
+
+    /// `callback_copy` + `callback_copy_user_data` (ggml-backend.cpp:969-970
+    /// @c35b66744) — the user_data is captured by the closure
+    callback_copy: Option<SchedCopyCallback>,
 
     op_offload: bool,
 
@@ -1588,7 +1623,85 @@ fn backend_sched_alloc_splits(sched: &mut BackendSched, ctx: &mut Context) -> bo
     true
 }
 
-/// `ggml_backend_sched_compute_splits` (ggml-backend.cpp:1646-1846) — the
+/// `ggml_backend_sched_is_host_weight` (ggml-backend.cpp:1805-1809 @c35b66744,
+/// added by 6753a033f) — a tensor living in a host buffer with USAGE_WEIGHTS.
+fn sched_is_host_weight(ctx: &Context, t: TensorId) -> bool {
+    tensor_buffer(ctx, t).is_some_and(|b| {
+        backend_buffer_get_usage(&b) == BackendBufferUsage::Weights && backend_buffer_is_host(&b)
+    })
+}
+
+/// `ggml_backend_sched_copy_input` (ggml-backend.cpp:1811-1842 @c35b66744,
+/// extracted from the compute_splits loop by 6753a033f): copy one split input
+/// to the split's backend — user inputs immediately (event-sync then copy),
+/// everything else after waiting on the split backend's event; a host-weight
+/// input is first offered to the copy callback (a `true` return means the
+/// user already did the copy); the async-copy attempt falls back to a sync
+/// copy when the backend has no `cpy_tensor_async` or it declines.
+fn sched_copy_input(sched: &BackendSched, ctx: &mut Context, split_id: usize, input: TensorId) {
+    let split_backend_id = sched.splits[split_id].backend_id;
+    let split_backend = sched.backends[split_backend_id].clone();
+    let input_backend = backend_sched_get_tensor_backend(sched, input)
+        .expect("split input must have an assigned backend");
+    let input_cpy = tensor_copy_of(sched, input, split_backend_id, sched.cur_copy).unwrap();
+
+    if ctx.tensors[input.0 as usize].flags & GGML_TENSOR_FLAG_INPUT != 0 {
+        // inputs from the user must be copied immediately to prevent the user
+        // overwriting the data before the copy is done
+        if let Some(event) = &sched.events[split_backend_id][sched.cur_copy] {
+            backend_event_synchronize(event);
+        } else {
+            backend_synchronize(&split_backend);
+        }
+        backend_tensor_copy(ctx, input, input_cpy);
+        return;
+    }
+
+    // wait for the split backend to finish using the input before
+    // overwriting it
+    if let Some(event) = &sched.events[split_backend_id][sched.cur_copy] {
+        backend_event_wait(&split_backend, event);
+    } else {
+        backend_synchronize(&split_backend);
+    }
+
+    // offer host weights to the copy callback — `true` means the user
+    // performed the (possibly partial) copy
+    // (ggml-backend.cpp:1835-1838)
+    if let Some(callback) = &sched.callback_copy {
+        if sched_is_host_weight(ctx, input)
+            && callback(
+                &split_backend,
+                ctx,
+                input,
+                input_cpy,
+                &sched.splits[split_id].nodes,
+            )
+        {
+            return;
+        }
+    }
+
+    // try async copy, but if not possible, we can still use a sync copy
+    // without synchronizing the dst backend, since we handle the
+    // synchronization here with multiple copies and events
+    // (ggml-backend.cpp:1838-1842)
+    let mut done = false;
+    if let Some(cpy) = split_backend.iface.cpy_tensor_async {
+        done = cpy(&input_backend, &split_backend, ctx, input, input_cpy);
+    }
+    if !done {
+        backend_synchronize(&input_backend);
+        if let Some(event) = &sched.events[split_backend_id][sched.cur_copy] {
+            backend_event_synchronize(event);
+        } else {
+            backend_synchronize(&split_backend);
+        }
+        backend_tensor_copy(ctx, input, input_cpy);
+    }
+}
+
+/// `ggml_backend_sched_compute_splits` (ggml-backend.cpp:1848-1949) — the
 /// run pipeline: per split, copy the inputs, compute, record the event.
 fn backend_sched_compute_splits(sched: &BackendSched, ctx: &mut Context) -> GgmlStatus {
     let mut prev_backend_id: i32 = -1;
@@ -1611,61 +1724,22 @@ fn backend_sched_compute_splits(sched: &BackendSched, ctx: &mut Context) -> Ggml
             }
         }
 
-        // copy the input tensors to the split backend
+        // copy the input tensors to the split backend — the weights in host
+        // memory are copied last, so that the copy callback can read the
+        // other inputs of the split (ggml-backend.cpp:1871-1885 @c35b66744;
+        // the two-pass non-weights-then-host-weights order was introduced by
+        // 6753a033f together with the removal of the scheduler-side
+        // selective-expert-copy special case below)
         for input_id in 0..sched.splits[split_id].inputs.len() {
             let input = sched.splits[split_id].inputs[input_id];
-            let input_backend_id = sched.hv_tensor_backend_ids.get(&input).copied().unwrap_or(-1);
-            let input_backend = sched.backends[input_backend_id.max(0) as usize].clone();
-            let input_cpy = tensor_copy_of(sched, input, split_backend_id, sched.cur_copy).unwrap();
-
-            if ctx.tensors[input.0 as usize].flags & GGML_TENSOR_FLAG_INPUT != 0 {
-                // inputs from the user must be copied immediately to prevent
-                // the user overwriting the data before the copy is done
-                if let Some(event) = &sched.events[split_backend_id][sched.cur_copy] {
-                    backend_event_synchronize(event);
-                } else {
-                    backend_synchronize(&split_backend);
-                }
-                backend_tensor_copy(ctx, input, input_cpy);
-            } else {
-                // wait for the split backend to finish using the input before
-                // overwriting it
-                if let Some(event) = &sched.events[split_backend_id][sched.cur_copy] {
-                    backend_event_wait(&split_backend, event);
-                } else {
-                    backend_synchronize(&split_backend);
-                }
-
-                // when offloading MoE weights, only the used experts need to
-                // be copied (ggml-backend.cpp:1693-1781)
-                let first_node = sched.splits[split_id].nodes.first().copied();
-                let is_moe_weight = first_node.is_some_and(|n| {
-                    ctx.op(n) == GgmlOp::MulMatId
-                        && ctx.tensors[n.0 as usize].src[0] == Some(input_cpy)
-                        && tensor_buffer(ctx, input).is_some_and(|b| {
-                            backend_buffer_get_usage(&b) == BackendBufferUsage::Weights
-                                && backend_buffer_is_host(&b)
-                        })
-                });
-                if is_moe_weight {
-                    moe_copy_used_experts(sched, ctx, split_id, input_id, &input_backend);
-                } else {
-                    // try async copy; fall back to sync without synchronizing
-                    // the dst backend (handled here with copies and events)
-                    let mut done = false;
-                    if let Some(cpy) = split_backend.iface.cpy_tensor_async {
-                        done = cpy(&input_backend, &split_backend, ctx, input, input_cpy);
-                    }
-                    if !done {
-                        backend_synchronize(&input_backend);
-                        if let Some(event) = &sched.events[split_backend_id][sched.cur_copy] {
-                            backend_event_synchronize(event);
-                        } else {
-                            backend_synchronize(&split_backend);
-                        }
-                        backend_tensor_copy(ctx, input, input_cpy);
-                    }
-                }
+            if !sched_is_host_weight(ctx, input) {
+                sched_copy_input(sched, ctx, split_id, input);
+            }
+        }
+        for input_id in 0..sched.splits[split_id].inputs.len() {
+            let input = sched.splits[split_id].inputs[input_id];
+            if sched_is_host_weight(ctx, input) {
+                sched_copy_input(sched, ctx, split_id, input);
             }
         }
 
@@ -1720,111 +1794,15 @@ fn backend_sched_compute_splits(sched: &BackendSched, ctx: &mut Context) -> Ggml
     GgmlStatus::Success
 }
 
-/// [GGML_SCHED_MOE] the expert-grouped weight copy of
-/// ggml-backend.cpp:1693-1781: when offloading MoE weights, copy only the
-/// experts the split's MUL_MAT_ID actually uses, grouping consecutive
-/// experts, plus up to 512B of padding so the last expert's tail has no NaNs
-/// (needed by MMQ in the CUDA backend).
-fn moe_copy_used_experts(sched: &BackendSched, ctx: &mut Context, split_id: usize, input_id: usize, input_backend: &BackendRef) {
-    let input = sched.splits[split_id].inputs[input_id];
-    let split_backend_id = sched.splits[split_id].backend_id;
-    let input_cpy = tensor_copy_of(sched, input, split_backend_id, sched.cur_copy).unwrap();
-    let node = sched.splits[split_id].nodes[0];
-
-    // MUL_MAT_ID: experts are src[2] of ne[2]
-    let n_expert = ctx.tensors[input.0 as usize].ne[2] as usize;
-    let expert_size = ctx.tensors[input.0 as usize].nb[2] as usize;
-
-    backend_synchronize(input_backend);
-
-    // get the ids
-    let mut ids_tensor = ctx.tensors[node.0 as usize].src[2].expect("MUL_MAT_ID without ids");
-    let mut ids_backend = sched.backends[split_backend_id].clone();
-
-    if ctx.tensors[ids_tensor.0 as usize].ne.iter().product::<i64>() == 0 {
-        return;
-    }
-
-    // if the ids tensor is also an input of the split it may not have been
-    // copied yet — use the original ids tensor
-    for i in input_id + 1..sched.splits[split_id].inputs.len() {
-        let other = sched.splits[split_id].inputs[i];
-        if let Some(cpy) = tensor_copy_of(sched, other, split_backend_id, sched.cur_copy) {
-            if ids_tensor == cpy {
-                ids_tensor = other;
-                ids_backend = sched
-                    .backends
-                    .get(sched.hv_tensor_backend_ids.get(&other).copied().unwrap_or(-1).max(0) as usize)
-                    .cloned()
-                    .unwrap_or(ids_backend);
-                break;
-            }
-        }
-    }
-
-    // read the ids (ggml_bitset over the used expert indices)
-    let nbytes = ctx.nbytes(ids_tensor);
-    let mut ids = vec![0i32; nbytes / 4];
-    {
-        let bytes = bytemuck::cast_slice_mut::<i32, u8>(&mut ids);
-        backend_tensor_get_async(&ids_backend, ctx, ids_tensor, bytes, 0);
-    }
-    backend_synchronize(&ids_backend);
-
-    let bitset_size = (n_expert + 31) / 32;
-    let mut used_ids = vec![0u32; bitset_size];
-    let (ne0, ne1, nb0, nb1) = {
-        let t = &ctx.tensors[ids_tensor.0 as usize];
-        (t.ne[0] as usize, t.ne[1] as usize, t.nb[0] as usize, t.nb[1] as usize)
-    };
-    for i1 in 0..ne1 {
-        for i0 in 0..ne0 {
-            let id = ids[i1 * (nb1 / 4) + i0 * (nb0 / 4)];
-            assert!((0..n_expert as i32).contains(&id), "expert id out of range");
-            used_ids[(id / 32) as usize] |= 1u32 << (id % 32);
-        }
-    }
-
-    // group consecutive experts and copy them together
-    let copy_experts = |ctx: &mut Context, first_id: usize, last_id: usize| {
-        let expert_offset = first_id * expert_size;
-        let expert_size_copy = (last_id - first_id + 1) * expert_size;
-        let padding = expert_size.min(512);
-        let padding_end = if last_id < n_expert - 1 { padding } else { 0 };
-
-        let src_bytes = ctx.data_bytes(input).expect("tensor not allocated")
-            [expert_offset..expert_offset + expert_size_copy + padding_end]
-            .to_vec();
-        backend_tensor_set(ctx, input_cpy, &src_bytes, expert_offset);
-    };
-
-    let get = |used: &[u32], i: usize| -> bool { used[i / 32] & (1u32 << (i % 32)) != 0 };
-
-    let mut id = 0;
-    while !get(&used_ids, id) {
-        id += 1;
-    }
-    let mut first_id = id;
-    let mut last_id = first_id;
-
-    id += 1;
-    while id < n_expert {
-        if !get(&used_ids, id) {
-            id += 1;
-            continue;
-        }
-        if id == last_id + 1 {
-            last_id = id;
-            id += 1;
-            continue;
-        }
-        copy_experts(ctx, first_id, last_id);
-        first_id = id;
-        last_id = id;
-        id += 1;
-    }
-    copy_experts(ctx, first_id, last_id);
-}
+// [GGML_SCHED_MOE] removed by upstream 6753a033f ("refactor selective expert
+// copying to user code"): the scheduler-side special case that copied only
+// the experts a split's MUL_MAT_ID actually used (the old
+// ggml-backend.cpp:1693-1781 `moe_copy_used_experts` + its `is_moe_weight`
+// gate in compute_splits) was deleted from the C source and is deleted here
+// with it. Selective expert copying is now the application's job, done
+// through `ggml_backend_sched_set_copy_callback` — the two-pass input copy
+// (non-host-weights first, then host weights) guarantees the callback sees
+// all non-weight inputs of the split (e.g. the expert ids) already copied.
 
 impl BackendSched {
     /// `ggml_backend_sched_new` (ggml-backend.cpp:1848-1918) — backends with
@@ -1891,6 +1869,7 @@ impl BackendSched {
             events,
             graph_inputs: Vec::new(),
             callback_eval: None,
+            callback_copy: None,
             op_offload,
             debug,
             sched_tensor_range: None,
@@ -2021,6 +2000,14 @@ pub fn backend_sched_synchronize(sched: &mut BackendSched) {
 /// `ggml_backend_sched_set_eval_callback` (ggml-backend.cpp:2045-2049)
 pub fn backend_sched_set_eval_callback(sched: &mut BackendSched, callback: SchedEvalCallback) {
     sched.callback_eval = Some(callback);
+}
+
+/// `ggml_backend_sched_set_copy_callback` (ggml-backend.cpp:2140-2143
+/// @c35b66744, added by 6753a033f) — set a callback to be called when the
+/// input weights of a split are being copied. (The C `user_data` is carried
+/// by the closure.)
+pub fn backend_sched_set_copy_callback(sched: &mut BackendSched, callback: SchedCopyCallback) {
+    sched.callback_copy = Some(callback);
 }
 
 /// `ggml_backend_sched_get_n_splits` (ggml-backend.cpp:2051)
@@ -2469,6 +2456,185 @@ mod tests {
             ctx_d.data_bytes(n2_d).unwrap(),
             "split graph output must be bit-identical to direct compute"
         );
+    }
+
+    /// copy callback (6753a033f, ggml-backend.h:317-327 @c35b66744) — single
+    /// backend: the callback is called only for input weights in host buffers
+    /// crossing a split, so a CPU-only graph (one backend, no split copies)
+    /// must never trigger it.
+    #[test]
+    fn sched_copy_callback_single_backend_not_called() {
+        let mut ctx = Context::new();
+        let out = build_toy(&mut ctx);
+        let mut g = Graph::new(16);
+        g.build_forward(&ctx, out);
+
+        let called = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut sched = backend_sched_new(&[cpu_backend_init()], None, 64, false, true);
+        {
+            let called = called.clone();
+            backend_sched_set_copy_callback(&mut sched, Box::new(move |_b, _ctx, src, _dst, _graph| {
+                called.lock().unwrap().push(format!("cb:{}", _ctx.tensors[src.0 as usize].name));
+                // returning true would skip the scheduler's own copy — were
+                // the callback wrongly invoked, the bit-identity check below
+                // would catch the skipped copy too
+                true
+            }));
+        }
+        let st = backend_sched_graph_compute(&mut sched, &mut ctx, &mut g);
+        assert_eq!(st, GgmlStatus::Success);
+        assert_eq!(backend_sched_get_n_splits(&sched), 1, "single backend — one split");
+        assert!(
+            called.lock().unwrap().is_empty(),
+            "no split copies host weights across backends — callback must not fire"
+        );
+
+        // and the compute is unaffected
+        let mut ctx_d = Context::new();
+        let out_d = build_toy(&mut ctx_d);
+        let mut gd = Graph::new(16);
+        gd.build_forward(&ctx_d, out_d);
+        crate::compute::graph_compute(&mut ctx_d, &mut gd, 4);
+        assert_eq!(ctx.data_bytes(out).unwrap(), ctx_d.data_bytes(out_d).unwrap());
+    }
+
+    /// copy callback (6753a033f) — two-backend contract: the weight `w` sits
+    /// in a CPU (host) buffer with USAGE_WEIGHTS while its MUL_MAT consumer is
+    /// pinned to the mock backend via `backend_sched_set_tensor_backend`, so
+    /// the scheduler must
+    ///   1. copy the split's non-weight input `a` (user INPUT) first,
+    ///   2. then offer only `w` to the callback with the split's backend, the
+    ///      previous-split `src`, the split-local `dst` copy and the split's
+    ///      graph nodes,
+    ///   3. a `false` return makes the scheduler copy the entire weight
+    ///      (bit-identical output), a `true` return means the user-performed
+    ///      copy stands (the scheduler skips its own).
+    #[test]
+    fn sched_copy_callback_two_backend_contract() {
+        // graph: n0 = mul_mat(w, a) — [4,4] x [4,2] -> [4,2]
+        let mut setup = |ctx: &mut Context| -> (TensorId, TensorId, TensorId) {
+            let w = ctx.new_tensor_2d(GgmlType::F32, 4, 4);
+            let a = ctx.new_tensor_2d(GgmlType::F32, 4, 2);
+            // w in a CPU (host) buffer with USAGE_WEIGHTS
+            // (ggml-backend.cpp:1805-1809 — the is_host_weight predicate)
+            let cpu_buft = backend_cpu_buffer_type();
+            let buf = backend_buft_alloc_buffer(&cpu_buft, ctx, 1024).unwrap();
+            let base = backend_buffer_get_base(&buf).unwrap();
+            assert_eq!(backend_tensor_alloc(&buf, ctx, w, base), GgmlStatus::Success);
+            backend_buffer_set_usage(&buf, BackendBufferUsage::Weights);
+            fill_f32(ctx, w, |i| (i as f32 * 0.125).sin());
+            ctx.set_name(w, "w");
+            ctx.set_name(a, "a");
+            ctx.tensors[a.0 as usize].flags |= GGML_TENSOR_FLAG_INPUT;
+            let n0 = ctx.mul_mat(w, a);
+            ctx.set_name(n0, "n0");
+            ctx.tensors[n0.0 as usize].flags |= GGML_TENSOR_FLAG_OUTPUT;
+            (w, a, n0)
+        };
+        let input_vals: Vec<f32> = (0..8).map(|i| (i as f32 * 0.7).sin()).collect();
+        let input_bytes: Vec<u8> = bytemuck::cast_slice(&input_vals).to_vec();
+        // reference mul_mat(scale * w, a) on a plain context
+        let direct = |scale: f32| -> Vec<u8> {
+            let mut ctx_d = Context::new();
+            let w_d = ctx_d.new_tensor_2d(GgmlType::F32, 4, 4);
+            ctx_d.arena_resize_tensor(w_d);
+            fill_f32(&mut ctx_d, w_d, |i| (i as f32 * 0.125).sin() * scale);
+            let a_d = ctx_d.new_tensor_2d(GgmlType::F32, 4, 2);
+            ctx_d.arena_resize_tensor(a_d);
+            ctx_d.with_f32_mut(a_d, |p| p.copy_from_slice(&input_vals)).unwrap();
+            let n0_d = ctx_d.mul_mat(w_d, a_d);
+            let mut gd = Graph::new(8);
+            gd.build_forward(&ctx_d, n0_d);
+            crate::compute::graph_compute(&mut ctx_d, &mut gd, 2);
+            ctx_d.data_bytes(n0_d).unwrap().to_vec()
+        };
+
+        // ---------- run A: the callback declines (false) -> full copy ----------
+        let mut ctx = Context::new();
+        let (w, a, n0) = setup(&mut ctx);
+        let mock = mock::mock_backend("MOCK", Some(GgmlOp::Silu));
+        let cpu = cpu_backend_init();
+        let mut g = Graph::new(8);
+        g.build_forward(&ctx, n0);
+        let mut sched = backend_sched_new(&[mock.backend.clone(), cpu], None, 32, false, true);
+        backend_sched_set_tensor_backend(&mut sched, n0, &mock.backend);
+        assert!(backend_sched_alloc_graph(&mut sched, &mut ctx, &mut g));
+        // after alloc the split copies exist — capture what the callback must see
+        let a_cpy = sched.hv_tensor_copies[&(a, 0, 0)];
+        let w_cpy = sched.hv_tensor_copies[&(w, 0, 0)];
+        let log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let log = log.clone();
+            let expect_input = input_bytes.clone();
+            backend_sched_set_copy_callback(&mut sched, Box::new(move |backend, ctx, src, dst, graph| {
+                let mut log = log.lock().unwrap();
+                // contract: (split backend, src in previous split, dst copy,
+                // split graph nodes)
+                log.push(format!(
+                    "cb:{} src={} dst_is_copy={} graph={}",
+                    backend_name(Some(backend)),
+                    ctx.tensors[src.0 as usize].name,
+                    dst == w_cpy && src == w,
+                    graph.len(),
+                ));
+                // contract: all non-weight inputs of the split have already
+                // been copied (two-pass order, ggml-backend.cpp:1872-1885)
+                let a_bytes = ctx.data_bytes(a_cpy).unwrap();
+                log.push(format!("a_copied_before_callback={}", a_bytes == expect_input.as_slice()));
+                false // decline — the scheduler must copy the entire weight
+            }));
+        }
+        backend_tensor_set(&mut ctx, a, &input_bytes, 0);
+        let st = backend_sched_graph_compute(&mut sched, &mut ctx, &mut g);
+        assert_eq!(st, GgmlStatus::Success);
+
+        assert_eq!(backend_sched_get_n_splits(&sched), 1, "single pinned node");
+        assert_eq!(
+            sched.splits[0].inputs.len(),
+            2,
+            "both w (host weight) and a (user input) cross to the mock"
+        );
+        let log = log.lock().unwrap();
+        assert_eq!(log.len(), 2, "callback fired exactly once");
+        assert_eq!(log[0], "cb:MOCK src=w dst_is_copy=true graph=1");
+        assert_eq!(log[1], "a_copied_before_callback=true");
+        drop(log);
+        // declining -> the scheduler copied the whole weight -> bit-identical
+        assert_eq!(ctx.data_bytes(n0).unwrap(), &direct(1.0)[..]);
+
+        // ---------- run B: the callback copies 2*w itself (true) -> stands ----------
+        let mut ctx = Context::new();
+        let (w, a, n0) = setup(&mut ctx);
+        let mock = mock::mock_backend("MOCK", Some(GgmlOp::Silu));
+        let cpu = cpu_backend_init();
+        let mut g = Graph::new(8);
+        g.build_forward(&ctx, n0);
+        let mut sched = backend_sched_new(&[mock.backend.clone(), cpu], None, 32, false, true);
+        backend_sched_set_tensor_backend(&mut sched, n0, &mock.backend);
+        assert!(backend_sched_alloc_graph(&mut sched, &mut ctx, &mut g));
+        let fired = Arc::new(Mutex::new(0usize));
+        {
+            let fired = fired.clone();
+            backend_sched_set_copy_callback(&mut sched, Box::new(move |_backend, ctx, src, dst, _graph| {
+                *fired.lock().unwrap() += 1;
+                // the user performs the copy itself: 2*w
+                let scaled: Vec<f32> = ctx
+                    .f32s(src)
+                    .unwrap()
+                    .iter()
+                    .map(|v| v * 2.0)
+                    .collect();
+                backend_tensor_set(ctx, dst, bytemuck::cast_slice(&scaled), 0);
+                true // handled — the scheduler must NOT copy over it
+            }));
+        }
+        backend_tensor_set(&mut ctx, a, &input_bytes, 0);
+        let st = backend_sched_graph_compute(&mut sched, &mut ctx, &mut g);
+        assert_eq!(st, GgmlStatus::Success);
+        assert_eq!(*fired.lock().unwrap(), 1);
+        // the user copy stands: output == mul_mat(2*w, a), != mul_mat(w, a)
+        assert_eq!(ctx.data_bytes(n0).unwrap(), &direct(2.0)[..]);
+        assert_ne!(ctx.data_bytes(n0).unwrap(), &direct(1.0)[..]);
     }
 
     /// gallocr inplace reuse — transcription of the reference's

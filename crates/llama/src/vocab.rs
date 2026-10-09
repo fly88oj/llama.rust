@@ -42,6 +42,9 @@ pub enum VocabType {
     Ugm,
     Rwkv,
     Plamo2,
+    /// `LLAMA_VOCAB_TYPE_PLAMO3` (abeada335, llama-vocab.h) — the PLaMo-2
+    /// table tokenizer with the PLaMo-3 pre-segmentation
+    Plamo3,
     Test,
 }
 
@@ -110,6 +113,8 @@ pub enum PreType {
     Ufakzeka,
     /// `LLAMA_VOCAB_PRE_TYPE_MMBERT` = 60 (a7b94df2c, llama-vocab.h:71)
     Mmbert,
+    /// `LLAMA_VOCAB_PRE_TYPE_K2_HORIZON` (462524043, llama-vocab.h)
+    K2Horizon,
 }
 
 /// `llama_vocab::token_data`.
@@ -214,6 +219,9 @@ struct Plamo2Tokenizer {
     to_suffix_id: HashMap<i64, i32>,
     /// rows: [piece_length, token_id, score, piece_id]
     table: Vec<[i32; 4]>,
+    /// `pre_segment_` (abeada335, llama-vocab.cpp:1745) — PLaMo-3's
+    /// pre-segmentation pass
+    pre_segment: bool,
 }
 
 // table column constants (llm_tokenizer_plamo2)
@@ -531,8 +539,15 @@ impl Vocab {
                 v.special_sep_id = TOKEN_NULL;
                 v.special_pad_id = TOKEN_NULL;
                 v.special_mask_id = TOKEN_NULL;
-            } else if v.tokenizer_model == "plamo2" {
-                v.ty = VocabType::Plamo2;
+            } else if v.tokenizer_model == "plamo2" || v.tokenizer_model == "plamo3" {
+                // abeada335 (llama-vocab.cpp:2213-2214): "plamo3" selects the
+                // pre-segmenting twin of the PLaMo-2 tokenizer
+                v.ty = if v.tokenizer_model == "plamo2" {
+                    VocabType::Plamo2
+                } else {
+                    VocabType::Plamo3
+                };
+                // PLaMo default special tokens (overridden by model config)
                 v.special_bos_id = 1; // <|plamo:bos|>
                 v.special_eos_id = 2; // <|plamo:eos|>
                 v.special_unk_id = 0; // <|plamo:unk|>
@@ -908,7 +923,9 @@ impl Vocab {
                         || text == "<PRE>"
                         || text == "▁<PRE>"
                         || text == "<|code_prefix|>"
-                        || text == "<|prefix|>")
+                        || text == "<|prefix|>"
+                        // PLaMo-3 (42b021b4d, llama-vocab.cpp:2863)
+                        || text == "<|plamo:fim_prefix|>")
                 {
                     v.special_fim_pre_id = id;
                     let attr = &mut v.id_to_token[id as usize].attr;
@@ -926,7 +943,9 @@ impl Vocab {
                         || text == "<SUF>"
                         || text == "▁<SUF>"
                         || text == "<|code_suffix|>"
-                        || text == "<|suffix|>")
+                        || text == "<|suffix|>"
+                        // PLaMo-3 (42b021b4d, llama-vocab.cpp:2885)
+                        || text == "<|plamo:fim_suffix|>")
                 {
                     v.special_fim_suf_id = id;
                     let attr = &mut v.id_to_token[id as usize].attr;
@@ -944,7 +963,9 @@ impl Vocab {
                         || text == "<MID>"
                         || text == "▁<MID>"
                         || text == "<|code_middle|>"
-                        || text == "<|middle|>")
+                        || text == "<|middle|>"
+                        // PLaMo-3 (42b021b4d, llama-vocab.cpp:2907)
+                        || text == "<|plamo:fim_middle|>")
                 {
                     v.special_fim_mid_id = id;
                     let attr = &mut v.id_to_token[id as usize].attr;
@@ -984,7 +1005,10 @@ impl Vocab {
                 }
 
                 // find FIM_SEP token
-                if v.special_fim_sep_id == TOKEN_NULL && text == "<|file_sep|>" {
+                // PLaMo-2/3 (42b021b4d, llama-vocab.cpp:2958)
+                if v.special_fim_sep_id == TOKEN_NULL
+                    && (text == "<|file_sep|>" || text == "<|plamo:file_separator|>")
+                {
                     v.special_fim_sep_id = id;
                     let attr = &mut v.id_to_token[id as usize].attr;
                     if *attr & ATTR_CONTROL == 0 {
@@ -1041,6 +1065,8 @@ impl Vocab {
                     || text == "<|tool_response>"
                     || text == "<｜end▁of▁sentence｜>"
                     || text == "[e~["
+                    // k2-horizon (462524043, llama-vocab.cpp:3039)
+                    || text == "<|ifm|im_end|>"
                 {
                     v.special_eog_ids.insert(id);
                     let attr = &mut v.id_to_token[id as usize].attr;
@@ -1277,7 +1303,14 @@ impl Vocab {
             VocabType::Wpm => Tokenizer::Wpm,
             VocabType::Ugm => Tokenizer::Ugm(Box::new(UgmTokenizer::build(self))),
             VocabType::Rwkv => Tokenizer::Rwkv(Box::new(RwkvTokenizer::build(self))),
-            VocabType::Plamo2 => Tokenizer::Plamo2(Box::new(Plamo2Tokenizer::build(self))),
+            // abeada335 (llama-vocab.cpp:3366-3370): pre_segment = false for
+            // PLaMo-2 (the leading U+FEFF is dropped), true for PLaMo-3
+            VocabType::Plamo2 => {
+                Tokenizer::Plamo2(Box::new(Plamo2Tokenizer::build(self, false)))
+            }
+            VocabType::Plamo3 => {
+                Tokenizer::Plamo2(Box::new(Plamo2Tokenizer::build(self, true)))
+            }
             VocabType::Test => Tokenizer::Test,
         };
     }
@@ -1303,6 +1336,7 @@ impl Vocab {
             VocabType::Ugm => "UGM",
             VocabType::Rwkv => "RWKV",
             VocabType::Plamo2 => "PLaMo2",
+            VocabType::Plamo3 => "PLaMo3",
             VocabType::Test => "TEST",
         }
     }
@@ -1441,7 +1475,9 @@ impl Vocab {
                 .get(unicode::byte_to_utf8(ch).as_bytes())
                 .copied()
                 .ok_or_else(|| format!("byte token for 0x{ch:02x} not found")),
-            VocabType::Plamo2 => {
+            // PLaMo uses byte tokens in format <0xXX> (llama-vocab.cpp:
+            // 4168-4172 covers PLAMO2 and PLAMO3 with one arm)
+            VocabType::Plamo2 | VocabType::Plamo3 => {
                 let buf = format!("<0x{ch:02X}>");
                 self.token_to_id
                     .get(buf.as_bytes())
@@ -1659,9 +1695,9 @@ impl Vocab {
                     }
                 }
             }
-            VocabType::Plamo2 => {
+            VocabType::Plamo2 | VocabType::Plamo3 => {
                 // honor the BOS/EOS settings (llama-vocab.cpp:3602-3605 +
-                // 3620-3628, db33d3cb8)
+                // 3620-3628, db33d3cb8; abeada335 gave PLAMO3 the same arm)
                 if add_special && self.add_bos {
                     assert!(self.special_bos_id != TOKEN_NULL);
                     output.push(self.special_bos_id);
@@ -2023,7 +2059,7 @@ impl Vocab {
                 VocabType::Test => {
                     return format!("{token:x}").into_bytes();
                 }
-                VocabType::Plamo2 => {
+                VocabType::Plamo2 | VocabType::Plamo3 => {
                     if self.is_byte(token) {
                         // handle byte tokens like <0xXX>
                         let bytes = token_text.as_bytes();
@@ -3320,8 +3356,93 @@ impl Vocab {
 // PLaMo-2 tokenizer (llm_tokenizer_plamo2 + session)
 // ---------------------------------------------------------------------------
 
+/// the PLaMo-3 pre-segmentation of abeada335 (llama-vocab.cpp:1550-1617):
+/// the cut points of pass 1 (`<|plamo:...|>` fencing) and pass 2 (runs),
+/// then the U+EE00 boundaries — returns the emitted segments' `[start, end)`
+/// ranges (the boundary marker itself is skipped). Public for the parity
+/// probe test (parity/ref_k2_plamo_split.c + tests/k2_plamo_split_parity.rs).
+pub fn plamo3_segments(unicode_data: &[u32]) -> Vec<(usize, usize)> {
+    let n = unicode_data.len();
+    let mut cut = vec![false; n + 1];
+
+    // pass 1: <|plamo:...|> (:1554-1577)
+    {
+        const PREFIX: [u32; 8] = ['<' as u32, '|' as u32, 'p' as u32, 'l' as u32,
+                                  'a' as u32, 'm' as u32, 'o' as u32, ':' as u32];
+        let prefix_len = PREFIX.len();
+        let mut i = 0usize;
+        while i + prefix_len <= n {
+            if unicode_data[i..i + prefix_len] != PREFIX {
+                i += 1;
+                continue;
+            }
+            // An empty body is valid.
+            let mut j = i + prefix_len;
+            // Treat U+001C..U+001F as whitespace (equivalent to Python \s).
+            while j < n
+                && j - (i + prefix_len) < 64
+                && unicode_data[j] != '|' as u32
+                && !(0x1C..=0x1F).contains(&unicode_data[j])
+                && !unicode::cpt_flags_from_cpt(unicode_data[j]).is_whitespace()
+            {
+                j += 1;
+            }
+            if j + 1 < n && unicode_data[j] == '|' as u32 && unicode_data[j + 1] == '>' as u32
+            {
+                cut[i] = true;
+                cut[j + 2] = true;
+                i = j + 2;
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    // pass 2: runs of repeated characters / spaces (a run never crosses
+    // a boundary from pass 1) (:1580-1599)
+    {
+        let mut i = 0usize;
+        while i < n {
+            let c = unicode_data[i];
+            let mut run = 1usize;
+            while i + run < n && unicode_data[i + run] == c && !cut[i + run] {
+                run += 1;
+            }
+
+            let is_repeated_chars = c != '\n' as u32 && run >= 4;
+            let is_spaces = c == ' ' as u32 && run >= 2;
+            if is_repeated_chars || is_spaces {
+                cut[i] = true;
+                cut[i + run] = true;
+            }
+
+            // a run that does not match cannot match at any later
+            // position either (it only gets shorter)
+            i += run;
+        }
+    }
+
+    let mut segments: Vec<(usize, usize)> = Vec::new();
+    let mut seg_start = 0usize;
+    for seg_end in 0..=n {
+        // U+EE00 is the tokenizer's private-use boundary marker; literal
+        // occurrences split segments and are not emitted (:1604-1617)
+        let is_boundary = seg_end < n && unicode_data[seg_end] == 0xEE00;
+        if seg_end == n || cut[seg_end] || is_boundary {
+            if seg_start < seg_end {
+                segments.push((seg_start, seg_end));
+            }
+            seg_start = seg_end + usize::from(is_boundary);
+        }
+    }
+
+    segments
+}
+
 impl Plamo2Tokenizer {
-    fn build(v: &Vocab) -> Plamo2Tokenizer {
+    /// `llm_tokenizer_plamo2(vocab, pre_segment)` (abeada335,
+    /// llama-vocab.cpp:1403) — pre_segment is true only for PLaMo-3
+    fn build(v: &Vocab, pre_segment: bool) -> Plamo2Tokenizer {
         let mut tokens: Vec<String> = Vec::new();
         let mut bytes = [0 as Token; 256];
         let mut to_suffix_id: HashMap<i64, i32> = HashMap::new();
@@ -3451,16 +3572,44 @@ impl Plamo2Tokenizer {
             bytes,
             to_suffix_id,
             table,
+            pre_segment,
         }
     }
 
+    /// `llm_tokenizer_plamo2::encode` (abeada335, llama-vocab.cpp:1545-
+    /// 1620): PLaMo-3 pre-segments the input — pass 1 fences `<|plamo:...|>`
+    /// special-token bodies (≤ 64 code points, U+001C..U+001F treated as
+    /// whitespace, terminated by `|>`), pass 2 cuts runs of ≥ 4 repeated
+    /// characters or ≥ 2 spaces, and literal U+EE00 (the tokenizer's
+    /// private-use boundary marker) splits segments without being emitted.
+    /// PLaMo-2 (pre_segment = false) only drops a leading BOM.
     fn encode(&self, text: &[u8]) -> Vec<Token> {
-        let mut unicode_data = unicode::cpts_from_utf8(text);
-        // skip the first code point if it is a BOM
-        if !unicode_data.is_empty() && unicode_data[0] == 0xFEFF {
-            unicode_data.remove(0);
+        let unicode_data = unicode::cpts_from_utf8(text);
+        if !self.pre_segment {
+            // PLaMo-2: skip the first code point if it is a BOM (the
+            // PLaMo-3 tokenizer keeps a leading U+FEFF in the input)
+            let mut data = unicode_data;
+            if !data.is_empty() && data[0] == 0xFEFF {
+                data.remove(0);
+            }
+            return self.encode_cpts(&data);
         }
 
+        let mut output: Vec<Token> = Vec::new();
+        for (a, b) in Self::plamo3_segments(&unicode_data) {
+            let tokens = self.encode_cpts(&unicode_data[a..b]);
+            output.extend_from_slice(&tokens);
+        }
+        output
+    }
+
+    fn plamo3_segments(unicode_data: &[u32]) -> Vec<(usize, usize)> {
+        plamo3_segments(unicode_data)
+    }
+
+
+    /// the pre-abelo335 encode body — the dynamic-programming table search
+    fn encode_cpts(&self, unicode_data: &[u32]) -> Vec<Token> {
         if unicode_data.is_empty() {
             return Vec::new();
         }
@@ -3769,6 +3918,10 @@ fn map_pre_tokenizer(v: &mut Vocab) -> Result<(), String> {
         v.clean_spaces = false;
     } else if pre == "mellum2" {
         v.pre_type = PreType::Mellum2;
+    } else if pre == "k2-horizon" {
+        // 462524043 (llama-vocab.cpp:2544-2547)
+        v.pre_type = PreType::K2Horizon;
+        v.clean_spaces = false;
     } else {
         return Err(format!("unknown pre-tokenizer type: '{pre}'"));
     }
@@ -3869,6 +4022,11 @@ fn bpe_pre_regexes(pre: PreType) -> (Vec<String>, bool) {
         ],
         PreType::KimiK2 => &[
             "\\p{Han}+",
+        ],
+        // 462524043 (llama-vocab.cpp:561-564) — served by the hand-written
+        // unicode splitter (regex_split_custom_k2_horizon)
+        PreType::K2Horizon => &[
+            "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\\r\\n\\p{L}\\p{N}]?(?:\\p{L}|\\p{M}|\\u200C|\\u200D)+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
         ],
         PreType::Superbpe => &[
             "\\p{N}+",

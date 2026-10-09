@@ -296,6 +296,22 @@ pub enum ForwardWeights {
     /// batch 19: glm5-next — the hybrid KDA + nope-MLA/k-pool DSA arch of
     /// `llama_memory_hybrid_idx` (glm5-next.cpp)
     Glm5Next(graph_arch::Glm5NextModelWeights, graph_arch::Glm5NextParams),
+    /// batch 20 (the c35b66744 sync): k2-horizon — the dense + MoVA hybrid
+    /// (k2-horizon.cpp) over the standard full-attention KV cache
+    /// (`create_memory`'s generic `llama_kv_cache` arm — no special cache
+    /// for the MoVA value experts)
+    K2Horizon(graph_arch::K2HorizonModelWeights, graph_arch::K2HorizonParams),
+    /// batch 20: lfm2 decision (d1 / d1-omni) — the Decision form of the
+    /// LFM2 arch when `n_layer_decision > 0` (`graph_decision`,
+    /// lfm2.cpp:137-139): `create_memory` returns nullptr
+    /// (llama-model.cpp:2385-2387) and the C's decode reroutes to the
+    /// encoder-style decision graph (llama-context.cpp:1729-1732); the port
+    /// drives the same builder from the decode dispatch with self-made
+    /// no-cache inputs (the dream no-memory precedent)
+    Lfm2Decision(
+        graph_arch::Lfm2DecisionModelWeights,
+        graph_arch::Lfm2DecisionParams,
+    ),
 }
 
 impl ForwardWeights {
@@ -474,6 +490,10 @@ impl ForwardWeights {
             ForwardWeights::Step35(w, _) => w.layers.len(),
             ForwardWeights::HyV4(w, _) => w.layers.len(),
             ForwardWeights::Glm5Next(w, _) => w.layers.len(),
+            // batch 20: k2-horizon's plain layer count; lfm2-decision counts
+            // trunk + head blocks (the file's `block_count`, lfm2.cpp:88)
+            ForwardWeights::K2Horizon(w, _) => w.layers.len(),
+            ForwardWeights::Lfm2Decision(w, _) => w.trunk_layers.len() + w.head_layers.len(),
         }
     }
     pub fn output(&self) -> ggml::TensorId {
@@ -607,6 +627,12 @@ impl ForwardWeights {
             ForwardWeights::Step35(w, _) => w.output,
             ForwardWeights::HyV4(w, _) => w.output,
             ForwardWeights::Glm5Next(w, _) => w.output,
+            // k2-horizon's (possibly tied) lm_head; lfm2-decision has no
+            // lm_head at all — the head's cls_out [n_embd, 1] scorer replaces
+            // it (lfm2.cpp:52-86: `output` stays NULL, the scores are the
+            // model output), so the generic n_vocab sizing sees a 1-wide head
+            ForwardWeights::K2Horizon(w, _) => w.output,
+            ForwardWeights::Lfm2Decision(w, _) => w.cls_out,
         }
     }
 
@@ -826,6 +852,8 @@ impl ForwardWeights {
             ForwardWeights::Step35(w, _) => w.tok_embd,
             ForwardWeights::HyV4(w, _) => w.tok_embd,
             ForwardWeights::Glm5Next(w, _) => w.tok_embd,
+            ForwardWeights::K2Horizon(w, _) => w.tok_embd,
+            ForwardWeights::Lfm2Decision(w, _) => w.tok_embd,
         }
     }
 
@@ -961,6 +989,8 @@ impl ForwardWeights {
             ForwardWeights::Step35(w, _) => w.tok_embd = id,
             ForwardWeights::HyV4(w, _) => w.tok_embd = id,
             ForwardWeights::Glm5Next(w, _) => w.tok_embd = id,
+            ForwardWeights::K2Horizon(w, _) => w.tok_embd = id,
+            ForwardWeights::Lfm2Decision(w, _) => w.tok_embd = id,
         }
     }
 
@@ -2056,6 +2086,19 @@ pub struct DecodeContext {
     /// the per-step `llm_graph_input_embd_h::h` input of the MTP graph —
     /// filled from the ubatch's embd rows in `step_ubatch`
     mtp_h_input: Option<TensorId>,
+    /// the per-step mixed-batch input bundle (`llm_graph_input_embd`'s
+    /// mixed_tokens/mixed_slots/mixed_embd, 0bb496dbd llama-graph.cpp:87-
+    /// 104) — `Some` only for a type-marked ubatch; the builders route it
+    /// through [`crate::graph::build_inp_embd`]
+    mixed_step: Option<crate::graph::InpMixed>,
+    /// `cparams.moe_cache_size` (d6cf9acb2, llama-cparams.h:58) — 0 = off.
+    /// The cache itself is GPU-only (moe_cache.rs); the flag rides the
+    /// context like any cparam so the GPU path can construct it.
+    pub moe_cache_size: usize,
+    /// `llama_context::copy_experts` (llama-context.h:214-222) — the ids
+    /// readback + used bitmap of `sched_copy_experts`; reset before every
+    /// graph compute (llama-context.cpp:2643)
+    copy_experts: crate::moe_cache::CopyExpertsState,
     /// the per-step k_rot Hadamard input of the deepseek4 MTP attention
     /// (`build_input_k_rot`, llama-kv-cache.cpp:1437-1455)
     mtp_k_rot: Option<TensorId>,
@@ -2510,6 +2553,12 @@ impl DecodeContext {
     /// row width is `hparams.n_embd_out()` of the arch (`output_reserve`,
     /// :2130-2150); archs without a nextn tap error out.
     pub fn set_embeddings_nextn(&mut self, value: bool, masked: bool) {
+        // 1a3011cc0 (llama-context.cpp:1244-1248): a *change* of either flag
+        // sets `sched_need_reserve = true` in C — the flags change the graph
+        // shape (the unmasked tap widens t_h_nextn to all rows), so the
+        // scheduler must re-reserve. The port rebuilds the per-step graph
+        // from the current flags on every decode (no persistent reserve), so
+        // the re-reserve is implicit — nothing to invalidate here.
         self.embeddings_nextn = value;
         self.embeddings_nextn_masked = masked;
         if value {
@@ -2828,6 +2877,9 @@ impl DecodeContext {
             embd_nextn_offset: 0,
             embd_nextn_token_rows: Vec::new(),
             mtp_h_input: None,
+            mixed_step: None,
+            moe_cache_size: 0,
+            copy_experts: crate::moe_cache::CopyExpertsState::default(),
             mtp_k_rot: None,
             eagle: None,
             eagle_g_input: None,
@@ -2981,6 +3033,9 @@ impl DecodeContext {
             embd_nextn_offset: 0,
             embd_nextn_token_rows: Vec::new(),
             mtp_h_input: None,
+            mixed_step: None,
+            moe_cache_size: 0,
+            copy_experts: crate::moe_cache::CopyExpertsState::default(),
             mtp_k_rot: None,
             msa: None,
             msa_step: None,
@@ -3060,6 +3115,9 @@ impl DecodeContext {
             embd_nextn_offset: 0,
             embd_nextn_token_rows: Vec::new(),
             mtp_h_input: None,
+            mixed_step: None,
+            moe_cache_size: 0,
+            copy_experts: crate::moe_cache::CopyExpertsState::default(),
             mtp_k_rot: None,
             msa: None,
             msa_step: None,
@@ -3176,6 +3234,9 @@ impl DecodeContext {
             embd_nextn_offset: 0,
             embd_nextn_token_rows: Vec::new(),
             mtp_h_input: None,
+            mixed_step: None,
+            moe_cache_size: 0,
+            copy_experts: crate::moe_cache::CopyExpertsState::default(),
             mtp_k_rot: None,
             msa: None,
             msa_step: None,
@@ -3361,12 +3422,10 @@ impl DecodeContext {
             match res {
                 Ok(()) => {
                     let idx = self.idx.as_mut().unwrap();
+                    // the restore rewrites the cells behind the pool
+                    // layout's back; the 43fe9c642 stale-all for shared
+                    // layouts is gone (rep_gen marks each rep once)
                     idx.stale_set(seq_id, 0);
-                    // it can also change which cells are shared; re-derive
-                    // sharing for every sequence, as seq_rm does
-                    if idx.kpool_layout_shared() {
-                        idx.stale_set(-1, 0);
-                    }
                 }
                 Err(e) => {
                     self.hybrid_idx_state_drop(seq_id, partial_only);
@@ -3404,10 +3463,8 @@ impl DecodeContext {
             self.recurrent_state_clear(seq_id, false);
         }
         if let Some(idx) = self.idx.as_mut() {
+            // (43fe9c642: no shared-layout stale-all any more)
             idx.stale_set(seq_id, 0);
-            if idx.kpool_layout_shared() {
-                idx.stale_set(-1, 0);
-            }
         }
     }
 
@@ -4437,6 +4494,10 @@ impl DecodeContext {
     /// when enabled, the port's CPU engine otherwise. `root` marks the graph
     /// output (set_output + result sync-back).
     fn run_graph(&mut self, gf: &mut ggml::Graph, root: ggml::TensorId, also_sync: &[ggml::TensorId]) -> Result<(), String> {
+        // `copy_experts.reset()` before every graph compute
+        // (llama-context.cpp:2643, d6cf9acb2): the ids readback cache dies
+        // with the graph it belonged to
+        self.copy_experts.reset();
         match self.gpu.as_mut() {
             Some(exe) => {
                 let mut sync: Vec<ggml::TensorId> = vec![root];
@@ -4999,6 +5060,7 @@ impl DecodeContext {
                 &self.attn,
                 &self.kv,
                 &inp,
+                self.mixed_step.as_ref(),
                 sinfo,
                 n_kv,
                 n,
@@ -5695,6 +5757,81 @@ impl DecodeContext {
                 n_kv,
                 n,
             ),
+            // batch 20: k2-horizon — the plain decode graph over the standard
+            // KV cache (the MoVA routing is all inside the layer body,
+            // k2-horizon.cpp:213-362)
+            ForwardWeights::K2Horizon(w, p) => graph_arch::build_k2_horizon_forward(
+                &mut self.gctx,
+                w,
+                p,
+                &self.kv,
+                &inp,
+                sinfo,
+                n_kv,
+                n,
+            ),
+            // batch 20: lfm2 decision (d1 / d1-omni) — `graph_decision` over
+            // the whole batch, no memory (create_memory's nullptr arm,
+            // llama-model.cpp:2385-2387). The C reroutes decode to encode
+            // (llama-context.cpp:1729-1732) whose graph IS this builder; the
+            // port's decode dispatch fills the no-cache inputs itself (the
+            // dream precedent) for the driver's single text-only sequence:
+            // both media masks all-visible (lfm2.cpp:360-384 with no media
+            // rows — text reads text), the conv taps from the step's own
+            // positions (lfm2.cpp:386-401)
+            ForwardWeights::Lfm2Decision(w, p) => {
+                let t = n as i64;
+                let kq_mask_enc = self.gctx.new_tensor_2d(GgmlType::F32, t, t);
+                let kq_mask_head = self.gctx.new_tensor_2d(GgmlType::F32, t, t);
+                let conv_left = self.gctx.new_tensor_2d(GgmlType::F32, 1, t);
+                let conv_right = self.gctx.new_tensor_2d(GgmlType::F32, 1, t);
+                for x in [kq_mask_enc, kq_mask_head, conv_left, conv_right] {
+                    self.gctx.arena_resize_tensor(x);
+                }
+                // the step's positions — read host-side for the conv taps
+                let pos: Vec<i32> = bytemuck::cast_slice(self.gctx.data_bytes(inp.pos).unwrap())
+                    [..n]
+                    .to_vec();
+                let seq = vec![0u32; n]; // the single-sequence decode driver
+                let no_media = vec![false; n]; // no mtmd rows on this path
+                let enc = graph_arch::lfm2_media_mask_rule(false, &no_media, &seq, n);
+                let head = graph_arch::lfm2_media_mask_rule(true, &no_media, &seq, n);
+                self.gctx
+                    .with_f32_mut(kq_mask_enc, |d| d.copy_from_slice(&enc))
+                    .unwrap();
+                self.gctx
+                    .with_f32_mut(kq_mask_head, |d| d.copy_from_slice(&head))
+                    .unwrap();
+                let (left, right) = graph_arch::lfm2_conv_mask_rule(&no_media, &seq, &pos, n);
+                self.gctx
+                    .with_f32_mut(conv_left, |d| d.copy_from_slice(&left))
+                    .unwrap();
+                self.gctx
+                    .with_f32_mut(conv_right, |d| d.copy_from_slice(&right))
+                    .unwrap();
+                let inp_d = graph_arch::Lfm2DecisionInputs {
+                    tokens: inp.tokens,
+                    pos: inp.pos,
+                    kq_mask_enc,
+                    kq_mask_head,
+                    conv_left,
+                    conv_right,
+                    // the decode driver's out_ids gather narrows the last head
+                    // block's rows (lfm2.cpp:542-546) — decode's single output
+                    // row makes the scores [3, 1]
+                    out_ids: inp.out_ids,
+                };
+                let result =
+                    graph_arch::build_lfm2_decision_forward(&mut self.gctx, w, p, &inp_d, n);
+                // the [3, n_out] scores replace the absent lm_head (t_embd of
+                // the C's encode, res->t_embd = scores, lfm2.cpp:580) — the
+                // driver's logits readout sees the 3 decision scores
+                graph::ForwardResult {
+                    logits: result.scores,
+                    embd: None,
+                    graph: result.graph,
+                }
+            }
             // arch batch 5 (2026-09-24): the mamba family. mamba2 reaches the
             // same builder as mamba (models.h:942 `using graph = ...mamba`).
             // The pure-recurrent variants need no KV cache at all — the
@@ -6551,7 +6688,6 @@ impl DecodeContext {
             let n_kv = self.kv.n_kv();
             let n_pool = idx.get_n_kpool();
             let n_new = idx.get_n_kpool_new();
-            let cache_safe = idx.get_kpool_cache_safe();
             let n_sel = kpool * n_pool.min(p.indexer_top_k as u32 / kpool) + kpool - 1;
 
             let k_idxs = self.gctx.new_tensor_1d(GgmlType::I64, n as i64);
@@ -6570,12 +6706,12 @@ impl DecodeContext {
             let new_pool_idxs = self
                 .gctx
                 .new_tensor_2d(GgmlType::I32, kpool as i64, n_new as i64);
-            let new_pool_rep = if cache_safe {
+            // c173a53bd: one scatter row per new pool, each a distinct rep
+            // row — the graph always scatters, new_pool_rep is not optional
+            let new_pool_rep = {
                 let t = self.gctx.new_tensor_1d(GgmlType::I64, n_new as i64);
                 self.gctx.arena_resize_tensor(t);
                 Some(t)
-            } else {
-                None
             };
             let new_pool_pos = self.gctx.new_tensor_1d(GgmlType::I32, 4 * n_new as i64);
             for t in [
@@ -6595,8 +6731,9 @@ impl DecodeContext {
                 idx_bytes.copy_from_slice(bytemuck::cast_slice(&idxs));
             }
 
-            // set_input_kpool — the qwen4exp call passes no gather mask and
-            // always passes new_pool_pos (qwen4exp.cpp:653-657)
+            // set_input_kpool — the qwen4exp call passes no selection mask
+            // and always passes new_pool_pos (qwen4exp.cpp:653-657; the
+            // null sel_mask of the c173a53bd signature)
             idx.set_input_kpool(
                 &mut self.gctx,
                 &self.kv.cells,
@@ -6607,9 +6744,8 @@ impl DecodeContext {
                 true,
                 tail_idxs,
                 None,
-                false,
                 new_pool_idxs,
-                new_pool_rep,
+                new_pool_rep.expect("qwen4exp: new_pool_rep always built"),
                 pos,
                 &seqs,
                 &cells,
@@ -6629,7 +6765,10 @@ impl DecodeContext {
                 n_new,
                 n_sel,
                 n_kv,
-                cache_safe,
+                // 43fe9c642 dropped the cache_safe flag: the graph always
+                // scatters (the old cache_safe == true branch). The field
+                // stays until the A-domain builder drops it.
+                cache_safe: true,
             });
             return;
         }
@@ -6644,7 +6783,6 @@ impl DecodeContext {
         // get_n_kpool_new() is the padded graph size n_new_g — stable across
         // decode steps, never below 1 (a7b94df2c:783-784)
         let n_new = idx.get_n_kpool_new();
-        let cache_safe = idx.get_kpool_cache_safe();
         // cparams.fused_lid — the CPU default (auto-resolved true,
         // llama-context.cpp:546-549); the fused lightning indexer wants an
         // F16 pool mask (glm5-next.cpp:303)
@@ -6673,32 +6811,35 @@ impl DecodeContext {
             idx_bytes.copy_from_slice(bytemuck::cast_slice(&idxs));
         }
 
-        // the gather selection (:325-338) — small decode batches gather
-        // the selected latents instead of scattering the mask
+        // the selection mask (:320-331, c173a53bd/310991409) — the top
+        // pools plus the optional tail, also the sparse attention bound;
+        // the gather path is gone, set_input_kpool always fills the mask so
+        // it stays allocated in every graph
         let n_top_pool = (n_pool as i64).min(top_k / kpool as i64);
         let n_sel = kpool * n_top_pool as u32 + u32::from(select_tail) * (kpool - 1);
-        let gather = n as i64 <= 16 && n_kv as i64 > n_sel as i64;
-        let gather_mask = self
+        let sel_mask = self
             .gctx
             .new_tensor_4d(GgmlType::F32, n_sel as i64, 1, 1, n as i64);
-        self.gctx.arena_resize_tensor(gather_mask);
+        self.gctx.arena_resize_tensor(sel_mask);
 
         let new_pool_idxs = self
             .gctx
             .new_tensor_2d(GgmlType::I32, kpool as i64, n_new as i64);
         self.gctx.arena_resize_tensor(new_pool_idxs);
-        let new_pool_rep = if cache_safe {
+        // one scatter row per new pool, each a distinct rep row — always
+        // (c173a53bd)
+        let new_pool_rep = {
             let t = self.gctx.new_tensor_1d(GgmlType::I64, n_new as i64);
             self.gctx.arena_resize_tensor(t);
-            Some(t)
-        } else {
-            None
+            t
         };
 
-        // set_input_kpool (llama-memory-hybrid-idx.cpp:791-1058 of a7b94df2c)
+        // set_input_kpool (llama-memory-hybrid-idx.cpp:738-1010 @c35b66744)
         // — reads the layout and the state this step just built; glm5-next
         // passes no new_pool_pos (the default nullptr, llama-memory-hybrid-
-        // idx.h:203 — its pooled keys are not rotated at pooling time)
+        // idx.h:203 — its pooled keys are not rotated at pooling time). The
+        // sel_mask rides the c173a53bd signature (the old gather_mask +
+        // gather pair)
         idx.set_input_kpool(
             &mut self.gctx,
             &self.kv.cells,
@@ -6708,8 +6849,7 @@ impl DecodeContext {
             pool_mask,
             mask_f16,
             tail_idxs,
-            Some(gather_mask),
-            gather,
+            Some(sel_mask),
             new_pool_idxs,
             new_pool_rep,
             pos,
@@ -6724,13 +6864,13 @@ impl DecodeContext {
             pool_idxs,
             pool_mask,
             tail_idxs,
-            gather_mask,
+            // 310991409: the sel_mask rename + the always-scatter semantics
+            // (the gather path and cache_safe are gone on both sides)
+            sel_mask,
             new_pool_idxs,
             new_pool_rep,
             n_new,
             n_sel: n_sel as u32,
-            gather,
-            cache_safe,
             fused_lid,
         });
     }
@@ -7027,8 +7167,34 @@ impl DecodeContext {
 
         let n_vocab = self.n_vocab();
         {
+            // `llama_batch_allocr(n_pos_per_embd, allow_mixed)`
+            // (llama-context.cpp:90-92, 0bb496dbd): allow_mixed =
+            // `llm_arch_supports_mixed_batch(model.arch) && cparams.ctx_type
+            // == LLAMA_CONTEXT_TYPE_DEFAULT`. The port's DecodeContext does
+            // not carry its arch, so the exception list resolves through the
+            // shapes it does know:
+            //   * ctx_type MTP ⇔ the mtp hook is mounted ("MTP uses the embd
+            //     input for the hidden state", llama-context.cpp:89);
+            //   * the eagle3 / dflash draft contexts are the EAGLE3 / DFLASH
+            //     archs (both in the exception list, llama-arch.cpp:1189);
+            //   * ForwardWeights::Cogvlm / Deepseek4 / GraniteSwitch are the
+            //     COGVLM / DEEPSEEK4 / GRANITE_SWITCH archs (the remaining
+            //     exceptions; GEMMA4_ASSISTANT lives in its own module and
+            //     never routes through decode_batch).
+            let allow_mixed = self.mtp.is_none()
+                && self.eagle.is_none()
+                && self.dflash.is_none()
+                && !matches!(
+                    self.weights,
+                    ForwardWeights::Cogvlm(..)
+                        | ForwardWeights::Deepseek4(..)
+                        | ForwardWeights::GraniteSwitch(..)
+                );
             let mut balloc = self.balloc.take().unwrap_or_else(|| {
-                crate::batch::BatchAllocr::new(self.weights.n_pos_per_embd() as u32)
+                crate::batch::BatchAllocr::new(
+                    self.weights.n_pos_per_embd() as u32,
+                    allow_mixed,
+                )
             });
             // `llama_batch_ext(ctx)`'s row width =
             // `llama_batch_ext_select_n_embd_inp` (llama-batch.cpp:1024-1034):
@@ -7464,6 +7630,49 @@ impl DecodeContext {
             row_idx,
             out_ids: None,
         };
+        // the mixed-batch inputs (`llm_graph_input_embd::set_input`,
+        // llama-graph.cpp:87-104, 0bb496dbd): the token rows' ids and their
+        // destination batch indices, plus the embd rows (the token rows'
+        // bytes are placeholders the set_rows overwrites)
+        self.mixed_step = if ub.is_mixed() {
+            let n_tok_rows = crate::graph::graph_n_tok_rows(ub);
+            let n_embd_row = if n > 0 { ub.embd.len() / n } else { 0 };
+            let mixed_tokens = self.gctx.new_tensor_1d(GgmlType::I32, n_tok_rows as i64);
+            let mixed_slots = self.gctx.new_tensor_1d(GgmlType::I64, n_tok_rows as i64);
+            let mixed_embd =
+                self.gctx
+                    .new_tensor_2d(GgmlType::F32, n_embd_row as i64, n as i64);
+            for t in [mixed_tokens, mixed_slots, mixed_embd] {
+                self.gctx.arena_resize_tensor(t);
+            }
+            let mut ids: Vec<i32> = Vec::with_capacity(n_tok_rows);
+            let mut slots: Vec<i64> = Vec::with_capacity(n_tok_rows);
+            for (i, &ty) in ub.type_.iter().enumerate() {
+                if ty == 0 {
+                    ids.push(ub.token[i]);
+                    slots.push(i as i64);
+                }
+            }
+            debug_assert_eq!(ids.len(), n_tok_rows);
+            self.gctx
+                .with_i32_mut(mixed_tokens, |p| p.copy_from_slice(&ids))
+                .unwrap();
+            {
+                let bytes = self.gctx.data_bytes_mut(mixed_slots).unwrap();
+                bytes.copy_from_slice(bytemuck::cast_slice(&slots));
+            }
+            self.gctx
+                .with_f32_mut(mixed_embd, |p| p.copy_from_slice(&ub.embd))
+                .unwrap();
+            Some(crate::graph::InpMixed {
+                tokens: mixed_tokens,
+                slots: mixed_slots,
+                embd: mixed_embd,
+                type_: ub.type_.clone(),
+            })
+        } else {
+            None
+        };
         self.kv.swa_step = match (row_idx_swa, kq_mask_swa) {
             (Some(row_idx), Some(kq_mask)) => Some(KvSwaStep { row_idx, kq_mask }),
             _ => None,
@@ -7480,6 +7689,13 @@ impl DecodeContext {
         // (`llm_graph_input_dsv4::set_input`) — the single-sequence batch
         // driver assembles the same step the decode() path does
         if self.kv.dsv4.is_some() {
+            // `ASSERT_EMBD_OR_TOKEN` on the raw write ubatch
+            // (llama-kv-cache-dsv4.cpp:86, 0bb496dbd): the DSV4 coupled
+            // rewrite only understands single-kind ubatches
+            assert!(
+                !ub.is_mixed(),
+                "mixed token/embd ubatch is not supported here"
+            );
             let use_fa = self.attn.use_flash_attn;
             let gctx = &mut self.gctx;
             dsv4_step_inputs(gctx, &mut self.kv, &q_pos, &q_seq, use_fa);
@@ -7503,6 +7719,14 @@ impl DecodeContext {
         // (speculative.cpp:1521-1547). deepseek4's iswa attention also needs
         // the cache's k_rot Hadamard input (llama-kv-cache.cpp:1437-1455).
         if self.mtp.is_some() {
+            // `ASSERT_EMBD_OR_TOKEN` (llama-batch.h:83-84, 0bb496dbd):
+            // llm_graph_input_embd_h consumes the whole batch's rows — a
+            // mixed token/embd ubatch must crash here, not read placeholder
+            // token bytes as hidden states
+            assert!(
+                !ub.is_mixed(),
+                "mixed token/embd ubatch is not supported here"
+            );
             let n_e = self.embd_nextn_n_embd;
             assert_eq!(
                 ub.embd.len(),
@@ -7928,13 +8152,10 @@ impl DecodeContext {
         });
         self.kv.seq_rm(seq_id as usize, p0, p1);
         if let (Some(stale), Some(idx)) = (idx_stale, self.idx.as_mut()) {
+            // (43fe9c642 removed the shared-layout stale-every-sequence:
+            // rep_gen keeps each rep's row unique without re-deriving
+            // sharing)
             idx.stale_set(seq_id, stale);
-            // removing a sequence can free cells another sequence shared,
-            // but only this one is marked stale — stale every sequence so
-            // the survivor re-derives `shared` (:195-199)
-            if idx.kpool_layout_shared() {
-                idx.stale_set(-1, 0);
-            }
         }
         if let (Some(rollback), Some(st)) = (rec_rollback, self.recurrent.as_ref()) {
             if let Some(ring) = self.recurrent_snaps.as_mut() {
@@ -7993,11 +8214,18 @@ impl DecodeContext {
             self.kv
                 .seq_cp_dsv4(gctx, seq_id_src as u32, seq_id_dst as u32);
         }
-        // hybrid_idx: the copy shares cells, which cannot hold two
-        // groupings, so both sides drop their cached keys
-        // (llama-memory-hybrid-idx.cpp:205-214)
+        // hybrid_idx (43fe9c642, llama-memory-hybrid-idx.cpp:203-213):
+        // only whole sequences are copied — the recurrent state ignores the
+        // range, and a shared cell holds a single pool grouping. A whole
+        // copy gives the destination the source's pools, rep rows included:
+        // the source keeps its pooled keys, the destination rebuilds its
+        // layout and re-pools into the same rows — so only the destination
+        // stales.
+        assert!(
+            p0 <= 0 && p1 < 0,
+            "seq_cp: partial sequence copy is not supported by the hybrid-idx memory"
+        );
         if let Some(idx) = self.idx.as_mut() {
-            idx.stale_set(seq_id_src, 0);
             idx.stale_set(seq_id_dst, 0);
         }
         Ok(())
@@ -8776,6 +9004,16 @@ pub enum EncoderWeights {
     /// modern-bert (modern-bert.cpp) — the symmetric-SWA facts + resolved FFN
     /// op ride the bundled params; rope facts via `EncoderParams::euro_rope`
     ModernBert(graph_arch::ModernBertModelWeights, graph_arch::ModernBertParams),
+    /// gemma-embedding2 (gemma-embedding2.cpp, 4fbc76dec) — the null-memory
+    /// text+vision+audio embedding family (`create_memory` returns nullptr,
+    /// llama-model.cpp:2402 — decode reroutes to encode,
+    /// llama-context.cpp:1729-1732); the per-layer-input/SWA facts ride the
+    /// bundled params, the mask-window facts via `EncoderParams::gemma_swa`
+    /// (the gemma-embedding v1 plumbing)
+    GemmaEmbedding2(
+        graph_arch::GemmaEmbedding2ModelWeights,
+        graph_arch::GemmaEmbedding2Params,
+    ),
 }
 
 impl EncoderWeights {
@@ -8789,6 +9027,7 @@ impl EncoderWeights {
             EncoderWeights::BertVariant(w, _) => w.layers.len(),
             EncoderWeights::NeoBert(w) => w.layers.len(),
             EncoderWeights::ModernBert(w, _) => w.layers.len(),
+            EncoderWeights::GemmaEmbedding2(w, _) => w.layers.len(),
         }
     }
 }
@@ -8904,7 +9143,8 @@ impl EncoderContext {
             EncoderWeights::Bert(_)
             | EncoderWeights::Eurobert(_)
             | EncoderWeights::GemmaEmbedding(_)
-            | EncoderWeights::LlamaEmbed(_) => {
+            | EncoderWeights::LlamaEmbed(_)
+            | EncoderWeights::GemmaEmbedding2(..) => {
                 let p = self.gctx.new_tensor_1d(GgmlType::I32, t);
                 alloc.push(p);
                 Some(p)
@@ -8935,7 +9175,8 @@ impl EncoderContext {
             | EncoderWeights::LlamaEmbed(_)
             | EncoderWeights::BertVariant(..)
             | EncoderWeights::NeoBert(_)
-            | EncoderWeights::ModernBert(..) => None,
+            | EncoderWeights::ModernBert(..)
+            | EncoderWeights::GemmaEmbedding2(..) => None,
         };
 
         // build_inp_mean / build_inp_cls (llama-graph.cpp:2495 / :2513) —
@@ -9089,6 +9330,35 @@ impl EncoderContext {
                     .unwrap();
                 Some(m)
             }
+            // gemma-embedding2 — the same symmetric-SWA twin (the loader set
+            // swa_type = SYMMETRIC, gemma-embedding2.cpp:4-6); the window
+            // facts ride `EncoderParams::gemma_swa` like gemma-embedding's
+            EncoderWeights::GemmaEmbedding2(..) => {
+                let swa = &self
+                    .params
+                    .gemma_swa
+                    .as_ref()
+                    .expect("gemma-embedding2 needs EncoderParams::gemma_swa")
+                    .0;
+                let m = self.gctx.new_tensor_2d(GgmlType::F32, t, t);
+                self.gctx.arena_resize_tensor(m);
+                self.gctx
+                    .with_f32_mut(m, |d| {
+                        for j in 0..n {
+                            for i in 0..n {
+                                let masked = crate::hparams::LlamaHparams::is_masked_swa(
+                                    swa.n_swa,
+                                    crate::hparams::LlamaSwaType::SYMMETRIC,
+                                    i as i32,
+                                    j as i32,
+                                );
+                                d[j * n + i] = if masked { f32::NEG_INFINITY } else { 0.0 };
+                            }
+                        }
+                    })
+                    .unwrap();
+                Some(m)
+            }
             _ => None,
         };
         self.gctx
@@ -9212,6 +9482,12 @@ impl EncoderContext {
                 graph_arch::build_modern_bert_forward(
                     &mut self.gctx, w, &self.params, mp, &rope, &inputs, n,
                 )
+            }
+            // gemma-embedding2 — the arch's own graph (gemma-embedding2.cpp:
+            //79-234): the bundled params carry the per-layer-input + SWA
+            // facts, the rope pair the test assembly mirrors
+            EncoderWeights::GemmaEmbedding2(w, p) => {
+                graph_arch::build_gemma_embedding2_forward(&mut self.gctx, w, p, &inputs, n)
             }
         };
         let embd = result.embd;

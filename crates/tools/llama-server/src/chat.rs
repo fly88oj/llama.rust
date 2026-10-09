@@ -618,10 +618,10 @@ mod tests {
         let raw = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\", \"unit\": \"fahrenheit\"}}\n</tool_call>";
         let mut pp = llama::chat_tools::ChatParserParams::default();
         pp.format = llama::chat_tools::ChatFormat::PegNative;
-        pp.generation_prompt = parsed.generation_prompt.clone();
+        pp.generation_prompt = llama::chat_tools::ChatInput::from_plain(parsed.generation_prompt.clone());
         pp.parser = llama::peg::PegArena::default();
         pp.parser.load(&parsed.parser).unwrap();
-        let msg = llama::chat_tools::chat_parse(raw, false, &pp).unwrap();
+        let msg = llama::chat_tools::chat_parse(&llama::chat_tools::ChatInput::from(raw), false, &pp).unwrap();
         assert_eq!(msg.tool_calls.len(), 1);
         assert_eq!(msg.tool_calls[0].name, "get_weather");
         assert_eq!(
@@ -632,7 +632,9 @@ mod tests {
         // a partial parse of the same text yields the same tool call once the
         // closing tag is present, and diffs stream the name/arguments
         let partial = llama::chat_tools::chat_parse(
-            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
+            &llama::chat_tools::ChatInput::from(
+                "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
+            ),
             true,
             &pp,
         )
@@ -681,10 +683,12 @@ mod tests {
         .unwrap();
         let mut pp = llama::chat_tools::ChatParserParams::default();
         pp.format = llama::chat_tools::ChatFormat::PegNative;
-        pp.generation_prompt = parsed.generation_prompt.clone();
+        pp.generation_prompt = llama::chat_tools::ChatInput::from_plain(parsed.generation_prompt.clone());
         pp.parser = llama::peg::PegArena::default();
         pp.parser.load(&parsed.parser).unwrap();
-        let msg = llama::chat_tools::chat_parse("Hello! How can I help?", false, &pp).unwrap();
+        let msg =
+            llama::chat_tools::chat_parse(&llama::chat_tools::ChatInput::from("Hello! How can I help?"), false, &pp)
+                .unwrap();
         assert!(msg.tool_calls.is_empty());
         assert_eq!(msg.content, "Hello! How can I help?");
     }

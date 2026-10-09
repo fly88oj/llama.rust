@@ -52,7 +52,10 @@ use ggml::tensor::{Context, TensorId};
 use ggml::{Gguf, GgufType, TensorInfo, Value};
 use memmap2::Mmap;
 
-use crate::arch::{kv_name, tensor_name_suffix, LlmArch, LlmKv, LlmTensor, LlmTensorLayer};
+use crate::arch::{
+    kv_name, tensor_name_suffix, LlmArch, LlmKv, LlmTensor, LlmTensorLayer,
+};
+use crate::hparams::LLAMA_MAX_EXPERTS;
 use crate::hparams::{LlamaExpertGatingFuncType, LlamaHparams, LlamaRopeScalingType, LlamaSwaType};
 use crate::meta::load_hparams;
 
@@ -140,6 +143,11 @@ pub struct LayerTensors {
     pub attn_sinks: Option<TensorId>,
     /// `wqkv_gate` (qwen35 gated delta net: `attn_gate`, the z gate)
     pub wqkv_gate: Option<TensorId>,
+    /// K2 Horizon MoVA (462524043, llama-model.h:311-313): the value-expert
+    /// router gate / its bias / the routed value experts
+    pub attn_v_gate: Option<TensorId>,
+    pub attn_v_gate_b: Option<TensorId>,
+    pub attn_v_exps: Option<TensorId>,
 
     // deepseek2 MLA projections (deepseek2.cpp:100-120). NOTE: like the C
     // `llama_layer`, `wq_b`/`wk_b`/`wv_b` above carry the deepseek meanings
@@ -1207,6 +1215,18 @@ pub fn arch_tensors_support(arch: LlmArch) -> ArchTensorsSupport {
         // reference (tests/clef_e2e.rs).
         LlmArch::CLEF => Full,
         LlmArch::GLM5_NEXT => Partial,
+        // sync round (c35b66744, 462524043): k2-horizon — loader + graph
+        // (graph_arch.rs build_k2_horizon_forward) + synthetic-file node-flow
+        // parity vs the NEW reference (tests/k2_horizon_e2e.rs); the
+        // ForwardWeights/CLI routing is an integrator item (the tts batch
+        // precedent — context.rs is outside this round's ownership)
+        LlmArch::K2_HORIZON => Partial,
+        // sync round (c35b66744, 4fbc76dec): gemma-embedding2 — loader +
+        // encoder graph (graph_arch.rs build_gemma_embedding2_forward) +
+        // synthetic-file node-flow parity vs the NEW reference
+        // (tests/gemma_embedding2_e2e.rs); the EncoderWeights/CLI routing is
+        // an integrator item (the tts batch precedent)
+        LlmArch::GEMMA_EMBEDDING2 => Partial,
         _ => Unsupported,
     }
 }
@@ -1633,6 +1653,13 @@ fn load_arch_tensors(
     macro_rules! opt {
         ($t:expr, $suf:expr, $bid:expr, $ne:expr) => {
             ld.create_tensor($t, $suf, $bid, $ne, TENSOR_NOT_REQUIRED)?
+        };
+    }
+    // the flag-parameterized form (k2-horizon.cpp's NOT_REQUIRED |
+    // ALLOW_RESHAPE reads)
+    macro_rules! opt_flags {
+        ($t:expr, $suf:expr, $bid:expr, $ne:expr, $flags:expr) => {
+            ld.create_tensor($t, $suf, $bid, $ne, $flags)?
         };
     }
     macro_rules! dup_fallback {
@@ -2708,7 +2735,7 @@ fn load_arch_tensors(
         }
 
         // ---- models/lfm2moe.cpp ----
-        // ---- models/lfm2.cpp:36-95 + models/lfm2moe.cpp (the two files'
+        // ---- models/lfm2.cpp:36-145 + models/lfm2moe.cpp (the two files'
         // load_arch_tensors bodies are the same loop; lfm2's
         // n_layer_dense_lead == n_layer makes every layer dense) ----
         LlmArch::LFM2 | LlmArch::LFM2MOE => {
@@ -2720,16 +2747,143 @@ fn load_arch_tensors(
             );
 
             let output_norm = req!(LlmTensor::OUTPUT_NORM_LFM2, "weight", -1, &[lc.n_embd]);
-            let mut output = opt!(LlmTensor::OUTPUT, "weight", -1, &[lc.n_embd, lc.n_vocab]);
 
-            // if output is NULL, init from the input tok embed
-            if output.is_none() {
-                output = Some(dup_fallback!((lc.n_embd, lc.n_vocab)));
+            // the decision model (88dcc460d/a657f7e98, lfm2.cpp:52-86): no
+            // lm_head — the head's cls_out scores replace it; lfm2moe has no
+            // decision files (its arm keeps the plain path)
+            let decision = arch == LlmArch::LFM2 && hparams.n_layer_decision > 0;
+            let mut output = None;
+            let mut decision_cls_out: Option<TensorId> = None;
+            if decision {
+                let n_layer_decision = hparams.n_layer_decision as usize;
+                for (i, l) in layers
+                    .iter_mut()
+                    .enumerate()
+                    .take(lc.n_layer as usize)
+                    .skip(lc.n_layer as usize - n_layer_decision)
+                {
+                    let bid = i as i32;
+                    let n_ff_head = hparams.n_ff(i) as i64;
+
+                    l.attn_norm = Some(req!(
+                        LlmTensor::ATTN_NORM,
+                        "weight",
+                        bid,
+                        &[lc.n_embd]
+                    ));
+                    l.attn_norm_b = Some(req!(
+                        LlmTensor::ATTN_NORM,
+                        "bias",
+                        bid,
+                        &[lc.n_embd]
+                    ));
+
+                    l.wqkv = Some(req!(
+                        LlmTensor::ATTN_QKV,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, 3 * lc.n_embd]
+                    ));
+                    l.wqkv_b = Some(req!(
+                        LlmTensor::ATTN_QKV,
+                        "bias",
+                        bid,
+                        &[3 * lc.n_embd]
+                    ));
+                    l.wo = Some(req!(
+                        LlmTensor::ATTN_OUT,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, lc.n_embd]
+                    ));
+                    l.wo_b =
+                        Some(req!(LlmTensor::ATTN_OUT, "bias", bid, &[lc.n_embd]));
+
+                    l.ffn_norm = Some(req!(
+                        LlmTensor::FFN_NORM,
+                        "weight",
+                        bid,
+                        &[lc.n_embd]
+                    ));
+                    l.ffn_norm_b = Some(req!(
+                        LlmTensor::FFN_NORM,
+                        "bias",
+                        bid,
+                        &[lc.n_embd]
+                    ));
+                    l.ffn_up = Some(req!(
+                        LlmTensor::FFN_UP,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, n_ff_head]
+                    ));
+                    l.ffn_up_b =
+                        Some(req!(LlmTensor::FFN_UP, "bias", bid, &[n_ff_head]));
+                    l.ffn_down = Some(req!(
+                        LlmTensor::FFN_DOWN,
+                        "weight",
+                        bid,
+                        &[n_ff_head, lc.n_embd]
+                    ));
+                    l.ffn_down_b =
+                        Some(req!(LlmTensor::FFN_DOWN, "bias", bid, &[lc.n_embd]));
+                }
+
+                // one token type per question type (lfm2.cpp:81-83)
+                let n_token_types = ld.token_type_count() as i64;
+                if n_token_types != 3 {
+                    return Err(
+                        "decision model must have one token type per question type".into()
+                    );
+                }
+                extra.token_types = Some(req!(
+                    LlmTensor::TOKEN_TYPES,
+                    "weight",
+                    -1,
+                    &[lc.n_embd, n_token_types]
+                ));
+
+                extra.cls_norm = Some(req!(
+                    LlmTensor::CLS_NORM,
+                    "weight",
+                    -1,
+                    &[lc.n_embd]
+                ));
+                extra.cls_norm_b = Some(req!(
+                    LlmTensor::CLS_NORM,
+                    "bias",
+                    -1,
+                    &[lc.n_embd]
+                ));
+                extra.cls = Some(req!(
+                    LlmTensor::CLS,
+                    "weight",
+                    -1,
+                    &[lc.n_embd, lc.n_embd]
+                ));
+                extra.cls_b = Some(req!(LlmTensor::CLS, "bias", -1, &[lc.n_embd]));
+                decision_cls_out = Some(req!(
+                    LlmTensor::CLS_OUT,
+                    "weight",
+                    -1,
+                    &[lc.n_embd, 1]
+                ));
+                extra.cls_out_b = Some(req!(LlmTensor::CLS_OUT, "bias", -1, &[1]));
+            } else {
+                let mut out = opt!(LlmTensor::OUTPUT, "weight", -1, &[lc.n_embd, lc.n_vocab]);
+                // if output is NULL, init from the input tok embed
+                if out.is_none() {
+                    out = Some(dup_fallback!((lc.n_embd, lc.n_vocab)));
+                }
+                output = out;
             }
 
             let n_ff_exp = hparams.n_ff_exp(0) as i64;
 
-            for (i, l) in layers.iter_mut().enumerate() {
+            // the trunk stops before the head blocks (lfm2.cpp:88)
+            let n_layer_trunk = lc.n_layer as usize
+                - if decision { hparams.n_layer_decision as usize } else { 0 };
+            for (i, l) in layers.iter_mut().enumerate().take(n_layer_trunk) {
                 let bid = i as i32;
                 let il = i;
                 let is_moe_layer = i >= hparams.n_layer_dense_lead as usize;
@@ -2869,7 +3023,16 @@ fn load_arch_tensors(
                 &[hparams.n_embd_out() as i64]
             );
 
-            (tok_embd, output_norm, None, output.unwrap(), None)
+            // the decision files carry no lm_head — the head's cls_out scores
+            // replace it; the port's non-optional output slot reuses tok_embd
+            // (the hrm-text convention, never read on this path)
+            (
+                tok_embd,
+                output_norm,
+                None,
+                output.unwrap_or(tok_embd),
+                decision_cls_out,
+            )
         }
 
         // ---- models/granite-hybrid.cpp (granitehybrid) ----
@@ -3078,14 +3241,20 @@ fn load_arch_tensors(
         // models/clef.cpp (the clef arch inherits the qwen35 loader
         // wholesale, clef.cpp:27-28) ----
         LlmArch::QWEN35 | LlmArch::CLEF => {
-            // C++ `mtp_only`: the file has nextn layers but no trunk block 0
-            let mtp_only =
-                lc.n_layer_nextn > 0 && ld.gguf.find_tensor("blk.0.attn_norm.weight").is_none();
-            let trunk_flags = if mtp_only { TENSOR_NOT_REQUIRED } else { 0 };
-            // C++ `mtp_flags = !ml.load_mtp ? TENSOR_SKIP : 0`; the port has no
-            // load_mtp switch and no TENSOR_SKIP (see module docs), so MTP
-            // blocks are always loaded — equivalent to load_mtp = true.
-            let mtp_flags = 0u32;
+            // nextn_flags (448147d42, qwen35.cpp:31-34): the shared
+            // trunk/mtp probe — a file without blk.0.attn_norm.weight is
+            // MTP-only (trunk NOT_REQUIRED); a file without the first nextn
+            // tensor is trunk-only (mtp NOT_REQUIRED — new: trunk-only files
+            // are accepted). The port has no load_mtp switch (no TENSOR_SKIP,
+            // see module docs), so MTP blocks load when present.
+            let nf = nextn_flags(
+                ld.gguf,
+                LlmTensor::ATTN_NORM,
+                hparams.n_layer_all,
+                hparams.n_layer_nextn,
+            );
+            let trunk_flags = nf.trunk;
+            let mtp_flags = nf.mtp;
 
             let tok_embd = req!(
                 LlmTensor::TOKEN_EMBD,
@@ -10674,10 +10843,10 @@ fn load_arch_tensors(
 
                 // the NextN trio + the optional shared-head/embedding
                 // fallbacks (load_block_mtp's additive tail,
-                // qwen3next.cpp:106-121) — mtp_flags == 0 in the port
-                // (load_mtp always on), so they are REQUIRED on a nextn file
-                // and absent from a trunk-only one (the loop never reaches
-                // i >= n_layer there)
+                // qwen3next.cpp:106-121). 448147d42: mtp_flags is
+                // NOT_REQUIRED on a trunk-only file (nf.mtp), so a nextn
+                // block present in the file loads while pure trunk files
+                // pass — the port has no TENSOR_SKIP (load_mtp always on)
                 if skip {
                     l.nextn.eh_proj = Some(req!(
                         LlmTensor::NEXTN_EH_PROJ,
@@ -11164,13 +11333,20 @@ fn load_arch_tensors(
                 // blocks at i >= n_layer carry the gated-MLA attention set +
                 // the MoE FFN (the ffn_* requests below already cover them)
                 // + the nextn trio and the LAYER_OUT_NORM shared head norm.
-                // mtp_flags = trunk_only ? TENSOR_NOT_REQUIRED : 0
-                // (:46-49 — `blk.{n_layer}.nextn.eh_proj.weight` absent).
-                if skip {
-                    let mtp_probe = format!("blk.{}.nextn.eh_proj.weight", lc.n_layer);
-                    let trunk_only =
-                        lc.n_layer_nextn > 0 && ld.gguf.find_tensor(&mtp_probe).is_none();
-                    let mskip = trunk_only;
+                // The gate is the layer index; the requirement flag is
+                // nf.mtp (448147d42's shared probe — NOT_REQUIRED on a
+                // trunk-only file, `blk.{n_layer}.nextn.eh_proj.weight`
+                // absent).
+                if i >= lc.n_layer as usize {
+                    // 448147d42's shared probe for this arm (the bailingmoe3
+                    // trunk probe is ATTN_NORM)
+                    let nf = nextn_flags(
+                        ld.gguf,
+                        LlmTensor::ATTN_NORM,
+                        hparams.n_layer_all,
+                        hparams.n_layer_nextn,
+                    );
+                    let mskip = nf.mtp != 0;
                     if q_lora_rank > 0 {
                         l.wq_a = opt_or_req!(
                             LlmTensor::ATTN_Q_A,
@@ -11402,16 +11578,33 @@ fn load_arch_tensors(
             let n_embd_indexer = hparams.indexer_head_size as i64;
             let kpool = hparams.indexer_kpool as i64;
 
+            // nextn_flags (448147d42 + b9acf138a, glm5-next.cpp:67-80): a
+            // file without blk.0.attn_norm.weight is MTP-only (trunk
+            // NOT_REQUIRED); a file without the first nextn tensor is
+            // trunk-only (mtp NOT_REQUIRED). The port has no load_mtp switch
+            // so TENSOR_SKIP never applies (≡ load_mtp = true).
+            let nf = nextn_flags(
+                ld.gguf,
+                LlmTensor::ATTN_NORM,
+                hparams.n_layer_all,
+                hparams.n_layer_nextn,
+            );
+
             for (i, l) in layers.iter_mut().enumerate() {
                 let bid = i as i32;
-                let skip = i >= lc.n_layer; // the mtp_flags half in C
+                let skip = if i >= lc.n_layer {
+                    nf.mtp != 0
+                } else {
+                    nf.trunk != 0
+                };
 
                 l.attn_norm = opt_or_req!(LlmTensor::ATTN_NORM, "weight", bid, &[lc.n_embd], skip);
                 l.ffn_norm = opt_or_req!(LlmTensor::FFN_NORM, "weight", bid, &[lc.n_embd], skip);
 
                 // the mHC mixers exist on the trunk layers only
-                // (glm5-next.cpp:87-94)
-                if !skip {
+                // (glm5-next.cpp:87-94 — the gate is the layer index, the
+                // b9acf138a flags only relax the create_tensor requirement)
+                if i < lc.n_layer as usize {
                     l.hc_attn_fn = Some(req!(
                         LlmTensor::HC_ATTN_FN,
                         "weight",
@@ -11578,10 +11771,12 @@ fn load_arch_tensors(
                         skip
                     );
 
-                    // the k-pool indexer (glm5-next.cpp:141-154) — the NextN
-                    // block always has a full indexer; shared trunk layers
-                    // carry none (TENSOR_NOT_REQUIRED in C)
-                    let full = skip || hparams.is_indexer_full(i);
+                    // the k-pool indexer (glm5-next.cpp:141-154) — the
+                    // NextN block always has a full indexer; shared trunk
+                    // layers carry none (TENSOR_NOT_REQUIRED in C). The C's
+                    // `i >= n_layer || is_indexer_full(i)` short-circuits the
+                    // OOB abort on the nextn blocks.
+                    let full = i >= lc.n_layer as usize || hparams.is_indexer_full(i);
                     l.indexer_k_norm = opt_or_req!(
                         LlmTensor::INDEXER_K_NORM,
                         "weight",
@@ -11715,16 +11910,32 @@ fn load_arch_tensors(
                     );
                 }
 
-                if skip {
-                    // the NextN block (glm5-next.cpp:177-184)
-                    l.nextn.eh_proj = Some(req!(
+                // the NextN block (glm5-next.cpp:177-184) — gated by the
+                // layer index; the requirement flag is nf.mtp (448147d42:
+                // NOT_REQUIRED on a trunk-only file)
+                if i >= lc.n_layer as usize {
+                    let nskip = nf.mtp != 0;
+                    l.nextn.eh_proj = opt_or_req!(
                         LlmTensor::NEXTN_EH_PROJ,
                         "weight",
                         bid,
-                        &[2 * lc.n_embd, lc.n_embd]
-                    ));
-                    l.nextn.enorm = Some(req!(LlmTensor::NEXTN_ENORM, "weight", bid, &[lc.n_embd]));
-                    l.nextn.hnorm = Some(req!(LlmTensor::NEXTN_HNORM, "weight", bid, &[lc.n_embd]));
+                        &[2 * lc.n_embd, lc.n_embd],
+                        nskip
+                    );
+                    l.nextn.enorm = opt_or_req!(
+                        LlmTensor::NEXTN_ENORM,
+                        "weight",
+                        bid,
+                        &[lc.n_embd],
+                        nskip
+                    );
+                    l.nextn.hnorm = opt_or_req!(
+                        LlmTensor::NEXTN_HNORM,
+                        "weight",
+                        bid,
+                        &[lc.n_embd],
+                        nskip
+                    );
                     l.nextn.embed_tokens = opt!(
                         LlmTensor::NEXTN_EMBED_TOKENS,
                         "weight",
@@ -13390,14 +13601,19 @@ fn load_arch_tensors(
             let hc_dim = hc * lc.n_embd;
             let hc_lr = hparams.hc_low_rank as i64;
 
-            // an MTP-only file carries the MTP block, the embeddings and the
-            // LM head, but no trunk (a7b94df2c qwen4exp.cpp:178-181)
-            let mtp_only = lc.n_layer_nextn > 0
-                && ld.gguf.find_tensor("blk.0.hc_attn_norm.weight").is_none();
-            let trunk_flags = if mtp_only { TENSOR_NOT_REQUIRED } else { 0 };
-            // C++ `mtp_flags = ml.load_mtp ? 0 : TENSOR_SKIP`; the port has
-            // no load_mtp switch — MTP blocks always load
-            let mtp_flags = 0u32;
+            // nextn_flags (448147d42, qwen4exp.cpp:181-184): qwen4exp has
+            // no attn_norm — the trunk probe is HC_ATTN_NORM. A file without
+            // the first nextn tensor is trunk-only (mtp NOT_REQUIRED — new:
+            // trunk-only files are accepted). No load_mtp switch in the port
+            // (no TENSOR_SKIP), so MTP blocks load when present.
+            let nf = nextn_flags(
+                ld.gguf,
+                LlmTensor::HC_ATTN_NORM,
+                hparams.n_layer_all,
+                hparams.n_layer_nextn,
+            );
+            let trunk_flags = nf.trunk;
+            let mtp_flags = nf.mtp;
 
             let tok_embd = req!(
                 LlmTensor::TOKEN_EMBD,
@@ -19063,6 +19279,357 @@ fn load_arch_tensors(
             (tok_embd, output_norm, None, output, None)
         }
 
+        // ---- models/gemma-embedding2.cpp:21-73 (4fbc76dec) ----
+        LlmArch::GEMMA_EMBEDDING2 => {
+            let n_embd_per_layer = hparams.n_embd_per_layer as i64;
+            let n_embd_out = hparams.n_embd_out() as i64;
+
+            // :27-32
+            if lc.n_embd_head_k != lc.n_embd_head_v {
+                return Err("EmbeddingGemma2 requires n_embd_head_k == n_embd_head_v".into());
+            }
+            if hparams.n_embd_head_k_swa != hparams.n_embd_head_v_swa {
+                return Err(
+                    "EmbeddingGemma2 requires n_embd_head_k_swa == n_embd_head_v_swa".into()
+                );
+            }
+
+            let tok_embd = req!(
+                LlmTensor::TOKEN_EMBD,
+                "weight",
+                -1,
+                &[lc.n_embd, lc.n_vocab]
+            );
+
+            extra.per_layer_model_proj = Some(req!(
+                LlmTensor::PER_LAYER_MODEL_PROJ,
+                "weight",
+                0,
+                &[lc.n_embd, n_embd_per_layer * lc.n_layer as i64]
+            ));
+            extra.per_layer_proj_norm = Some(req!(
+                LlmTensor::PER_LAYER_PROJ_NORM,
+                "weight",
+                0,
+                &[n_embd_per_layer]
+            ));
+
+            let output_norm = req!(LlmTensor::OUTPUT_NORM, "weight", -1, &[lc.n_embd]);
+            // projects the final hidden state to the embedding dimension (:41)
+            let output = req!(
+                LlmTensor::OUTPUT,
+                "weight",
+                -1,
+                &[lc.n_embd, n_embd_out]
+            );
+
+            for (i, l) in layers.iter_mut().enumerate() {
+                let bid = i as i32;
+                // :45-48
+                let n_head = hparams.n_head(i) as i64;
+                let n_embd_head = hparams.n_embd_head_k(i) as i64;
+                let n_embd_k = hparams.n_embd_k_gqa(i) as i64;
+                let n_embd_v = hparams.n_embd_v_gqa(i) as i64;
+
+                l.attn_norm = Some(req!(LlmTensor::ATTN_NORM, "weight", bid, &[lc.n_embd]));
+
+                l.wq = Some(req!(
+                    LlmTensor::ATTN_Q,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, n_embd_head * n_head]
+                ));
+                l.wk = Some(req!(
+                    LlmTensor::ATTN_K,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, n_embd_k]
+                ));
+                l.wv = Some(req!(
+                    LlmTensor::ATTN_V,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, n_embd_v]
+                ));
+                l.wo = Some(req!(
+                    LlmTensor::ATTN_OUT,
+                    "weight",
+                    bid,
+                    &[n_embd_head * n_head, lc.n_embd]
+                ));
+
+                l.attn_q_norm = Some(req!(
+                    LlmTensor::ATTN_Q_NORM,
+                    "weight",
+                    bid,
+                    &[n_embd_head]
+                ));
+                l.attn_k_norm = Some(req!(
+                    LlmTensor::ATTN_K_NORM,
+                    "weight",
+                    bid,
+                    &[n_embd_head]
+                ));
+                l.attn_post_norm = Some(req!(
+                    LlmTensor::ATTN_POST_NORM,
+                    "weight",
+                    bid,
+                    &[lc.n_embd]
+                ));
+
+                l.ffn_norm = Some(req!(LlmTensor::FFN_NORM, "weight", bid, &[lc.n_embd]));
+                l.ffn_gate = Some(req!(
+                    LlmTensor::FFN_GATE,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, lc.n_ff]
+                ));
+                l.ffn_up = Some(req!(
+                    LlmTensor::FFN_UP,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, lc.n_ff]
+                ));
+                l.ffn_down = Some(req!(
+                    LlmTensor::FFN_DOWN,
+                    "weight",
+                    bid,
+                    &[lc.n_ff, lc.n_embd]
+                ));
+                l.ffn_post_norm = Some(req!(
+                    LlmTensor::FFN_POST_NORM,
+                    "weight",
+                    bid,
+                    &[lc.n_embd]
+                ));
+
+                l.per_layer_inp_gate = Some(req!(
+                    LlmTensor::PER_LAYER_INP_GATE,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, n_embd_per_layer]
+                ));
+                l.per_layer_proj = Some(req!(
+                    LlmTensor::PER_LAYER_PROJ,
+                    "weight",
+                    bid,
+                    &[n_embd_per_layer, lc.n_embd]
+                ));
+                l.per_layer_post_norm = Some(req!(
+                    LlmTensor::PER_LAYER_POST_NORM,
+                    "weight",
+                    bid,
+                    &[lc.n_embd]
+                ));
+
+                l.out_scale = Some(req!(
+                    LlmTensor::LAYER_OUT_SCALE,
+                    "weight",
+                    bid,
+                    &[1]
+                ));
+            }
+            (tok_embd, output_norm, None, output, None)
+        }
+
+        // ---- models/k2-horizon.cpp:51-117 (462524043): dense + MoVA hybrid —
+        // the MoVA layers trade wv for the attn_v_gate/attn_v_exps pair ----
+        LlmArch::K2_HORIZON => {
+            let tok_embd = req!(
+                LlmTensor::TOKEN_EMBD,
+                "weight",
+                -1,
+                &[lc.n_embd, lc.n_vocab]
+            );
+
+            let output_norm = req!(LlmTensor::OUTPUT_NORM, "weight", -1, &[lc.n_embd]);
+            let mut output = opt!(LlmTensor::OUTPUT, "weight", -1, &[lc.n_embd, lc.n_vocab]);
+            // if output is NULL, init from the input tok embed (:58-62)
+            if output.is_none() {
+                output = Some(dup_fallback!((lc.n_embd, lc.n_vocab)));
+            }
+
+            let n_value_expert = hparams.n_value_expert as i64;
+            let n_expert_shared = hparams.n_expert_shared;
+
+            for (i, l) in layers.iter_mut().enumerate() {
+                let bid = i as i32;
+
+                // :67-68
+                let is_moe_layer =
+                    hparams.n_expert > 0 && i as u32 >= hparams.n_layer_dense_lead;
+                let is_mova_layer = is_moe_layer && hparams.n_value_expert > 0;
+
+                l.attn_norm = Some(req!(LlmTensor::ATTN_NORM, "weight", bid, &[lc.n_embd]));
+
+                l.wq = Some(req!(
+                    LlmTensor::ATTN_Q,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, lc.n_embd_head_k * lc.n_head]
+                ));
+                l.wk = Some(req!(
+                    LlmTensor::ATTN_K,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, lc.n_embd_k_gqa]
+                ));
+                // one norm weight per head, stored flat; viewed as
+                // {head_dim, n_head} so it splits by head like Q/K (:74-76)
+                l.attn_q_norm = opt_flags!(
+                    LlmTensor::ATTN_Q_NORM,
+                    "weight",
+                    bid,
+                    &[lc.n_embd_head_k, lc.n_head],
+                    TENSOR_NOT_REQUIRED | TENSOR_ALLOW_RESHAPE
+                );
+                l.attn_k_norm = opt_flags!(
+                    LlmTensor::ATTN_K_NORM,
+                    "weight",
+                    bid,
+                    &[lc.n_embd_head_k, lc.n_head_kv],
+                    TENSOR_NOT_REQUIRED | TENSOR_ALLOW_RESHAPE
+                );
+
+                if is_mova_layer {
+                    // MoVA: the routed value experts replace wv (:78-81)
+                    l.attn_v_gate = Some(req!(
+                        LlmTensor::ATTN_V_GATE,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, n_value_expert]
+                    ));
+                    l.attn_v_gate_b = opt_flags!(
+                        LlmTensor::ATTN_V_GATE,
+                        "bias",
+                        bid,
+                        &[n_value_expert],
+                        TENSOR_NOT_REQUIRED
+                    );
+                    l.attn_v_exps = Some(req!(
+                        LlmTensor::ATTN_V_EXPS,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, lc.n_embd_v_gqa, n_value_expert]
+                    ));
+                } else {
+                    l.wv = Some(req!(
+                        LlmTensor::ATTN_V,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, lc.n_embd_v_gqa]
+                    ));
+                }
+
+                l.wo = Some(req!(
+                    LlmTensor::ATTN_OUT,
+                    "weight",
+                    bid,
+                    &[lc.n_embd_head_v * lc.n_head, lc.n_embd]
+                ));
+                l.wqkv_gate = opt_flags!(
+                    LlmTensor::ATTN_GATE,
+                    "weight",
+                    bid,
+                    &[lc.n_embd, lc.n_embd_head_v * lc.n_head],
+                    TENSOR_NOT_REQUIRED
+                );
+
+                l.ffn_norm = Some(req!(LlmTensor::FFN_NORM, "weight", bid, &[lc.n_embd]));
+
+                if is_moe_layer {
+                    let n_ff_exp = hparams.n_ff_exp(i) as i64;
+                    // :93-95
+                    if n_ff_exp == 0 {
+                        return Err(
+                            "K2 Horizon MoE layer requires expert_feed_forward_length".into()
+                        );
+                    }
+
+                    l.ffn_gate_inp = Some(req!(
+                        LlmTensor::FFN_GATE_INP,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, lc.n_expert]
+                    ));
+                    l.ffn_exp_probs_b = opt_flags!(
+                        LlmTensor::FFN_EXP_PROBS_B,
+                        "bias",
+                        bid,
+                        &[lc.n_expert],
+                        TENSOR_NOT_REQUIRED
+                    );
+
+                    l.ffn_up_exps = Some(req!(
+                        LlmTensor::FFN_UP_EXPS,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, n_ff_exp, lc.n_expert]
+                    ));
+                    l.ffn_gate_exps = Some(req!(
+                        LlmTensor::FFN_GATE_EXPS,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, n_ff_exp, lc.n_expert]
+                    ));
+                    l.ffn_down_exps = Some(req!(
+                        LlmTensor::FFN_DOWN_EXPS,
+                        "weight",
+                        bid,
+                        &[n_ff_exp, lc.n_embd, lc.n_expert]
+                    ));
+
+                    // :104-110 — the shexp width falls back to n_expert_shared
+                    // copies of the routed width
+                    if n_expert_shared > 0 {
+                        let n_ff_shexp = if hparams.n_ff_shexp > 0 {
+                            hparams.n_ff_shexp as i64
+                        } else {
+                            n_ff_exp * n_expert_shared as i64
+                        };
+                        l.ffn_up_shexp = Some(req!(
+                            LlmTensor::FFN_UP_SHEXP,
+                            "weight",
+                            bid,
+                            &[lc.n_embd, n_ff_shexp]
+                        ));
+                        l.ffn_gate_shexp = Some(req!(
+                            LlmTensor::FFN_GATE_SHEXP,
+                            "weight",
+                            bid,
+                            &[lc.n_embd, n_ff_shexp]
+                        ));
+                        l.ffn_down_shexp = Some(req!(
+                            LlmTensor::FFN_DOWN_SHEXP,
+                            "weight",
+                            bid,
+                            &[n_ff_shexp, lc.n_embd]
+                        ));
+                    }
+                } else {
+                    l.ffn_up = Some(req!(
+                        LlmTensor::FFN_UP,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, lc.n_ff]
+                    ));
+                    l.ffn_gate = Some(req!(
+                        LlmTensor::FFN_GATE,
+                        "weight",
+                        bid,
+                        &[lc.n_embd, lc.n_ff]
+                    ));
+                    l.ffn_down = Some(req!(
+                        LlmTensor::FFN_DOWN,
+                        "weight",
+                        bid,
+                        &[lc.n_ff, lc.n_embd]
+                    ));
+                }
+            }
+            (tok_embd, output_norm, None, output.unwrap(), None)
+        }
+
         _ => {
             return Err(format!(
                 "arch '{}' tensor loading not ported yet",
@@ -21390,6 +21957,93 @@ fn load_arch_hparams_batch(gguf: &Gguf, arch: LlmArch, h: &mut LlamaHparams) -> 
             }
         }
 
+        // ---- models/k2-horizon.cpp:3-49 (462524043) ----
+        LlmArch::K2_HORIZON => {
+            if let Some(v) = gguf.get_f32(&k(LlmKv::ROPE_SCALING_YARN_BETA_FAST)) {
+                h.yarn_beta_fast = v;
+            }
+            if let Some(v) = gguf.get_f32(&k(LlmKv::ROPE_SCALING_YARN_BETA_SLOW)) {
+                h.yarn_beta_slow = v;
+            }
+            h.f_norm_rms_eps = req_f32(k(LlmKv::ATTENTION_LAYERNORM_RMS_EPS))?;
+            if let Some(v) = gguf.get_u32(&k(LlmKv::ATTENTION_GROUPNORM_GROUPS)) {
+                h.n_norm_groups = v;
+            }
+            if h.n_norm_groups == 0 {
+                h.n_norm_groups = 1; // :8-10
+            }
+
+            if h.n_expert > 0 {
+                let vals = get_key_or_arr_u32_local(
+                    gguf,
+                    &k(LlmKv::EXPERT_FEED_FORWARD_LENGTH),
+                    h.n_layer_all as usize,
+                )?
+                .ok_or_else(|| format!("key {} not found", k(LlmKv::EXPERT_FEED_FORWARD_LENGTH)))?;
+                h.n_ff_exp_arr[..vals.len()].copy_from_slice(&vals);
+                if let Some(v) = gguf.get_u32(&k(LlmKv::LEADING_DENSE_BLOCK_COUNT)) {
+                    h.n_layer_dense_lead = v;
+                }
+                if let Some(v) = gguf.get_u32(&k(LlmKv::MOE_EVERY_N_LAYERS)) {
+                    h.moe_every_n_layers = v;
+                }
+                if let Some(v) = gguf.get_u32(&k(LlmKv::EXPERT_SHARED_COUNT)) {
+                    h.n_expert_shared = v;
+                }
+                if let Some(v) = gguf.get_u32(&k(LlmKv::EXPERT_SHARED_FEED_FORWARD_LENGTH)) {
+                    h.n_ff_shexp = v;
+                }
+                if let Some(v) = gguf.get_f32(&k(LlmKv::EXPERT_WEIGHTS_SCALE)) {
+                    h.expert_weights_scale = v;
+                }
+                if let Some(v) = gguf.get_bool(&k(LlmKv::EXPERT_WEIGHTS_NORM)) {
+                    h.expert_weights_norm = v;
+                }
+                if let Some(v) = gguf.get_u32(&k(LlmKv::EXPERT_GATING_FUNC)) {
+                    h.expert_gating_func = v;
+                }
+                if h.expert_gating_func == 0 {
+                    // LLAMA_EXPERT_GATING_FUNC_TYPE_NONE -> SIGMOID (:21-23)
+                    h.expert_gating_func = 2;
+                }
+            }
+
+            // MoVA (:26-35)
+            if let Some(v) = gguf.get_u32(&k(LlmKv::ATTENTION_VALUE_EXPERT_COUNT)) {
+                h.n_value_expert = v;
+            }
+            if let Some(v) = gguf.get_u32(&k(LlmKv::ATTENTION_VALUE_EXPERT_USED_COUNT)) {
+                h.n_value_expert_used = v;
+            }
+            if h.n_value_expert > 0 {
+                // GGML_ASSERT(n_value_expert <= LLAMA_MAX_EXPERTS); used > 0;
+                // used <= n_value_expert
+                assert!(h.n_value_expert <= LLAMA_MAX_EXPERTS as u32);
+                assert!(h.n_value_expert_used > 0);
+                assert!(h.n_value_expert_used <= h.n_value_expert);
+            } else {
+                assert!(h.n_value_expert_used == 0);
+            }
+        }
+
+        // ---- models/gemma-embedding2.cpp:3-19 (4fbc76dec) ----
+        LlmArch::GEMMA_EMBEDDING2 => {
+            h.swa_type = LlamaSwaType::SYMMETRIC;
+            b8_load_swa_pattern(gguf, arch, h, 6, false)?; // load_swa_pattern(ml, 6)
+
+            // embeddings do not use causal attention (:7); the q_norm makes
+            // the scaling unnecessary (:8)
+            h.causal_attn = false;
+            h.f_attention_scale = 1.0;
+
+            if let Some(v) = gguf.get_f32(&k(LlmKv::ROPE_FREQ_BASE_SWA)) {
+                h.rope_freq_base_train_swa = v;
+            }
+            h.n_swa = req_u32(k(LlmKv::ATTENTION_SLIDING_WINDOW))?;
+            h.f_norm_rms_eps = req_f32(k(LlmKv::ATTENTION_LAYERNORM_RMS_EPS))?;
+            h.n_embd_per_layer = req_u32(k(LlmKv::EMBEDDING_LENGTH_PER_LAYER))?;
+        }
+
         _ => {}
     }
 
@@ -21720,6 +22374,8 @@ impl LlamaModel {
                 mean_first: self.hparams.pooling_type_cls
                     == crate::hparams::LlamaPoolingType::MEAN,
                 modern_bert: false,
+                // 37ac63456: the classifier activation (tanh default)
+                act_cls: self.hparams.act_cls,
             }),
             (None, _) => None,
         };
@@ -21829,6 +22485,9 @@ impl LlamaModel {
                 mean_first: self.hparams.pooling_type_cls
                     == crate::hparams::LlamaPoolingType::MEAN,
                 modern_bert: true,
+                // 37ac63456: gelu_erf unless the file names one (the
+                // modern-bert loader default)
+                act_cls: self.hparams.act_cls,
             })
         } else {
             None
@@ -22075,6 +22734,268 @@ impl LlamaModel {
         }
     }
 
+    /// `models/k2-horizon.cpp:51-117` members (462524043) — the dense + MoVA
+    /// hybrid bundle for `graph_arch::build_k2_horizon_forward`.
+    pub fn k2_horizon_weights(&self) -> crate::graph_arch::K2HorizonModelWeights {
+        use crate::graph_arch as ga;
+        assert_eq!(
+            self.arch,
+            LlmArch::K2_HORIZON,
+            "k2_horizon_weights on {:?}",
+            self.arch
+        );
+        let layers = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(il, l)| ga::K2HorizonLayerWeights {
+                attn_norm: l
+                    .attn_norm
+                    .unwrap_or_else(|| panic!("layer {il}: attn_norm")),
+                wq: l.wq.unwrap_or_else(|| panic!("layer {il}: wq")),
+                wk: l.wk.unwrap_or_else(|| panic!("layer {il}: wk")),
+                attn_q_norm: l.attn_q_norm,
+                attn_k_norm: l.attn_k_norm,
+                attn_v_gate: l.attn_v_gate,
+                attn_v_gate_b: l.attn_v_gate_b,
+                attn_v_exps: l.attn_v_exps,
+                wv: l.wv,
+                wo: l.wo.unwrap_or_else(|| panic!("layer {il}: wo")),
+                wo_b: l.wo_b,
+                wqkv_gate: l.wqkv_gate,
+                ffn_norm: l
+                    .ffn_norm
+                    .unwrap_or_else(|| panic!("layer {il}: ffn_norm")),
+                ffn_gate: l.ffn_gate,
+                ffn_up: l.ffn_up,
+                ffn_down: l.ffn_down,
+                ffn_gate_inp: l.ffn_gate_inp,
+                ffn_exp_probs_b: l.ffn_exp_probs_b,
+                ffn_gate_exps: l.ffn_gate_exps,
+                ffn_up_exps: l.ffn_up_exps,
+                ffn_down_exps: l.ffn_down_exps,
+                ffn_gate_shexp: l.ffn_gate_shexp,
+                ffn_up_shexp: l.ffn_up_shexp,
+                ffn_down_shexp: l.ffn_down_shexp,
+            })
+            .collect();
+        ga::K2HorizonModelWeights {
+            tok_embd: self.tok_embd,
+            output_norm: self.output_norm,
+            output: self.output,
+            layers,
+        }
+    }
+
+    /// `models/gemma-embedding2.cpp:21-73` members (4fbc76dec) — the
+    /// text+vision+audio embedding bundle for
+    /// `graph_arch::build_gemma_embedding2_forward`.
+    pub fn gemma_embedding2_weights(&self) -> crate::graph_arch::GemmaEmbedding2ModelWeights {
+        use crate::graph_arch as ga;
+        assert_eq!(
+            self.arch,
+            LlmArch::GEMMA_EMBEDDING2,
+            "gemma_embedding2_weights on {:?}",
+            self.arch
+        );
+        let layers = self
+            .layers
+            .iter()
+            .enumerate()
+            .map(|(il, l)| ga::GemmaEmbedding2LayerWeights {
+                attn_norm: l
+                    .attn_norm
+                    .unwrap_or_else(|| panic!("layer {il}: attn_norm")),
+                wq: l.wq.unwrap_or_else(|| panic!("layer {il}: wq")),
+                wk: l.wk.unwrap_or_else(|| panic!("layer {il}: wk")),
+                wv: l.wv.unwrap_or_else(|| panic!("layer {il}: wv")),
+                wo: l.wo.unwrap_or_else(|| panic!("layer {il}: wo")),
+                attn_q_norm: l
+                    .attn_q_norm
+                    .unwrap_or_else(|| panic!("layer {il}: attn_q_norm")),
+                attn_k_norm: l
+                    .attn_k_norm
+                    .unwrap_or_else(|| panic!("layer {il}: attn_k_norm")),
+                attn_post_norm: l
+                    .attn_post_norm
+                    .unwrap_or_else(|| panic!("layer {il}: attn_post_norm")),
+                ffn_norm: l
+                    .ffn_norm
+                    .unwrap_or_else(|| panic!("layer {il}: ffn_norm")),
+                ffn_gate: l
+                    .ffn_gate
+                    .unwrap_or_else(|| panic!("layer {il}: ffn_gate")),
+                ffn_down: l
+                    .ffn_down
+                    .unwrap_or_else(|| panic!("layer {il}: ffn_down")),
+                ffn_up: l.ffn_up.unwrap_or_else(|| panic!("layer {il}: ffn_up")),
+                ffn_post_norm: l
+                    .ffn_post_norm
+                    .unwrap_or_else(|| panic!("layer {il}: ffn_post_norm")),
+                per_layer_inp_gate: l
+                    .per_layer_inp_gate
+                    .unwrap_or_else(|| panic!("layer {il}: per_layer_inp_gate")),
+                per_layer_proj: l
+                    .per_layer_proj
+                    .unwrap_or_else(|| panic!("layer {il}: per_layer_proj")),
+                per_layer_post_norm: l
+                    .per_layer_post_norm
+                    .unwrap_or_else(|| panic!("layer {il}: per_layer_post_norm")),
+                out_scale: l
+                    .out_scale
+                    .unwrap_or_else(|| panic!("layer {il}: out_scale")),
+            })
+            .collect();
+        ga::GemmaEmbedding2ModelWeights {
+            tok_embd: self.tok_embd,
+            per_layer_model_proj: self
+                .per_layer_model_proj
+                .expect("gemma_embedding2_weights: per_layer_model_proj"),
+            per_layer_proj_norm: self
+                .per_layer_proj_norm
+                .expect("gemma_embedding2_weights: per_layer_proj_norm"),
+            output_norm: self.output_norm,
+            output: self.output,
+            layers,
+        }
+    }
+
+    /// `models/lfm2.cpp:396-500` `graph_decision`'s weight bundle (88dcc460d
+    /// + a657f7e98) — the LFM2-decision form (`n_layer_decision > 0`): the
+    /// trunk blocks (layers[0..n_layer - n_layer_decision]) + the decision
+    /// head. The same derivation `tests/lfm2_decision_e2e.rs::weights_of`
+    /// pins.
+    pub fn lfm2_decision_weights(&self) -> crate::graph_arch::Lfm2DecisionModelWeights {
+        use crate::graph_arch as ga;
+        assert_eq!(
+            self.arch, LlmArch::LFM2,
+            "lfm2_decision_weights on {:?}",
+            self.arch
+        );
+        assert!(
+            self.hparams.n_layer_decision > 0,
+            "lfm2_decision_weights: n_layer_decision == 0 (the plain lfm2 form)"
+        );
+        let n_layer_all = self.hparams.n_layer() as usize;
+        let n_decision = self.hparams.n_layer_decision as usize;
+        let n_trunk = n_layer_all - n_decision;
+        let trunk_layers = self.layers[..n_trunk]
+            .iter()
+            .enumerate()
+            .map(|(il, l)| ga::Lfm2LayerWeights {
+                attn_norm: l
+                    .attn_norm
+                    .unwrap_or_else(|| panic!("trunk layer {il}: attn_norm")),
+                shortconv_conv: l.shortconv_conv,
+                shortconv_in_proj: l.shortconv_in_proj,
+                shortconv_out_proj: l.shortconv_out_proj,
+                wq: l.wq,
+                wk: l.wk,
+                wv: l.wv,
+                wo: l.wo,
+                attn_q_norm: l.attn_q_norm,
+                attn_k_norm: l.attn_k_norm,
+                wq_b: l.wq_b,
+                wk_b: l.wk_b,
+                wv_b: l.wv_b,
+                ffn_norm: l
+                    .ffn_norm
+                    .unwrap_or_else(|| panic!("trunk layer {il}: ffn_norm")),
+                ffn_gate: l.ffn_gate,
+                ffn_down: l.ffn_down,
+                ffn_up: l.ffn_up,
+                ffn_gate_inp: l.ffn_gate_inp,
+                ffn_gate_exps: l.ffn_gate_exps,
+                ffn_down_exps: l.ffn_down_exps,
+                ffn_up_exps: l.ffn_up_exps,
+                ffn_exp_probs_b: l.ffn_exp_probs_b,
+            })
+            .collect();
+        let head_layers = self.layers[n_trunk..n_layer_all]
+            .iter()
+            .enumerate()
+            .map(|(il, l)| ga::Lfm2DecisionHeadLayerWeights {
+                attn_norm: l
+                    .attn_norm
+                    .unwrap_or_else(|| panic!("head layer {il}: attn_norm")),
+                attn_norm_b: l
+                    .attn_norm_b
+                    .unwrap_or_else(|| panic!("head layer {il}: attn_norm_b")),
+                wqkv: l.wqkv.unwrap_or_else(|| panic!("head layer {il}: wqkv")),
+                wqkv_b: l
+                    .wqkv_b
+                    .unwrap_or_else(|| panic!("head layer {il}: wqkv_b")),
+                wo: l.wo.unwrap_or_else(|| panic!("head layer {il}: wo")),
+                wo_b: l.wo_b.unwrap_or_else(|| panic!("head layer {il}: wo_b")),
+                ffn_norm: l
+                    .ffn_norm
+                    .unwrap_or_else(|| panic!("head layer {il}: ffn_norm")),
+                ffn_norm_b: l
+                    .ffn_norm_b
+                    .unwrap_or_else(|| panic!("head layer {il}: ffn_norm_b")),
+                ffn_up: l.ffn_up.unwrap_or_else(|| panic!("head layer {il}: ffn_up")),
+                ffn_up_b: l
+                    .ffn_up_b
+                    .unwrap_or_else(|| panic!("head layer {il}: ffn_up_b")),
+                ffn_down: l.ffn_down.unwrap_or_else(|| panic!("head layer {il}: ffn_down")),
+                ffn_down_b: l
+                    .ffn_down_b
+                    .unwrap_or_else(|| panic!("head layer {il}: ffn_down_b")),
+            })
+            .collect();
+        ga::Lfm2DecisionModelWeights {
+            tok_embd: self.tok_embd,
+            output_norm: self.output_norm,
+            type_embd: self.token_types.expect("lfm2 decision: token_types"),
+            cls_norm: self.cls_norm.expect("lfm2 decision: cls_norm"),
+            cls_norm_b: self.cls_norm_b.expect("lfm2 decision: cls_norm_b"),
+            cls: self.cls.expect("lfm2 decision: cls"),
+            cls_b: self.cls_b.expect("lfm2 decision: cls_b"),
+            cls_out: self.cls_out.expect("lfm2 decision: cls_out"),
+            cls_out_b: self.cls_out_b.expect("lfm2 decision: cls_out_b"),
+            trunk_layers,
+            head_layers,
+        }
+    }
+
+    /// the decision graph's geometry (lfm2.cpp:396-413 reads the same hparams
+    /// members the decode graph does) — the same derivation
+    /// `tests/lfm2_decision_e2e.rs::params_of` pins.
+    pub fn lfm2_decision_params(&self) -> crate::graph_arch::Lfm2DecisionParams {
+        let hp = &self.hparams;
+        let n_layer_all = hp.n_layer() as usize;
+        let n_decision = hp.n_layer_decision as usize;
+        let n_trunk = n_layer_all - n_decision;
+        let rope = hp.rope_runtime();
+        crate::graph_arch::Lfm2DecisionParams {
+            n_embd: hp.n_embd as i64,
+            is_recr: (0..n_trunk).map(|il| hp.is_recr(il)).collect(),
+            n_shortconv_l_cache: hp.n_shortconv_l_cache as i64,
+            norm_rms_eps: hp.f_norm_rms_eps,
+            n_head: (0..n_trunk).map(|il| hp.n_head(il) as i64).collect(),
+            n_head_kv: (0..n_trunk).map(|il| hp.n_head_kv(il) as i64).collect(),
+            n_embd_head: hp.n_embd_head_k(0) as i64,
+            rope: crate::graph_arch::EurobertRope {
+                n_rot: hp.n_rot(0) as i32,
+                // llama_model_rope_type(LFM2) = NEOX (llama-model.cpp:3202)
+                rope_mode: hp.rope_type as i32,
+                n_ctx_orig: rope.n_ctx_orig_yarn,
+                freq_base: hp.rope_freq_base_train,
+                freq_scale: rope.freq_scale,
+                ext_factor: rope.ext_factor,
+                attn_factor: rope.attn_factor,
+                beta_fast: rope.beta_fast,
+                beta_slow: rope.beta_slow,
+            },
+            f_norm_eps: hp.f_norm_eps,
+            head_n_head: (n_trunk..n_layer_all).map(|il| hp.n_head(il) as i64).collect(),
+            head_n_head_kv: (n_trunk..n_layer_all)
+                .map(|il| hp.n_head_kv(il) as i64)
+                .collect(),
+            n_layer_decision: n_decision,
+        }
+    }
+
     pub fn eurobert_weights(&self) -> crate::graph_arch::EurobertModelWeights {
         use crate::graph_arch as ga;
         assert_eq!(
@@ -22113,6 +23034,83 @@ impl LlamaModel {
             layers,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// arch predicates (llama-arch.cpp — the port keeps them out of the generated
+// arch.rs so domains can call them)
+// ---------------------------------------------------------------------------
+
+/// `llm_arch_supports_mixed_batch` (llama-arch.cpp:1189-1202 @c35b66744,
+/// added by 0bb496dbd) — these models pick weights, routing or input meaning
+/// per ubatch based on token vs embd input, so a batch mixing token and embd
+/// entries is rejected for them. Everything else accepts mixed batches
+/// (`llama_batch_allocr(n_pos_per_embd, allow_mixed)` receives
+/// `llm_arch_supports_mixed_batch(arch) && ctx_type == DEFAULT`,
+/// llama-context.cpp:90-92).
+pub fn llm_arch_supports_mixed_batch(arch: LlmArch) -> bool {
+    !matches!(
+        arch,
+        LlmArch::COGVLM
+            | LlmArch::DEEPSEEK4
+            | LlmArch::GRANITE_SWITCH
+            | LlmArch::EAGLE3
+            | LlmArch::DFLASH
+            | LlmArch::GEMMA4_ASSISTANT
+    )
+}
+
+/// `llama_model_base::nextn_flags` (448147d42, llama-model.cpp:3464-3480 +
+/// llama-model.h:852-858) — tensor flags for a file that holds the trunk,
+/// the NextN layers, or both. A file without the first trunk layer is
+/// MTP-only, a file without the first NextN layer is trunk-only.
+///
+/// The port's loader probe is `gguf.find_tensor` (the C's
+/// `ml.get_weight(...) == nullptr`); `n_layer_all - n_layer_nextn` is the
+/// first NextN block id (the C's `hparams.n_layer()`).
+pub fn nextn_flags(
+    gguf: &ggml::gguf::Gguf,
+    trunk_probe: crate::arch::LlmTensor,
+    n_layer_all: u32,
+    n_layer_nextn: u32,
+) -> NextnFlags {
+    let mut trunk = 0u32;
+    let mut mtp = 0u32;
+
+    if n_layer_nextn > 0 {
+        let n_layer = n_layer_all - n_layer_nextn;
+        // a file without the first trunk layer is MTP-only
+        let trunk_name = crate::arch::tensor_name_suffix(trunk_probe, "weight", 0, -1);
+        if gguf.find_tensor(&trunk_name).is_none() {
+            trunk = TENSOR_NOT_REQUIRED;
+        }
+        // a file without the first NextN layer is trunk-only
+        let mtp_name = crate::arch::tensor_name_suffix(
+            crate::arch::LlmTensor::NEXTN_EH_PROJ,
+            "weight",
+            n_layer as i32,
+            -1,
+        );
+        if gguf.find_tensor(&mtp_name).is_none() {
+            mtp = TENSOR_NOT_REQUIRED;
+        }
+    }
+
+    // C: `if (!ml.load_mtp) { mtp |= TENSOR_SKIP; }` — the port has no
+    // load_mtp switch (≡ load_mtp = true, see module docs), so TENSOR_SKIP
+    // is never applied (model.rs:29-32).
+
+    NextnFlags { trunk, mtp }
+}
+
+/// `llama_model_base::nextn_flags_t` (llama-model.h:852-858, 448147d42).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NextnFlags {
+    /// `TENSOR_NOT_REQUIRED` when the file holds only the NextN layers
+    pub trunk: u32,
+    /// `TENSOR_NOT_REQUIRED` when the file holds only the trunk,
+    /// `TENSOR_SKIP` when MTP is not loaded (never in the port)
+    pub mtp: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -23843,9 +24841,12 @@ mod batch12_count_check {
         // encoder-decoder arch); 148 with sync batch A's GLM5_NEXT (Partial —
         // loader/table face, the graph lands with the kpool memory port,
         // PARITY.md sync batch A §2); 149 with sync batch A2's CLEF (Full —
-        // clef.rs + the decision tables, PARITY.md sync batch A2)
+        // clef.rs + the decision tables, PARITY.md sync batch A2); 151 with
+        // sync batch 3's K2_HORIZON + GEMMA_EMBEDDING2 (both Partial —
+        // graphs + CLI/ForwardWeights routing landed with the batch; the
+        // lfm2-decision files reuse the LFM2 arch, no count)
         assert_eq!(
-            n, 149,
+            n, 151,
             "arch_tensors_support ported count"
         );
     }

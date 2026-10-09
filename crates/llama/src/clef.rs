@@ -864,11 +864,13 @@ impl ClefState {
         })
         .unwrap();
 
-        // the causal mask: token j attends to every token whose position
-        // is at or before its own (set_input_kq_mask's causal rule for one
-        // sequence, llama-kv-cache.cpp:1557-1705; clef.cpp:393-407 pins
-        // causal_attn = true even on the encoder path)
-        let visible = |i: usize, j: usize| pos[i] <= pos[j];
+        // the causal mask, causal BY BATCH ORDER: token j attends to every
+        // token at or before its own index in the batch (9871df591's
+        // llm_graph_input_attn_clef, clef.cpp:317-340 — the tokens of an
+        // image share the same position, so the old pos-based rule
+        // (clef.cpp:393-407) would over-attend; same sequence only, the
+        // port's driver is single-sequence)
+        let visible = |i: usize, j: usize| i <= j;
         if mask_ty == GgmlType::F16 {
             let bytes = gctx.data_bytes_mut(kq_mask).unwrap();
             let m: &mut [half::f16] = bytemuck::cast_slice_mut(bytes);

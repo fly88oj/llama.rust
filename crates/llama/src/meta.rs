@@ -389,6 +389,17 @@ fn detect_arch(gguf: &Gguf) -> LlmArch {
 /// Note: the C++ `hparams.vocab_only` early return cannot trigger here (the
 /// vocab module is loaded separately in the port), so the full path always
 /// runs — matching a normal `llama_model_load` invocation.
+/// `LLM_CLS_ACT_TYPES_FROM_STRING` (37ac63456, llama-model.cpp): the
+/// transformers names — "gelu" is the exact (erf) variant.
+fn cls_act_from_string(name: &str) -> Option<i32> {
+    match name {
+        "gelu" => Some(ggml::ops::GGML_UNARY_OP_GELU_ERF),
+        "silu" => Some(ggml::ops::GGML_UNARY_OP_SILU),
+        "tanh" => Some(ggml::ops::GGML_UNARY_OP_TANH),
+        _ => None,
+    }
+}
+
 pub fn load_hparams(gguf: &Gguf) -> Result<(LlmArch, LlamaHparams), String> {
     let arch = detect_arch(gguf);
 
@@ -417,6 +428,12 @@ fn load_hparams_generic(gguf: &Gguf, arch: LlmArch, h: &mut LlamaHparams) -> Res
     // required general model keys
     h.n_ctx_train = get_key_u32(gguf, &k(LlmKv::CONTEXT_LENGTH), true)?.unwrap();
     h.n_embd = get_key_u32(gguf, &k(LlmKv::EMBEDDING_LENGTH), true)?.unwrap();
+    // the classifier head activation (37ac63456, llama-model.cpp:1382-1388)
+    if let Some(act) = get_key_string(gguf, &k(LlmKv::CLASSIFIER_ACTIVATION), false)? {
+        h.act_cls = cls_act_from_string(&act)
+            .ok_or_else(|| format!("unsupported classifier activation: {act}"))?;
+    }
+
     if let Some(v) = get_key_u32(gguf, &k(LlmKv::EMBEDDING_LENGTH_OUT), false)? {
         h.n_embd_out_impl = v;
     }
@@ -1307,6 +1324,21 @@ fn load_arch_hparams(gguf: &Gguf, arch: LlmArch, h: &mut LlamaHparams) -> Result
             }
 
             h.n_layer_dense_lead = h.n_layer();
+
+            // the decision-model head (88dcc460d, lfm2.cpp:29-35): trailing
+            // blocks scored per question type — one token type each
+            if let Some(v) = get_key_u32(gguf, &k(LlmKv::DECISION_BLOCK_COUNT), false)? {
+                h.n_layer_decision = v;
+            }
+            if h.n_layer_decision > 0 {
+                if h.n_layer_decision >= h.n_layer() || h.causal_attn {
+                    return Err("invalid decision head".into());
+                }
+                h.f_norm_eps =
+                    get_key_f32(gguf, &k(LlmKv::ATTENTION_LAYERNORM_EPS), true)?.unwrap();
+                // N_DECISION_TYPES = 3: choice, score, noul
+                h.n_embd_out_impl = 3;
+            }
 
             if let Some(v) = get_key_u32(gguf, &k(LlmKv::ATTENTION_SLIDING_WINDOW), false)? {
                 h.n_swa = v;
@@ -2448,6 +2480,12 @@ fn load_arch_hparams(gguf: &Gguf, arch: LlmArch, h: &mut LlamaHparams) -> Result
                 h.pooling_type_cls = LlamaPoolingType::MEAN;
             }
 
+            // GGUFs without a classifier activation use gelu, the
+            // transformers default (37ac63456, modern-bert.cpp:31-35)
+            if get_key_string(gguf, &k(LlmKv::CLASSIFIER_ACTIVATION), false)?.is_none() {
+                h.act_cls = ggml::ops::GGML_UNARY_OP_GELU_ERF;
+            }
+
             // the decision-model head (a7b94df2c modern-bert.cpp:31-41,
             // commit a4cb4c61f): trailing blocks scored per question type
             if let Some(v) = get_key_u32(gguf, &k(LlmKv::DECISION_BLOCK_COUNT), false)? {
@@ -2609,6 +2647,7 @@ pub fn llama_model_rope_type(arch: LlmArch, hparams: &LlamaHparams) -> LlamaRope
         | LlmArch::GEMMA4
         | LlmArch::GEMMA4_ASSISTANT
         | LlmArch::GEMMA_EMBEDDING
+        | LlmArch::GEMMA_EMBEDDING2
         | LlmArch::STARCODER2
         | LlmArch::OPENELM
         | LlmArch::GPTNEOX
@@ -2644,6 +2683,7 @@ pub fn llama_model_rope_type(arch: LlmArch, hparams: &LlamaHparams) -> LlamaRope
         | LlmArch::STEP35
         | LlmArch::SPARK2_5
         | LlmArch::TALKIE
+        | LlmArch::K2_HORIZON
         | LlmArch::MELLUM
         | LlmArch::MAPLE
         | LlmArch::HRM_TEXT => NEOX,

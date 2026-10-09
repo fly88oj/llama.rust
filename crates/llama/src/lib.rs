@@ -21,6 +21,7 @@ pub mod impl_log;
 pub mod json_schema;
 pub mod kv_cache;
 pub mod meta;
+pub mod moe_cache;
 pub mod mlock;
 pub mod model;
 pub mod mtmd;

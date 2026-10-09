@@ -2934,6 +2934,10 @@ pub fn common_sampler_types_from_chars(chars: &str) -> Vec<CommonSamplerType> {
 pub struct SamplingParams {
     pub seed: u32,              // LLAMA_DEFAULT_SEED
     pub n_prev: i32,            // 64
+    /// `int32_t n_probs = 0` (common.h:700) — if more than 0, the number of
+    /// top probabilities the caller wants; a non-zero value keeps
+    /// distribution sampling on an otherwise greedy chain (d0b490f25)
+    pub n_probs: i32,
     pub min_keep: usize,        // 0
     pub top_k: i32,             // 40 (<= 0 to use vocab size)
     pub top_p: f32,             // 0.95 (1.0 = disabled)
@@ -2979,6 +2983,7 @@ impl Default for SamplingParams {
         SamplingParams {
             seed: LLAMA_DEFAULT_SEED,
             n_prev: 64,
+            n_probs: 0,
             min_keep: 0,
             top_k: 40,
             top_p: 0.95,
@@ -3140,8 +3145,18 @@ impl SamplingContext {
                     params.seed,
                 ));
             } else {
-                // default: sample from distribution
-                samplers.push(init_dist(params.seed));
+                // "Keep distribution sampling when callers request probabilities."
+                // (d0b490f25, sampling.cpp:401-406) — an eligible
+                // temperature-zero chain (or a chain ending in top_k == 1)
+                // selects greedily instead
+                let greedy = params.n_probs == 0
+                    && !params.samplers.is_empty()
+                    && ((params.samplers.last() == Some(&CommonSamplerType::Temperature)
+                        && params.temp == 0.0
+                        && params.dynatemp_range == 0.0)
+                        || (params.samplers.last() == Some(&CommonSamplerType::TopK)
+                            && params.top_k == 1));
+                samplers.push(if greedy { init_greedy() } else { init_dist(params.seed) });
             }
         } else if params.mirostat == 1 {
             samplers.push(init_temp(params.temp));
@@ -3781,6 +3796,58 @@ mod tests {
         s.apply(&mut cur);
         assert_eq!(cur.selected, 2);
         assert_eq!(cur.selected_token(), Some(2));
+    }
+
+    /// the greedy/dist tail eligibility of `common_sampler_init`
+    /// (d0b490f25, sampling.cpp:401-406): an eligible temperature-zero chain
+    /// (or one ending in top_k == 1) selects greedily; requested
+    /// probabilities, dynamic temperature, a non-tail sampler type or an
+    /// empty list keep distribution sampling
+    #[test]
+    fn greedy_eligibility_of_chain_tail() {
+        let check = |mut sp: SamplingParams, greedy: bool| {
+            let mut smpl = SamplingContext::new(4, sp.clone());
+            let last = smpl.chain.samplers.last().unwrap();
+            assert_eq!(last.name(), if greedy { "greedy" } else { "dist" });
+
+            // the selection on [-2, -1, 0, 1]
+            let mut cur = TokenDataArray::from_logits(&[-2.0, -1.0, 0.0, 1.0]);
+            smpl.chain.apply(&mut cur);
+            if greedy || sp.n_probs > 0 {
+                assert_eq!(cur.selected_token(), Some(3));
+            }
+        };
+
+        let mut sp = SamplingParams {
+            temp: 0.0,
+            samplers: vec![CommonSamplerType::TopK, CommonSamplerType::Temperature],
+            ..Default::default()
+        };
+        check(sp.clone(), true);
+        let mut probabilities = sp.clone();
+        probabilities.n_probs = 4;
+        check(probabilities, false);
+        let mut dynamic = sp.clone();
+        dynamic.dynatemp_range = 1.0;
+        check(dynamic, false);
+        // the greedy tail must be the LAST sampler of the list
+        let mut swapped = sp.clone();
+        swapped.samplers = vec![CommonSamplerType::Temperature, CommonSamplerType::TopK];
+        check(swapped, false);
+        let mut empty = sp.clone();
+        empty.samplers = Vec::new();
+        check(empty, false);
+
+        // temp != 0 with top_k == 1 as the tail is greedy too
+        sp.temp = 0.8;
+        sp.samplers = vec![CommonSamplerType::Temperature, CommonSamplerType::TopK];
+        sp.top_k = 1;
+        check(sp.clone(), true);
+        let mut probabilities = sp.clone();
+        probabilities.n_probs = 4;
+        check(probabilities, false);
+        sp.top_k = 8;
+        check(sp, false);
     }
 
     #[test]

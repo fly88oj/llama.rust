@@ -124,6 +124,10 @@ pub struct Slot {
     pub n_ctx: u32,
     /// `slot.prompt.tokens` — the tokens of this slot's sequence in the cache
     pub prompt_tokens: Vec<i32>,
+    /// `slot.prompt.checkpoints` — the saved rollback points of the prompt
+    /// processing (always empty until the prompt-cache checkpoint machinery
+    /// lands; restored slot files may carry them, 033df86b6)
+    pub checkpoints: std::collections::VecDeque<SlotCheckpoint>,
     pub task: Option<Task>,
     pub sampler: Option<SamplingContext>,
     pub grammar: Option<GrammarSampler>,
@@ -134,9 +138,11 @@ pub struct Slot {
     pub sampled: i32,
     /// `slot.i_batch` — the batch index of the token whose logits this slot needs
     pub i_batch: i32,
-    pub generated_text: String,
+    /// `slot.generated` — the generated text *and* its tokens, accumulated as
+    /// the parse input (`common_chat_input`, server-context.cpp:288; 18b5f8b18)
+    pub generated: llama::chat_tools::ChatInput,
     pub generated_tokens: Vec<i32>,
-    /// `n_sent_text` — how much of `generated_text` the client already has
+    /// `n_sent_text` — how much of `generated.text` the client already has
     pub n_sent_text: usize,
     pub has_next_token: bool,
     pub has_new_line: bool,
@@ -216,7 +222,7 @@ impl Slot {
                         self.n_predict_max as i64 - self.stats.n_gen as i64
                     },
                     prompt: t.prompt_text.clone(),
-                    generated: self.generated_text.clone(),
+                    generated: self.generated.text.clone(),
                 });
             }
             self.state = SlotState::Idle;
@@ -254,13 +260,210 @@ fn now_us() -> i64 {
 
 /// `LLAMA_STATE_SEQ_MAGIC` = `LLAMA_FILE_MAGIC_GGSQ` (include/llama.h:43/48)
 pub const STATE_SEQ_MAGIC: u32 = 0x6767_7371; // 'ggsq'
-/// `LLAMA_STATE_SEQ_VERSION` (include/llama.h:49)
-pub const STATE_SEQ_VERSION: u32 = 3;
+/// `LLAMA_STATE_SEQ_VERSION` (include/llama.h:49) — 4 since 210791069 (the
+/// KV state blob gained the exact `n_rot_k`/`n_rot_v` rotation metadata)
+pub const STATE_SEQ_VERSION: u32 = 4;
 /// `LLAMA_TOKEN_NULL` (include/llama.h:39) — the marker word of the packed
 /// `server_tokens` format
 const TOKEN_NULL: i32 = -1;
 /// `SERVER_TOKENS_STATE_VERSION` (server-common.cpp:286)
 const SERVER_TOKENS_STATE_VERSION: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// the context-checkpoint appendix of slot save files (server-context.cpp:2586-2714,
+// 033df86b6): checkpoints are appended after the llama state payload because
+// they cannot be recreated from the final state alone (a recurrent state
+// cannot be rewound)
+// ---------------------------------------------------------------------------
+
+/// `SLOT_CKPT_MAGIC` = "SCKP" (server-context.cpp:2589)
+const SLOT_CKPT_MAGIC: u32 = 0x504b_4353;
+/// `SLOT_CKPT_VERSION` (server-context.cpp:2590)
+const SLOT_CKPT_VERSION: u32 = 1;
+/// `params_base.n_ctx_checkpoints` (common.h:637) — the port does not parse
+/// the arg, so the default cap applies
+const N_CTX_CHECKPOINTS: usize = 32;
+
+/// `common_prompt_checkpoint` (common.h:1272-1306) — one saved rollback point
+/// of a slot's prompt processing. The port does not yet create checkpoints
+/// while processing prompts, but slot save files written by the reference
+/// carry them, and the appendix round-trips through here.
+#[derive(Clone, Debug, Default)]
+pub struct SlotCheckpoint {
+    /// `id_task` — `-1` marks a checkpoint restored from a slot file (not
+    /// created by a task; server-context.cpp:2661)
+    pub id_task: i64,
+    pub n_tokens: usize,
+    pub pos_min: i32,
+    pub pos_max: i32,
+    pub data_tgt: Vec<u8>,
+    pub data_dft: Vec<u8>,
+    pub data_spec: Vec<u8>,
+}
+
+impl SlotCheckpoint {
+    /// `common_prompt_checkpoint::size()` (common.h:1301-1303)
+    #[allow(dead_code)] // used by the checkpoint machinery (not yet ported)
+    pub fn size(&self) -> usize {
+        self.data_tgt.len() + self.data_dft.len() + self.data_spec.len()
+    }
+}
+
+/// `ckpt_read` (server-context.cpp:2592-2597) over an in-memory cursor —
+/// every read advances `n_read` like the C's byte counter
+fn ckpt_read<'a>(rd: &mut &'a [u8], n: usize, n_read: &mut usize) -> Option<&'a [u8]> {
+    if rd.len() < n {
+        return None;
+    }
+    let (head, rest) = rd.split_at(n);
+    *rd = rest;
+    *n_read += n;
+    Some(head)
+}
+
+/// `ckpt_read_buf` (server-context.cpp:2599-2607): read the u64 length then
+/// the blob — the size is checked against the bytes left in the appendix
+/// before allocating (the size field may be corrupted)
+fn ckpt_read_buf(rd: &mut &[u8], n_avail: usize, n_read: &mut usize) -> Option<Vec<u8>> {
+    let n = u64::from_le_bytes(ckpt_read(rd, 8, n_read)?.try_into().ok()?) as usize;
+    if n > n_avail - *n_read {
+        return None;
+    }
+    let buf = ckpt_read(rd, n, n_read)?.to_vec();
+    Some(buf)
+}
+
+/// the `decision.label_groups` reduction of `send_decision`
+/// (server-context.cpp:2347-2355, 88dcc460d): one output per group, the max
+/// of the group's label scores
+fn reduce_label_groups(scores: &mut Vec<f32>, spec: &crate::server_decision::DecisionSpec) {
+    if spec.label_groups.is_empty() {
+        return;
+    }
+    let mut reduced: Vec<f32> = Vec::new();
+    let mut i = 0usize;
+    for &n in &spec.label_groups {
+        assert!(n > 0 && i + n as usize <= scores.len());
+        let end = i + n as usize;
+        reduced.push(scores[i..end].iter().cloned().fold(f32::NEG_INFINITY, f32::max));
+        i = end;
+    }
+    *scores = reduced;
+}
+
+/// `ckpt_write_buf` (server-context.cpp:2616-2621): the u64 length then the blob
+fn ckpt_write_buf(out: &mut Vec<u8>, buf: &[u8], n_written: &mut usize) {
+    let n = buf.len() as u64;
+    out.extend_from_slice(&n.to_le_bytes());
+    *n_written += 8;
+    if n > 0 {
+        out.extend_from_slice(buf);
+        *n_written += buf.len();
+    }
+}
+
+/// `save_slot_checkpoints`'s serialization (server-context.cpp:2623-2653):
+/// `[u32 magic][u32 version][u32 count]` then per checkpoint
+/// `[u64 n_tokens][i32 pos_min][i32 pos_max]` and three length-prefixed blobs
+/// (target, draft, speculative). Writes nothing for an empty list.
+fn slot_checkpoints_appendix(
+    checkpoints: &std::collections::VecDeque<SlotCheckpoint>,
+    out: &mut Vec<u8>,
+) -> usize {
+    if checkpoints.is_empty() {
+        return 0;
+    }
+    let mut n_written = 0usize;
+    out.extend_from_slice(&SLOT_CKPT_MAGIC.to_le_bytes());
+    out.extend_from_slice(&SLOT_CKPT_VERSION.to_le_bytes());
+    out.extend_from_slice(&(checkpoints.len() as u32).to_le_bytes());
+    n_written += 12;
+    for cur in checkpoints {
+        out.extend_from_slice(&(cur.n_tokens as u64).to_le_bytes());
+        out.extend_from_slice(&cur.pos_min.to_le_bytes());
+        out.extend_from_slice(&cur.pos_max.to_le_bytes());
+        n_written += 16;
+        ckpt_write_buf(out, &cur.data_tgt, &mut n_written);
+        ckpt_write_buf(out, &cur.data_dft, &mut n_written);
+        ckpt_write_buf(out, &cur.data_spec, &mut n_written);
+    }
+    n_written
+}
+
+/// `load_slot_checkpoints`'s parse (server-context.cpp:2655-2714): returns the
+/// parsed checkpoints (marked `id_task = -1`, capped at the last
+/// `n_ctx_checkpoints`) and the bytes consumed; 0 consumed means there is no
+/// usable appendix (absent, wrong magic, damaged, or an empty target state —
+/// a damaged appendix is ignored, never fatal).
+fn parse_slot_checkpoints_appendix(
+    bytes: &[u8],
+    offset: usize,
+    slot_id: i32,
+) -> (std::collections::VecDeque<SlotCheckpoint>, usize) {
+    if offset > bytes.len() {
+        return (Default::default(), 0);
+    }
+    let n_avail = bytes.len() - offset; // bytes after the llama state payload
+    let mut rd: &[u8] = &bytes[offset..];
+    let mut n_read = 0usize;
+    let take = |rd: &mut &[u8], n: usize, n_read: &mut usize| -> Option<Vec<u8>> {
+        ckpt_read(rd, n, n_read).map(|s| s.to_vec())
+    };
+    let read_u32 = |rd: &mut &[u8], n_read: &mut usize| -> Option<u32> {
+        take(rd, 4, n_read).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(u32::from_le_bytes)
+    };
+    let read_i32 = |rd: &mut &[u8], n_read: &mut usize| -> Option<i32> {
+        take(rd, 4, n_read).and_then(|b| <[u8; 4]>::try_from(b).ok()).map(i32::from_le_bytes)
+    };
+    let read_u64 = |rd: &mut &[u8], n_read: &mut usize| -> Option<u64> {
+        take(rd, 8, n_read).and_then(|b| <[u8; 8]>::try_from(b).ok()).map(u64::from_le_bytes)
+    };
+    let invalid = |what: &str| {
+        eprintln!("slot {slot_id}: {what} context checkpoint appendix - ignored");
+    };
+    match read_u32(&mut rd, &mut n_read) {
+        Some(m) if m == SLOT_CKPT_MAGIC => {}
+        // no appendix at all — not an error, nothing consumed
+        _ => return (Default::default(), 0),
+    }
+    if !matches!(read_u32(&mut rd, &mut n_read), Some(v) if v == SLOT_CKPT_VERSION) {
+        invalid("invalid");
+        return (Default::default(), 0);
+    }
+    let Some(count) = read_u32(&mut rd, &mut n_read) else {
+        invalid("invalid");
+        return (Default::default(), 0);
+    };
+    let mut checkpoints: std::collections::VecDeque<SlotCheckpoint> = Default::default();
+    for _ in 0..count {
+        let mut cur = SlotCheckpoint::default();
+        cur.id_task = -1; // not created by a task - marks a checkpoint restored from a slot file
+        let ok = (|| -> Option<()> {
+            cur.n_tokens = read_u64(&mut rd, &mut n_read)? as usize;
+            cur.pos_min = read_i32(&mut rd, &mut n_read)?;
+            cur.pos_max = read_i32(&mut rd, &mut n_read)?;
+            cur.data_tgt = ckpt_read_buf(&mut rd, n_avail, &mut n_read)?;
+            cur.data_dft = ckpt_read_buf(&mut rd, n_avail, &mut n_read)?;
+            cur.data_spec = ckpt_read_buf(&mut rd, n_avail, &mut n_read)?;
+            Some(())
+        })();
+        if ok.is_none() {
+            invalid("truncated");
+            return (Default::default(), 0);
+        }
+        // a saved checkpoint always holds a target state - an empty blob
+        // would roll back without restoring anything
+        if cur.data_tgt.is_empty() {
+            invalid("invalid");
+            return (Default::default(), 0);
+        }
+        checkpoints.push_back(cur);
+        if checkpoints.len() > N_CTX_CHECKPOINTS {
+            checkpoints.pop_front();
+        }
+    }
+    (checkpoints, n_read)
+}
 
 /// `server_tokens_state_writer::take`'s trailing pad — the byte stream grows
 /// to a multiple of `sizeof(llama_token)`
@@ -384,9 +587,10 @@ pub struct ChatStreamState {
     pub parser: ChatParserParams,
     /// `chat_msg` — the previous parsed message (the diff base)
     pub msg: ChatMsg,
-    /// `generated_text` — the text accumulated through `update_chat_msg`
-    /// (only what was *sent* — the C adds each partial's `text_to_send`)
-    pub generated_text: String,
+    /// `generated_input` — the text+tokens accumulated through
+    /// `update_chat_msg` (`common_chat_input`, server-task.h:111; 18b5f8b18)
+    /// (only what was *sent* — the C adds each partial's content chunk)
+    pub generated_input: llama::chat_tools::ChatInput,
     /// `generated_tool_call_ids` — the ids already handed out
     pub generated_tool_call_ids: Vec<String>,
 }
@@ -394,11 +598,14 @@ pub struct ChatStreamState {
 impl ChatStreamState {
     /// `task_result_state`'s constructor (server-task.cpp:141-159) from the
     /// task's chat metadata; `is_continuation` is always false (the port does
-    /// not splice continuation prompts, see PARITY.md).
-    fn new(params: &TaskParams) -> Result<ChatStreamState, String> {
+    /// not splice continuation prompts, see PARITY.md). The generation prompt
+    /// is token-aligned via `common_chat_input_tokenize` — the schema's
+    /// `generation_prompt` handler does this at request-parse time when a
+    /// vocab is available (server-schema.cpp:314-321, 18b5f8b18).
+    fn new(params: &TaskParams, vocab: &Vocab) -> Result<ChatStreamState, String> {
         let mut parser = ChatParserParams::default();
         parser.format = chat_format_from_name(&params.chat_format)?;
-        parser.generation_prompt = params.generation_prompt.clone();
+        parser.generation_prompt = llama::chat_tools::chat_input_tokenize(vocab, &params.generation_prompt);
         if !params.chat_parser.is_empty() {
             // `chat_parser_params.parser.load(data.at("chat_parser"))`
             // (server-schema.cpp:318-327)
@@ -411,19 +618,24 @@ impl ChatStreamState {
         Ok(ChatStreamState {
             parser,
             msg: ChatMsg::default(),
-            generated_text: String::new(),
+            generated_input: llama::chat_tools::ChatInput::default(),
             generated_tool_call_ids: Vec::new(),
         })
     }
 
     /// `task_result_state::update_chat_msg` (server-task.cpp:162-230) with
     /// `filter_tool_calls = false` — re-parse the accumulated text, hand out
-    /// tool-call ids, and diff against the previous message.
-    fn update_chat_msg(&mut self, text_added: &str, is_partial: bool) -> Result<Vec<ChatMsgDiff>, String> {
-        self.generated_text.push_str(text_added);
+    /// tool-call ids, and diff against the previous message. Since 18b5f8b18
+    /// the accumulated parse input carries the generating tokens.
+    fn update_chat_msg(
+        &mut self,
+        added: &llama::chat_tools::ChatInput,
+        is_partial: bool,
+    ) -> Result<Vec<ChatMsgDiff>, String> {
+        self.generated_input.append_chunk(added);
         let msg_prv = self.msg.clone();
         //SRV_DBG("Parsing chat message: %s\n", …)
-        let new_msg = chat_parse(&self.generated_text, is_partial, &self.parser)?;
+        let new_msg = chat_parse(&self.generated_input, is_partial, &self.parser)?;
         let mut diffs = Vec::new();
         if !new_msg.empty() {
             let mut new_msg = new_msg;
@@ -943,7 +1155,7 @@ impl Engine {
                             slot.n_predict_max as i64 - slot.stats.n_gen as i64
                         },
                         t.prompt_text.clone(),
-                        slot.generated_text.clone(),
+                        slot.generated.text.clone(),
                     )
                 });
                 if let Some((id, params, n_prompt, n_proc, n_cached, n_gen, has_next, has_new_line, n_remaining, prompt, generated)) =
@@ -1195,14 +1407,21 @@ impl Engine {
             let mut flat = 0usize;
             for q in &questions {
                 for variant in 0..dc.n_variants(q) {
-                    match dc.fill_task(&state, &questions, q, variant, files.len(), &media_marker) {
+                    match dc.fill_task(&state, &questions, q, variant, files.len(), &media_marker, &files) {
                         Ok((tokens, spec)) => {
                             specs.push(DecisionTaskSpec { tokens, spec, index: flat })
                         }
                         Err(e) => {
                             // "the instructions and the options of a question
-                            // must not be empty" is the path's invalid_argument
-                            let code = if e.contains("must not be empty") { 400 } else { 500 };
+                            // must not be empty" and d1's "no single-token
+                            // label left" are the path's invalid_argument
+                            let code = if e.contains("must not be empty")
+                                || e.contains("no single-token label left")
+                            {
+                                400
+                            } else {
+                                500
+                            };
                             err(task, &e, code);
                             return;
                         }
@@ -1319,7 +1538,7 @@ impl Engine {
                     flat += 1;
                 }
             }
-            match dc.format_answer(q, &q_scores) {
+            match dc.format_answer(q, &q_scores, !files.is_empty()) {
                 Ok(a) => answers.push((q.id.clone(), a)),
                 Err(e) => {
                     err(task, &e, 500);
@@ -1346,6 +1565,10 @@ impl Engine {
 
     /// `send_decision`'s label arm (server-context.cpp:2278-2286): the logits
     /// of the label tokens at the last prompt token.
+    /// the `decision.label_groups` reduction of `send_decision`
+    /// (server-context.cpp:2347-2355, 88dcc460d): one output per group, the
+    /// max of the group's label scores
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn decision_decode_one(
         &mut self,
         tokens: &[i32],
@@ -1360,6 +1583,9 @@ impl Engine {
                     .ok_or_else(|| ("failed to get logits".to_string(), 500i64))?;
                 out.push(row);
             }
+            // `decision.label_groups`: the output of a group is the max of
+            // its labels' scores (server-context.cpp:2347-2355, 88dcc460d)
+            reduce_label_groups(&mut out, spec);
             return Ok(out);
         }
         // markers / joint: the embeddings output (`llama_get_embeddings_ith`)
@@ -1388,6 +1614,8 @@ impl Engine {
                     .ok_or_else(|| ("failed to get logits".to_string(), 500i64))?;
                 out.push(row);
             }
+            // the label_groups max of the parent path applies here too
+            reduce_label_groups(&mut out, spec);
             return Ok(out);
         }
         // embeddings path: re-decode the whole child prompt (the encode core
@@ -1523,6 +1751,69 @@ impl Engine {
         }
     }
 
+    /// `save_slot_checkpoints` (server-context.cpp:2623-2653, 033df86b6) —
+    /// serialize `slot.prompt.checkpoints` as the "SCKP" appendix of the slot
+    /// save file. The port builds the file in memory, so the appendix bytes
+    /// extend `out` (the C appends to the already-written payload file);
+    /// returns the number of appendix bytes. An empty checkpoint list writes
+    /// nothing — the same byte layout as the reference.
+    fn save_slot_checkpoints(&self, si: usize, out: &mut Vec<u8>) -> usize {
+        let n = slot_checkpoints_appendix(&self.slots[si].checkpoints, out);
+        if n > 0 {
+            eprintln!(
+                "slot {}: appended {} context checkpoint(s) ({:.3} MiB)",
+                self.slots[si].id,
+                self.slots[si].checkpoints.len(),
+                n as f64 / 1024.0 / 1024.0
+            );
+        }
+        n
+    }
+
+    /// `load_slot_checkpoints` (server-context.cpp:2655-2714, 033df86b6) —
+    /// parse the checkpoint appendix starting at `offset` (the end of the
+    /// llama state payload within the file). Returns the number of appendix
+    /// bytes consumed, 0 if there is no usable appendix. When a draft context
+    /// is active and the newest checkpoint carries draft data, one blob is
+    /// test-loaded — a mismatch drops every checkpoint's draft data instead
+    /// of crashing.
+    fn load_slot_checkpoints(&mut self, bytes: &[u8], offset: usize, si: usize) -> usize {
+        let (mut checkpoints, n_read) = parse_slot_checkpoints_appendix(bytes, offset, self.slots[si].id);
+        if n_read == 0 {
+            return 0;
+        }
+        // the slot file does not check the draft context - test-load one draft
+        // checkpoint, drop the draft data if it does not fit
+        if self.spec.is_some()
+            && !checkpoints.is_empty()
+            && !checkpoints.back().unwrap().data_dft.is_empty()
+        {
+            let id_slot = self.slots[si].id;
+            let back = checkpoints.back().unwrap().clone();
+            let mut ok = true;
+            if let Some(dft) = self.spec.as_mut().unwrap().ctx_dft() {
+                ok = dft.state_seq_set_data(id_slot, &back.data_dft, true).is_ok();
+                dft.seq_rm(id_slot, -1, -1);
+            }
+            if !ok {
+                eprintln!(
+                    "slot {}: draft context checkpoint data does not match the draft context - dropped",
+                    self.slots[si].id
+                );
+                for cur in checkpoints.iter_mut() {
+                    cur.data_dft.clear();
+                }
+            }
+        }
+        eprintln!(
+            "slot {}: restored {} context checkpoint(s)",
+            self.slots[si].id,
+            checkpoints.len()
+        );
+        self.slots[si].checkpoints = checkpoints;
+        n_read
+    }
+
     fn run_slot_task(&mut self, task: &mut Task) {
         let err = |task: &Task, msg: &str, code: i64| {
             let type_str = if code == 400 { "invalid_request_error" } else { "server_error" };
@@ -1585,7 +1876,7 @@ impl Engine {
                 // `llama_state_seq_save_file` + "Unable to save slot" on 0
                 // bytes written (server-context.cpp:2573-2582)
                 let n_saved = self.slots[si].prompt_tokens.len();
-                let state = match &self.core {
+                let framed = match &self.core {
                     Core::Decode(dctx) => dctx.state_seq_get_data(action.id_slot, false),
                     // an encoder-only context has no sequence state to save
                     Core::Encode(_) => {
@@ -1593,12 +1884,24 @@ impl Engine {
                         return;
                     }
                 };
+                // `state_seq_save_file` (llama-context.cpp:3481-3499) writes
+                // `state_seq_write_data` DIRECTLY — the `[io_magic][seq_id]`
+                // frame exists only in the in-memory `state_seq_get_data`
+                // blob, so it is stripped for the file (byte-compatible with
+                // the reference's slot files)
+                let state: &[u8] = &framed[8..];
                 let mut file: Vec<u8> = Vec::with_capacity(12 + packed.len() + state.len());
                 file.extend_from_slice(&STATE_SEQ_MAGIC.to_le_bytes());
                 file.extend_from_slice(&STATE_SEQ_VERSION.to_le_bytes());
                 file.extend_from_slice(&(packed.len() as u32 / 4).to_le_bytes());
                 file.extend_from_slice(&packed);
                 file.extend_from_slice(&state);
+                // the checkpoint appendix goes after the llama state payload
+                // (`save_slot_checkpoints`, server-context.cpp:2925-2929,
+                // 033df86b6) — an empty list appends nothing, matching the
+                // reference's bytes; the write failure of the whole file
+                // covers the C's "incomplete context checkpoints" error
+                let _nwrite_ckpt = self.save_slot_checkpoints(si, &mut file);
                 if std::fs::write(&action.filepath, &file).is_err() {
                     err(task, "Unable to save slot", 500);
                     return;
@@ -1700,12 +2003,30 @@ impl Engine {
                 // (server-context.cpp:2647) — seq_rm drops the old cells
                 // before the restored state lands
                 self.slot_prompt_clear(si);
+                let payload_end;
                 match &mut self.core {
                     Core::Decode(dctx) => {
-                        if let Err(e) = dctx.state_seq_set_data(action.id_slot, rd, false) {
+                        // the file stores the unframed `state_seq_write_data`
+                        // stream (state_seq_load_file reads it through
+                        // llama_io_read_file); the port's state_seq_set_data
+                        // takes the framed blob, so the 8-byte header goes
+                        // back on (the saved seq id is not matched on
+                        // restore, the target id is what counts)
+                        let mut framed = Vec::with_capacity(rd.len() + 8);
+                        framed.extend_from_slice(&llama::context::DecodeContext::STATE_SEQ_IO_MAGIC.to_le_bytes());
+                        framed.extend_from_slice(&(action.id_slot as i32).to_le_bytes());
+                        framed.extend_from_slice(rd);
+                        if let Err(e) = dctx.state_seq_set_data(action.id_slot, &framed, false) {
                             err(task, &format!("Unable to restore slot: {e}"), 400);
                             return;
                         }
+                        // `nread` is the end offset of the llama state payload
+                        // within the file (server-context.cpp:2996) — the C's
+                        // `file.tell()` after `state_seq_read_data`; the port
+                        // re-derives it from a dummy size pass over the
+                        // restored sequence (minus the 8-byte frame the size
+                        // pass includes but the file does not)
+                        payload_end = 12 + packed_bytes.len() + dctx.state_seq_get_size(action.id_slot, false) - 8;
                     }
                     Core::Encode(_) => {
                         err(task, "Unable to restore slot: No available space in KV cache or invalid slot save file", 400);
@@ -1713,9 +2034,13 @@ impl Engine {
                     }
                 }
                 self.slots[si].prompt_tokens = restored;
-                // `file.tell()` — the reference consumed the whole file
-                // (GGML_ASSERT of llama-context.cpp:3317-3319)
-                let n_read = bytes.len();
+                // the checkpoint appendix after the payload
+                // (`load_slot_checkpoints`, server-context.cpp:2998-3000, 033df86b6)
+                let nread_ckpt = self.load_slot_checkpoints(&bytes, payload_end, si);
+                // `res->n_bytes = nread + nread_ckpt` (:3008) — the payload
+                // end plus whatever appendix was consumed (an ignored
+                // appendix reports just the payload)
+                let n_read = payload_end + nread_ckpt;
                 let t_ms = (now_us() - t_start) as f64 / 1000.0;
                 // `server_task_result_slot_save_load::to_json` (restore,
                 // server-task.cpp:1643-1655)
@@ -1757,6 +2082,9 @@ impl Engine {
             dctx.seq_rm(id, -1, -1);
         }
         self.slots[si].prompt_tokens.clear();
+        // `server_prompt::clear()` also drops the context checkpoints
+        // (server-common.cpp:475-482)
+        self.slots[si].checkpoints.clear();
     }
 
     /// `get_available_slot` (server-context.cpp:1279-1390): the requested
@@ -1822,10 +2150,14 @@ impl Engine {
         // common_sampler_init(vocab, params) — the vocab lowers the DRY
         // string sequence breakers into token sequences
         // (common/sampling.cpp:353 llama_sampler_init_dry(vocab, …))
+        let mut sampling = task.params.sampling.clone();
+        // `n_probs` rides on the sampling params (common.h:700) — it decides
+        // the greedy/dist eligibility of the chain's tail (d0b490f25)
+        sampling.n_probs = task.params.n_probs;
         let mut sampler = SamplingContext::new_with_vocab(
             self.n_vocab,
             Some(&self.vocab),
-            task.params.sampling.clone(),
+            sampling,
         );
         // `server_slot::init_sampler` (server-context.cpp:409-428): the full
         // prompt is fed into the chain with is_generated = false so the
@@ -1981,7 +2313,7 @@ impl Engine {
 
         // the OAI-chat parse state (`task::create_state`, server-queue.cpp:530)
         let chat = if task.params.res_type == ResponseType::OaiChat {
-            match ChatStreamState::new(&task.params) {
+            match ChatStreamState::new(&task.params, &self.vocab) {
                 Ok(state) => Some(state),
                 Err(e) => {
                     let _ = task.tx.send(StreamEvent::Frame(error_frame(
@@ -2003,7 +2335,7 @@ impl Engine {
         slot.n_predict_max = n_predict;
         slot.sampled = 0;
         slot.i_batch = -1;
-        slot.generated_text.clear();
+        slot.generated = llama::chat_tools::ChatInput::default();
         slot.generated_tokens.clear();
         slot.probs_output.clear();
         slot.n_sent_text = 0;
@@ -2768,7 +3100,9 @@ impl Engine {
             .map(|t| t.params.preserved_tokens.contains(&tok))
             .unwrap_or(false);
         let token_str = crate::api::token_piece(&self.vocab, tok, accept_special);
-        self.slots[si].generated_text.push_str(&token_str);
+        // `slot.generated.append(token_str, result.tok)` (server-context.cpp:1971,
+        // 18b5f8b18) — the generated text *and* tokens accumulate together
+        self.slots[si].generated.append_piece(&token_str, tok);
         if self.slots[si].task.as_ref().unwrap().params.return_tokens {
             self.slots[si].generated_tokens.push(tok);
         }
@@ -2776,21 +3110,24 @@ impl Engine {
 
         let mut text_to_send = String::new();
         let mut incomplete = false;
-        if !self.slots[si].generated_text.is_empty() {
+        if !self.slots[si].generated.text.is_empty() {
             incomplete =
-                validate_utf8_len(&self.slots[si].generated_text) < self.slots[si].generated_text.len();
+                validate_utf8_len(&self.slots[si].generated.text) < self.slots[si].generated.text.len();
             if !incomplete {
-                let pos = self.slots[si].n_sent_text.min(self.slots[si].generated_text.len());
-                let str_test = self.slots[si].generated_text[pos..].to_string();
+                let mut pos = self.slots[si].n_sent_text.min(self.slots[si].generated.text.len());
+                let str_test = self.slots[si].generated.text[pos..].to_string();
                 let mut send_text = true;
 
                 // `find_stopping_strings(str_test, token_str.size(), is_full_stop = true)`
+                // (server-context.cpp:1986-1992): a full stop truncates the
+                // generated input at the stop word (`truncate(pos + stop_pos)`,
+                // 18b5f8b18) — `send_text` stays true so the text *before* the
+                // stop word still flows out in this partial
                 if let Some(stop_pos) =
                     self.find_stopping_strings(si, &str_test, token_str.len(), true)
                 {
-                    let start = pos + stop_pos;
-                    self.slots[si].generated_text.truncate(start);
-                    send_text = false;
+                    self.slots[si].generated.truncate(pos + stop_pos);
+                    pos = self.slots[si].n_sent_text.min(self.slots[si].generated.text.len());
                 } else if self.slots[si].has_next_token && !self.vocab.is_eog(tok) {
                     // a partial stop word at the end: hold the text back
                     send_text = self.find_stopping_strings(si, &str_test, token_str.len(), false)
@@ -2798,8 +3135,8 @@ impl Engine {
                 }
 
                 if send_text {
-                    let pos = self.slots[si].n_sent_text.min(self.slots[si].generated_text.len());
-                    text_to_send = self.slots[si].generated_text[pos..].to_string();
+                    // no send the stop word in the response
+                    text_to_send = self.slots[si].generated.text[pos..].to_string();
                     self.slots[si].n_sent_text += text_to_send.len();
                 }
             }
@@ -2894,9 +3231,16 @@ impl Engine {
         if is_progress && !task.params.return_progress {
             return Ok(());
         }
+        // `res->content = slot.generated.substr(slot.n_sent_text - tkn.text_to_send.size(),
+        // tkn.text_to_send.size())` (server-context.cpp:2192-2194, 18b5f8b18) —
+        // the partial's content is the token-aligned chunk that was just sent
+        // (`n_sent_text` was already advanced in `process_token`)
         let (content, tokens) = match tkn {
-            Some((tok, text)) => (text, vec![tok]),
-            None => (String::new(), Vec::new()),
+            Some((tok, text)) => {
+                let start = self.slots[si].n_sent_text - text.len();
+                (self.slots[si].generated.substr(start, Some(text.len())), vec![tok])
+            }
+            None => (llama::chat_tools::ChatInput::default(), Vec::new()),
         };
         // `state.update_chat_msg(content, true, oaicompat_msg_diffs)`
         // (server-task.cpp:988-993): re-parse the accumulated text and diff
@@ -2937,7 +3281,7 @@ impl Engine {
                     (
                         "choices".into(),
                         Json::Array(vec![Json::Object(vec![
-                            ("text".into(), Json::String(content.clone())),
+                            ("text".into(), Json::String(content.text.clone())),
                             ("index".into(), Json::Int(task.index as i64)),
                             (
                                 "logprobs".into(),
@@ -2960,7 +3304,7 @@ impl Engine {
                 if task.params.verbose {
                     fields.push((
                         "__verbose".into(),
-                        partial_non_oaicompat(&task, slot, &content, &tokens, is_progress, stats_json.as_ref(), prob_output),
+                        partial_non_oaicompat(&task, slot, &content.text, &tokens, is_progress, stats_json.as_ref(), prob_output),
                     ));
                 }
                 if let Some(s) = stats_json {
@@ -3055,7 +3399,7 @@ impl Engine {
             _ => {
                 let mut fields: Vec<(String, Json)> = vec![
                     ("index".into(), Json::Int(task.index as i64)),
-                    ("content".into(), Json::String(content)),
+                    ("content".into(), Json::String(content.text)),
                     (
                         "tokens".into(),
                         Json::Array(tokens.into_iter().map(|t| Json::Int(t as i64)).collect()),
@@ -3101,9 +3445,9 @@ impl Engine {
             == ResponseType::OaiChat
         {
             let added = if task.params.stream {
-                String::new()
+                llama::chat_tools::ChatInput::default()
             } else {
-                self.slots[si].generated_text.clone()
+                self.slots[si].generated.clone()
             };
             match self.slots[si]
                 .chat
@@ -3165,7 +3509,13 @@ impl Engine {
         };
         let usage = usage_json_oaicompat(slot.stats.n_gen, task.n_tokens() as i64, slot.stats.n_prompt_cached);
         // non-stream requests report the whole text; streams already sent it
-        let content = if stream { String::new() } else { slot.generated_text.clone() };
+        // (`res->content = std::move(slot.generated)` — a `common_chat_input`
+        // since 18b5f8b18; only `.text` reaches the JSON)
+        let content = if stream {
+            llama::chat_tools::ChatInput::default()
+        } else {
+            slot.generated.clone()
+        };
         let has_probs = !slot.probs_output.is_empty();
 
         match task.params.res_type {
@@ -3184,7 +3534,7 @@ impl Engine {
                     (
                         "choices".into(),
                         Json::Array(vec![Json::Object(vec![
-                            ("text".into(), Json::String(content)),
+                            ("text".into(), Json::String(content.text)),
                             ("index".into(), Json::Int(task.index as i64)),
                             ("logprobs".into(), logprobs),
                             ("finish_reason".into(), Json::String(finish_reason.into())),
@@ -3295,7 +3645,7 @@ impl Engine {
                     } else {
                         Json::Object(vec![
                             ("role".into(), Json::String("assistant".into())),
-                            ("content".into(), Json::String(content)),
+                            ("content".into(), Json::String(content.text)),
                         ])
                     };
                     let mut choice = vec![
@@ -3341,7 +3691,7 @@ impl Engine {
                     ("index".into(), Json::Int(task.index as i64)),
                     (
                         "content".into(),
-                        Json::String(if stream { String::new() } else { slot.generated_text.clone() }),
+                        Json::String(if stream { String::new() } else { slot.generated.text.clone() }),
                     ),
                     (
                         "tokens".into(),
@@ -3454,7 +3804,7 @@ fn final_non_oaicompat(engine: &Engine, si: usize) -> Json {
         ("index".into(), Json::Int(task.index as i64)),
         (
             "content".into(),
-            Json::String(if stream { String::new() } else { slot.generated_text.clone() }),
+            Json::String(if stream { String::new() } else { slot.generated.text.clone() }),
         ),
         (
             "tokens".into(),
@@ -4010,5 +4360,187 @@ mod lazy_trigger_tests {
         ] {
             assert!(!fs_validate_filename(bad), "{bad:?} must be rejected");
         }
+    }
+}
+/// the checkpoint-appendix format tests — the port's mirror of the reference's
+/// `test_slot_save.py` appendix cases (tools/server/tests/unit/test_slot_save.py:596-735,
+/// 033df86b6): the byte layout, the damaged-appendix tolerance (ignored, never
+/// fatal) and the `n_ctx_checkpoints` cap. The checkpoint *reuse* assertions of
+/// the upstream tests (a restored slot rolling back to a checkpoint instead of
+/// re-processing the prompt) need the prompt-cache checkpoint machinery, which
+/// the port does not have yet.
+#[cfg(test)]
+mod slot_ckpt_tests {
+    use super::*;
+
+    fn ckpt(tgt: &[u8], dft: &[u8], spec: &[u8]) -> SlotCheckpoint {
+        SlotCheckpoint {
+            id_task: 7,
+            n_tokens: 11,
+            pos_min: 3,
+            pos_max: 9,
+            data_tgt: tgt.to_vec(),
+            data_dft: dft.to_vec(),
+            data_spec: spec.to_vec(),
+        }
+    }
+
+    /// `parse_ckpt_appendix`'s spec: magic(4) version(4) count(4), then per
+    /// checkpoint n_tokens(8) pos_min(4) pos_max(4) and three blobs (target,
+    /// draft, speculative), each size(8) + data
+    #[test]
+    fn appendix_byte_layout() {
+        let list: VecDeque<SlotCheckpoint> = [
+            ckpt(b"TGT", b"", b"SP"),
+            ckpt(&[0xAA; 5], b"D", b""),
+        ]
+        .into_iter()
+        .collect();
+        let mut out = Vec::new();
+        let n = slot_checkpoints_appendix(&list, &mut out);
+        assert_eq!(n, out.len());
+        let expect: Vec<u8> = [
+            SLOT_CKPT_MAGIC.to_le_bytes().as_slice(),
+            SLOT_CKPT_VERSION.to_le_bytes().as_slice(),
+            2u32.to_le_bytes().as_slice(),
+            // checkpoint 0
+            11u64.to_le_bytes().as_slice(),
+            3i32.to_le_bytes().as_slice(),
+            9i32.to_le_bytes().as_slice(),
+            3u64.to_le_bytes().as_slice(),
+            b"TGT".as_slice(),
+            0u64.to_le_bytes().as_slice(),
+            2u64.to_le_bytes().as_slice(),
+            b"SP".as_slice(),
+            // checkpoint 1
+            11u64.to_le_bytes().as_slice(),
+            3i32.to_le_bytes().as_slice(),
+            9i32.to_le_bytes().as_slice(),
+            5u64.to_le_bytes().as_slice(),
+            &[0xAA; 5].as_slice(),
+            1u64.to_le_bytes().as_slice(),
+            b"D".as_slice(),
+            0u64.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        assert_eq!(out, expect);
+    }
+
+    #[test]
+    fn empty_list_writes_nothing() {
+        let mut out = Vec::new();
+        assert_eq!(slot_checkpoints_appendix(&Default::default(), &mut out), 0);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn roundtrip_and_task_marker() {
+        let list: VecDeque<SlotCheckpoint> =
+            [ckpt(b"tgt-state", b"dft-state", b"spec-state"), ckpt(b"x", b"", b"")]
+                .into_iter()
+                .collect();
+        let mut file = b"PAYLOAD".to_vec();
+        let off = file.len();
+        let n = slot_checkpoints_appendix(&list, &mut file);
+        let (got, consumed) = parse_slot_checkpoints_appendix(&file, off, 0);
+        assert_eq!(consumed, n);
+        assert_eq!(got.len(), 2);
+        for (g, w) in got.iter().zip(list.iter()) {
+            // id_task = -1 marks a checkpoint restored from a slot file
+            assert_eq!(g.id_task, -1);
+            assert_eq!(g.n_tokens, w.n_tokens);
+            assert_eq!(g.pos_min, w.pos_min);
+            assert_eq!(g.pos_max, w.pos_max);
+            assert_eq!(g.data_tgt, w.data_tgt);
+            assert_eq!(g.data_dft, w.data_dft);
+            assert_eq!(g.data_spec, w.data_spec);
+        }
+    }
+
+    #[test]
+    fn no_appendix_consumes_nothing() {
+        let file = b"just the llama state payload".to_vec();
+        let (got, n) = parse_slot_checkpoints_appendix(&file, file.len(), 0);
+        assert_eq!(n, 0);
+        assert!(got.is_empty());
+        // a payload that merely contains the magic bytes mid-stream is not an
+        // appendix — only the bytes at the exact offset are looked at
+        let mut file2 = b"state".to_vec();
+        file2.extend_from_slice(&SLOT_CKPT_MAGIC.to_le_bytes());
+        let (got2, n2) = parse_slot_checkpoints_appendix(&file2, 0, 0);
+        assert_eq!(n2, 0);
+        assert!(got2.is_empty());
+    }
+
+    /// the upstream "oversized_blob" damage: a size field that cannot be
+    /// allocated must be rejected before allocating (n_read == off)
+    #[test]
+    fn oversized_blob_is_rejected() {
+        let mut file = Vec::new();
+        file.extend_from_slice(&SLOT_CKPT_MAGIC.to_le_bytes());
+        file.extend_from_slice(&SLOT_CKPT_VERSION.to_le_bytes());
+        file.extend_from_slice(&1u32.to_le_bytes());
+        file.extend_from_slice(&11u64.to_le_bytes());
+        file.extend_from_slice(&3i32.to_le_bytes());
+        file.extend_from_slice(&9i32.to_le_bytes());
+        file.extend_from_slice(&(1u64 << 62).to_le_bytes());
+        let (got, n) = parse_slot_checkpoints_appendix(&file, 0, 0);
+        assert_eq!(n, 0);
+        assert!(got.is_empty());
+    }
+
+    /// the upstream "empty_target" damage: a valid save never writes an empty
+    /// target state
+    #[test]
+    fn empty_target_state_is_rejected() {
+        let list: VecDeque<SlotCheckpoint> = [ckpt(b"", b"", b"")].into_iter().collect();
+        let mut file = Vec::new();
+        slot_checkpoints_appendix(&list, &mut file);
+        let (got, n) = parse_slot_checkpoints_appendix(&file, 0, 0);
+        assert_eq!(n, 0);
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn wrong_version_and_truncation_are_ignored() {
+        let mut file = Vec::new();
+        file.extend_from_slice(&SLOT_CKPT_MAGIC.to_le_bytes());
+        file.extend_from_slice(&9u32.to_le_bytes()); // version
+        file.extend_from_slice(&1u32.to_le_bytes());
+        assert_eq!(parse_slot_checkpoints_appendix(&file, 0, 0).1, 0);
+
+        let list: VecDeque<SlotCheckpoint> = [ckpt(b"tgt", b"", b"")].into_iter().collect();
+        let mut full = Vec::new();
+        slot_checkpoints_appendix(&list, &mut full);
+        let (got, n) = parse_slot_checkpoints_appendix(&full[..full.len() - 1], 0, 0);
+        assert_eq!(n, 0);
+        assert!(got.is_empty());
+    }
+
+    /// the upstream "many_checkpoints" damage: a flood of entries keeps only
+    /// the last `n_ctx_checkpoints`, the appendix is still fully consumed
+    #[test]
+    fn many_checkpoints_keep_the_last_cap() {
+        let mut list: VecDeque<SlotCheckpoint> = Default::default();
+        // one-byte fillers that never match go first, the real checkpoints stay last
+        for i in 0..(N_CTX_CHECKPOINTS + 8) {
+            list.push_back(SlotCheckpoint {
+                id_task: 0,
+                n_tokens: i,
+                pos_min: 0,
+                pos_max: 1 << 30,
+                data_tgt: vec![0],
+                data_dft: Vec::new(),
+                data_spec: Vec::new(),
+            });
+        }
+        let mut file = Vec::new();
+        let n = slot_checkpoints_appendix(&list, &mut file);
+        let (got, consumed) = parse_slot_checkpoints_appendix(&file, 0, 0);
+        assert_eq!(consumed, n);
+        assert_eq!(got.len(), N_CTX_CHECKPOINTS);
+        // the survivors are the *last* N_CTX_CHECKPOINTS
+        assert_eq!(got.front().unwrap().n_tokens, 8);
+        assert_eq!(got.back().unwrap().n_tokens, N_CTX_CHECKPOINTS + 7);
     }
 }

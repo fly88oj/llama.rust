@@ -570,6 +570,23 @@ pub fn llm_type_of(arch: LlmArch, h: &LlamaHparams, n_vocab: u32) -> LlmType {
             60 => B31,
             _ => UNKNOWN,
         },
+        // k2-horizon.cpp:37-48 (462524043)
+        LlmArch::K2_HORIZON => match nl {
+            28 => B1,
+            36 => match h.n_embd {
+                2560 => B4,
+                4096 => B7,
+                _ => UNKNOWN,
+            },
+            48 => B36,
+            64 => B32,
+            _ => UNKNOWN,
+        },
+        // gemma-embedding2.cpp:15-18 (4fbc76dec)
+        LlmArch::GEMMA_EMBEDDING2 => match nl {
+            24 => B0_3,
+            _ => UNKNOWN,
+        },
         _ => UNKNOWN,
     }
 }
@@ -1129,6 +1146,7 @@ pub fn vocab_print_info(vocab: &Vocab) {
         VocabType::Ugm => "UGM",
         VocabType::Rwkv => "RWKV",
         VocabType::Plamo2 => "PLaMo2",
+        VocabType::Plamo3 => "PLaMo3",
         VocabType::Test => "TEST",
     };
     let tok = |id: i32| vocab.id_to_token[id as usize].text.clone();

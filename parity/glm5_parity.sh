@@ -81,11 +81,23 @@ if [ "${GLM5_GRAPH:-1}" = "1" ]; then
     bash parity/limited.sh -- env GLM5_DUMP_MODEL="$SYNTH" GLM5_DUMP_OUT="$OUT/nodes_port.bin" \
         cargo test --release -p llama --test glm5_dump -- --ignored --nocapture glm5_prefill_node_dump \
         > /dev/null 2>&1 || exit 1
-    n=$(python3 parity/decode_dump_cmp.py "$OUT/nodes_ref.bin" "$OUT/nodes_port.bin" 2>/dev/null | grep -cE 'DIVERGENT' || true)
-    if [ "$n" -eq 0 ]; then
-        echo "   glm5-next graph: node streams bit-identical (0 divergent)"
+    # acceptance = the default glm5_dump test's named-node pairing (76 named
+    # nodes x 13 graphs, byte-identical). The legacy positional comparator
+    # (decode_dump_cmp.py) can no longer judge this pair: since 0bb496dbd the
+    # reference keeps all three build_inp_embd branches in the graph via
+    # ggml_build_forward_select, and the branches not selected for the batch
+    # are never computed — their dump slots read as zeros, so a live port node
+    # paired against a dead ref branch shows as a spurious DIVERGENT. The
+    # port resolves the selection at step-graph build time (documented in
+    # graph.rs build_inp_embd) and has no dead branches; named pairing
+    # compares only live nodes on both sides.
+    cp "$OUT/nodes_ref.bin"  parity/glm5/nodes_ref.bin
+    cp "$OUT/nodes_port.bin" parity/glm5/nodes_port.bin
+    if bash parity/limited.sh -- cargo test --release -p llama --test glm5_dump -- --nocapture glm5_graph_nodes_bit_exact_vs_reference \
+        > /dev/null 2>&1; then
+        echo "   glm5-next graph: named-node streams bit-identical (76 names x 13 graphs)"
     else
-        echo "   glm5-next graph: $n DIVERGENT nodes" >&2
+        echo "   glm5-next graph: named-node comparison FAILED" >&2
         exit 1
     fi
 fi
