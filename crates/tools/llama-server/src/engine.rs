@@ -890,11 +890,120 @@ fn grammar_accept_lazy(
 }
 
 /// Which llama context the server holds — a decoder (`llama_decode`, the
-/// reference's `ctx_tgt`) or an encoder-only model (`llama_encode`, reached
-/// when the server starts with `--embeddings` on a BERT-family file).
+/// reference's `ctx_tgt`), an encoder-only model (`llama_encode`, reached
+/// when the server starts with `--embeddings` on a BERT-family file), or the
+/// lfm2 d1-omni decision model (`lfm2.decision.block_count > 0`, a657f7e98).
 pub enum Core {
     Decode(DecodeContext),
     Encode(EncoderContext),
+    /// `graph_decision` of lfm2.cpp:415-518 — the null-memory d1-omni trunk
+    /// the reference drives through `llama_decode`'s "no memory -> encode()"
+    /// reroute (llama-context.cpp:1729-1732). The port's `DecodeContext`
+    /// builds the hybrid-memory decode graph, so the decision model rides its
+    /// own stateless core: one `build_lfm2_decision_forward` pass per request
+    /// (the same driver as `tests/lfm2_decision_e2e.rs`).
+    Decision(D1OmniCore),
+}
+
+/// the d1-omni forward driver — `tests/lfm2_decision_e2e.rs`'s `D1Driver`
+/// lifted into the engine: the no-cache trunk (media-aware masks, text-only
+/// in the port), the [3, n_tokens] score output of the head.
+pub struct D1OmniCore {
+    pub gctx: ggml::Context,
+    pub w: llama::graph_arch::Lfm2DecisionModelWeights,
+    pub p: llama::graph_arch::Lfm2DecisionParams,
+    /// `hparams.n_embd_out()` = the question-type count (3,
+    /// lfm2.cpp:15-17 `N_DECISION_TYPES`)
+    pub n_embd_out: usize,
+    pub n_threads: usize,
+}
+
+impl D1OmniCore {
+    /// one decision pass — the text-only mask shapes (single sequence, no
+    /// media: everything visible, plain neighbor taps). Returns the flat
+    /// score rows `[n_tokens][n_embd_out]` (ggml's [3, T] column-major
+    /// layout is token-major in memory — exactly `llama_get_embeddings_ith`
+    /// rows, llama-context.cpp's `outputs_embd`).
+    fn decide(&mut self, tokens: &[i32]) -> Result<Vec<f32>, String> {
+        use ggml::types::GgmlType;
+        use llama::graph_arch;
+
+        let n = tokens.len();
+        let t = n as i64;
+        let watermark = self.gctx.mark();
+        self.gctx.reset_graph_to(watermark);
+
+        let tokens_t = self.gctx.new_tensor_1d(GgmlType::I32, t);
+        let pos_t = self.gctx.new_tensor_1d(GgmlType::I32, t);
+        let enc_mask = self.gctx.new_tensor_2d(GgmlType::F32, t, t);
+        let head_mask = self.gctx.new_tensor_2d(GgmlType::F32, t, t);
+        let conv_left = self.gctx.new_tensor_2d(GgmlType::F32, 1, t);
+        let conv_right = self.gctx.new_tensor_2d(GgmlType::F32, 1, t);
+        for x in [tokens_t, pos_t, enc_mask, head_mask, conv_left, conv_right] {
+            self.gctx.arena_resize_tensor(x);
+        }
+        self.gctx
+            .with_i32_mut(tokens_t, |q| q.copy_from_slice(tokens))
+            .ok_or("tensor access failed".to_string())?;
+        self.gctx
+            .with_i32_mut(pos_t, |q| {
+                for (k, v) in q.iter_mut().enumerate() {
+                    *v = k as i32;
+                }
+            })
+            .ok_or("tensor access failed".to_string())?;
+        // text-only single sequence: every position visible in both masks
+        // (lfm2.cpp:352-384's set_input with no media rows)
+        self.gctx.with_f32_mut(enc_mask, |q| q.fill(0.0)).ok_or("tensor access failed".to_string())?;
+        self.gctx.with_f32_mut(head_mask, |q| q.fill(0.0)).ok_or("tensor access failed".to_string())?;
+        // the neighbor taps: left[i+1] = right[i] = 1 within the sequence
+        // (lfm2_conv_mask_rule, graph_arch.rs)
+        self.gctx
+            .with_f32_mut(conv_left, |q| {
+                q[0] = 0.0;
+                for v in q.iter_mut().skip(1) {
+                    *v = 1.0;
+                }
+            })
+            .ok_or("tensor access failed".to_string())?;
+        self.gctx
+            .with_f32_mut(conv_right, |q| {
+                for v in q.iter_mut().take(n.saturating_sub(1)) {
+                    *v = 1.0;
+                }
+                if n > 0 {
+                    q[n - 1] = 0.0;
+                }
+            })
+            .ok_or("tensor access failed".to_string())?;
+
+        let inp = graph_arch::Lfm2DecisionInputs {
+            tokens: tokens_t,
+            pos: pos_t,
+            kq_mask_enc: enc_mask,
+            kq_mask_head: head_mask,
+            conv_left,
+            conv_right,
+            out_ids: None,
+        };
+        let result =
+            graph_arch::build_lfm2_decision_forward(&mut self.gctx, &self.w, &self.p, &inp, n);
+        let scores = result.scores;
+        let mut gf = result.graph;
+        ggml::compute::graph_compute(&mut self.gctx, &mut gf, self.n_threads);
+        let bytes = self
+            .gctx
+            .data_bytes(scores)
+            .ok_or("score tensor access failed".to_string())?;
+        // the [3, T] F32 scores, token-major in memory — T rows of
+        // n_embd_out (the `llama_get_embeddings_ith` layout)
+        let flat: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        debug_assert_eq!(flat.len(), n * self.n_embd_out);
+        Ok(flat)
+    }
 }
 
 /// `server_context_impl` — the model side of the server.
@@ -926,6 +1035,28 @@ pub struct Engine {
     /// `n_keep` default (server-schema.cpp:529 `params.n_keep =
     /// params_base.n_keep`).
     pub n_keep_default: i32,
+    /// `params_base.n_ctx_checkpoints` (common.h:637, `--ctx-checkpoints`)
+    /// — the per-slot cap of the prompt-cache checkpoint list; 0 disables
+    /// the machinery (`do_checkpoint = n_ctx_checkpoints > 0`,
+    /// server-context.cpp:3865)
+    pub n_ctx_checkpoints: i32,
+    /// `params_base.checkpoint_min_step` (common.h:639,
+    /// `--checkpoint-min-step`) — the minimum token spacing between
+    /// checkpoints (0 = no minimum)
+    pub checkpoint_min_step: i32,
+    /// `n_swa` of the target memory (server-context.cpp:1337
+    /// `swa_full ? 0 : llama_model_n_swa(model_tgt)`; the port has no
+    /// `--swa-full` flag, so it is the raw hparams window). Drives the
+    /// rollback threshold `pos_min_thold = max(0, pos_next - n_swa - …)`
+    /// (server-context.cpp:3674)
+    pub n_swa: i32,
+    /// the memory cannot roll back a partial sequence —
+    /// `common_context_can_seq_rm` resolved to FULL/RS (common.cpp:1553-1596;
+    /// a recurrent half without snapshots refuses `seq_rm`, a rollback
+    /// ring/dsv4 bounds it, llama-memory-recurrent.cpp:180-210). Checkpoints
+    /// are only created for such memories, or when `n_swa > 0`
+    /// (server-context.cpp:3870-3878)
+    pub seq_rm_bounded: bool,
     pub shutdown: Arc<AtomicBool>,
     /// `server_context_impl::spec` (server-context.cpp:1259-1300) — the
     /// speculator of `common_speculative_init`, shared by every slot (`None`
@@ -955,7 +1086,7 @@ impl Engine {
     fn dctx(&mut self) -> Option<&mut DecodeContext> {
         match &mut self.core {
             Core::Decode(d) => Some(d),
-            Core::Encode(_) => None,
+            Core::Encode(_) | Core::Decision(_) => None,
         }
     }
 }
@@ -1068,6 +1199,14 @@ impl Engine {
     /// never touch the slots in the port: they encode synchronously, one at a
     /// time, on the engine thread.
     pub fn run(&mut self, server: &Server) -> ! {
+        // pin both `now_us` epochs before the first request — the lazy
+        // OnceLocks would otherwise start the clocks AT their first call,
+        // whose elapsed is then 0 and the first request's `t_start` reads
+        // as "not set" (the `server_slot_stats::is_set` gate and every
+        // timing of the first request were wrong; ggml_time_us initializes
+        // at library load in the reference — engine.rs and api.rs each own
+        // a clock here)
+        let _ = (now_us(), crate::api::now_us());
         loop {
             let mut queued: VecDeque<Task> = server.queue.drain().into();
             // the deferred /slots tasks first (queue_tasks.defer) — a slot
@@ -1271,6 +1410,17 @@ impl Engine {
                     }
                 }
             }
+            // the d1-omni core: its scores ARE the embedding rows (pooling
+            // NONE was forced at load, common.cpp:1285-1290) — an /embeddings
+            // request against the decision model answers with the per-token
+            // score rows like the reference's encode reroute
+            Core::Decision(d) => match d.decide(&tokens) {
+                Ok(v) => (d.n_embd_out, tokens.len(), v),
+                Err(e) => {
+                    err(&format!("failed to encode: {e}"), 500);
+                    return;
+                }
+            },
         };
         // `send_embedding`: pooling NONE reports every token row; a pooled mode
         // reports one normalized row
@@ -1449,9 +1599,16 @@ impl Engine {
                 .collect()
         };
 
-        // decode every group: the parent's whole prompt, then the children
-        // from the shared prefix (`copy_prompt_to` — the port continues the
-        // parent's sequence instead of copying between slots)
+        // decode every group. A shared-prefix group mirrors the reference's
+        // slot flow exactly (server-context.cpp:3828-3854 + :3926-3932): the
+        // parent's batch stops at `n_tokens_shared`, `copy_prompt_to` hands
+        // that state to the children (`seq_cp` of the KV cells + the
+        // recurrent tail), the parent then continues its own tail and every
+        // child decodes its tail from the boundary. The port has one
+        // context, so the "copy" is a full-sequence state snapshot taken
+        // right after the prefix decode and restored before each child (the
+        // recurrent cell cannot be rewound any other way — the single live
+        // cell has no per-position snapshots without n_rs_seq)
         let mut scores_by_index: std::collections::BTreeMap<usize, Vec<f32>> =
             std::collections::BTreeMap::new();
         let mut n_tokens_total: i64 = 0;
@@ -1476,7 +1633,29 @@ impl Engine {
                 );
                 return;
             }
-            match self.decision_decode_one(&g.parent.tokens, &g.parent.spec) {
+            // the shared boundary state: decode the prefix, snapshot the
+            // whole sequence (KV + recurrent cell) at that point
+            let boundary: Option<Vec<u8>> = if g.n_tokens_shared > 0 {
+                match self.decision_decode_prefix(&g.parent.tokens, g.n_tokens_shared) {
+                    Ok(snap) => Some(snap),
+                    Err(code_msg) => {
+                        err(task, &code_msg.0, code_msg.1);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+            // the parent's own scores: with a shared prefix the parent
+            // continues from the boundary (the reference's parent prompt is
+            // also split — prefix batch, then its own tail); without one it
+            // is one fresh decode
+            let parent_scores = if boundary.is_some() {
+                self.decision_decode_continue(&g.parent.tokens, g.n_tokens_shared, &g.parent.spec)
+            } else {
+                self.decision_decode_one(&g.parent.tokens, &g.parent.spec)
+            };
+            match parent_scores {
                 Ok(s) => {
                     n_tokens_total += g.parent.tokens.len() as i64;
                     scores_by_index.insert(g.parent.index, s);
@@ -1499,6 +1678,14 @@ impl Engine {
                         400,
                     );
                     return;
+                }
+                // rewind to the shared boundary before the child's tail
+                // (`copy_prompt_to`'s seq_cp on the parent's prefix cells)
+                if let Some(snap) = boundary.as_ref() {
+                    if let Err(code_msg) = self.decision_restore_state(snap) {
+                        err(task, &code_msg.0, code_msg.1);
+                        return;
+                    }
                 }
                 match self.decision_decode_tail(&g.parent.tokens, &child.tokens, shared, &child.spec)
                 {
@@ -1593,9 +1780,86 @@ impl Engine {
         self.decision_scores_from_rows(spec, &values, n_rows, n_embd_out, tokens.len())
     }
 
+    /// the parent of a shared-prefix group: the prefix is already in the
+    /// sequence (`decision_decode_prefix` left it at the boundary), the
+    /// parent's own tail decodes as its second batch and the scores read at
+    /// its last token — exactly the reference's [prefix batch][parent tail
+    /// batch] split (server-context.cpp:3926-3932 stops the parent's fill at
+    /// `n_tokens_shared`)
+    fn decision_decode_continue(
+        &mut self,
+        tokens: &[i32],
+        shared: usize,
+        spec: &crate::server_decision::DecisionSpec,
+    ) -> Result<Vec<f32>, (String, i64)> {
+        let tail = &tokens[shared..];
+        let pos: Vec<i32> = (shared as i32..tokens.len() as i32).collect();
+        if !spec.labels.is_empty() {
+            let logits = self.decode_continue_logits_at(tail, &pos)?;
+            let mut out = Vec::with_capacity(spec.labels.len());
+            for &label in &spec.labels {
+                let row = *logits
+                    .get(label as usize)
+                    .ok_or_else(|| ("failed to get logits".to_string(), 500i64))?;
+                out.push(row);
+            }
+            reduce_label_groups(&mut out, spec);
+            return Ok(out);
+        }
+        let _ = tail;
+        let _ = pos;
+        // the embeddings family shares only via kev, whose child path
+        // re-decodes whole prompts anyway — unreachable in practice
+        self.decision_decode_one(tokens, spec)
+    }
+
+    /// the shared-prefix boundary decode: run the parent's first `shared`
+    /// tokens (one batch, exactly where the reference's batch fill stops —
+    /// "stop at the end of the shared prefix", server-context.cpp:3926-3932)
+    /// and return the full-sequence state snapshot at that point
+    /// (`copy_prompt_to`'s `seq_cp` source state). The port's snapshot is
+    /// `state_seq_get_data(0, false)` — the full state, because the
+    /// recurrent half is not in the PARTIAL_ONLY blob.
+    fn decision_decode_prefix(
+        &mut self,
+        parent_tokens: &[i32],
+        shared: usize,
+    ) -> Result<Vec<u8>, (String, i64)> {
+        let prefix = &parent_tokens[..shared];
+        let pos: Vec<i32> = (0..shared as i32).collect();
+        match &mut self.core {
+            Core::Decode(dctx) => {
+                dctx.seq_rm(0, -1, -1);
+                dctx
+                    .decode(prefix, &pos)
+                    .map_err(|e| (format!("failed to decode: {e}"), 500))?;
+                Ok(dctx.state_seq_get_data(0, false))
+            }
+            // the encoder/decision cores have no sequence state to share (the
+            // embeddings family never shares a prompt —
+            // `can_share_prompt()`)
+            Core::Encode(_) | Core::Decision(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// restore a `decision_decode_prefix` snapshot before a child's tail
+    /// (`copy_prompt_to(other)`: `seq_rm` + `seq_cp` of the prefix cells)
+    fn decision_restore_state(&mut self, snap: &[u8]) -> Result<(), (String, i64)> {
+        match &mut self.core {
+            Core::Decode(dctx) => {
+                dctx.seq_rm(0, -1, -1);
+                dctx
+                    .state_seq_set_data(0, snap, false)
+                    .map_err(|e| (format!("failed to restore the shared prefix: {e}"), 500))
+            }
+            Core::Encode(_) | Core::Decision(_) => Ok(()),
+        }
+    }
+
     /// the shared-prefix continuation: the parent's first `shared` tokens are
-    /// already in the KV, the child decodes only its tail (`copy_prompt_to` +
-    /// the child's own prompt processing, server-context.cpp:3610-3627)
+    /// already in the KV (the restored boundary snapshot), the child decodes
+    /// only its tail (`copy_prompt_to` + the child's own prompt processing,
+    /// server-context.cpp:3610-3627)
     fn decision_decode_tail(
         &mut self,
         parent_tokens: &[i32],
@@ -1606,7 +1870,8 @@ impl Engine {
         if !spec.labels.is_empty() {
             let tail = &child_tokens[shared..];
             let pos: Vec<i32> = (shared as i32..child_tokens.len() as i32).collect();
-            let logits = self.decode_last_logits_at(tail, &pos)?;
+            // no wipe: the sequence continues from the boundary state
+            let logits = self.decode_continue_logits_at(tail, &pos)?;
             let mut out = Vec::with_capacity(spec.labels.len());
             for &label in &spec.labels {
                 let row = *logits
@@ -1713,7 +1978,27 @@ impl Engine {
                     Err(e) => Err((format!("failed to decode: {e}"), 500)),
                 }
             }
-            Core::Encode(_) => Err((
+            Core::Encode(_) | Core::Decision(_) => Err((
+                "an encoder-only context has no logits output".to_string(),
+                500,
+            )),
+        }
+    }
+
+    /// the continuation twin of [`Self::decode_last_logits_at`]: no wipe —
+    /// the sequence already holds the shared prefix (the restored boundary
+    /// snapshot) and the batch appends the child's tail at its positions
+    fn decode_continue_logits_at(
+        &mut self,
+        tokens: &[i32],
+        pos: &[i32],
+    ) -> Result<Vec<f32>, (String, i64)> {
+        match &mut self.core {
+            Core::Decode(dctx) => match dctx.decode(tokens, pos) {
+                Ok(row) => Ok(row.to_vec()),
+                Err(e) => Err((format!("failed to decode: {e}"), 500)),
+            },
+            Core::Encode(_) | Core::Decision(_) => Err((
                 "an encoder-only context has no logits output".to_string(),
                 500,
             )),
@@ -1721,12 +2006,20 @@ impl Engine {
     }
 
     /// per-token embedding rows (pooling NONE) — the encoder core's
-    /// `llama_encode`, the decode core's `decode_embed`
+    /// `llama_encode`, the decode core's `decode_embed`, the d1-omni core's
+    /// own stateless forward
     fn decode_rows(&mut self, tokens: &[i32]) -> Result<(usize, usize, Vec<f32>), (String, i64)> {
         let pos: Vec<i32> = (0..tokens.len() as i32).collect();
         match &mut self.core {
             Core::Encode(enc) => match enc.encode(tokens) {
                 Ok(e) => Ok((e.n_embd_out, e.n_rows, e.values)),
+                Err(e) => Err((format!("failed to encode: {e}"), 500)),
+            },
+            // the d1-omni model: one whole-prompt pass through
+            // `build_lfm2_decision_forward` — the [3, T] scores read as T
+            // rows of n_embd_out (the `llama_get_embeddings_ith` layout)
+            Core::Decision(d) => match d.decide(tokens) {
+                Ok(v) => Ok((d.n_embd_out, tokens.len(), v)),
                 Err(e) => Err((format!("failed to encode: {e}"), 500)),
             },
             Core::Decode(dctx) => {
@@ -1747,7 +2040,160 @@ impl Engine {
         match &self.core {
             Core::Decode(d) => d.n_batch as i32,
             // the EncoderContext reserves with the server's n_ubatch
-            Core::Encode(_) => 512,
+            Core::Encode(_) | Core::Decision(_) => 512,
+        }
+    }
+
+    /// the checkpoint blob's `partial_only` flag. The reference writes
+    /// `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (the swa half / the recurrent
+    /// cells / the whole plain KV); the port's partial blob SKIPS the
+    /// recurrent half (`state_write_attn_half`, context.rs:3306-3313), so a
+    /// recurrent/hybrid memory snapshots the full state — a superset that
+    /// restores the same cells (see `create_checkpoint`'s doc comment)
+    fn ckpt_partial_only(&self) -> bool {
+        !matches!(&self.core, Core::Decode(d) if d.weights.recurrent_dims().is_some())
+    }
+
+    /// `llama_memory_seq_pos_min` of the target memory, hybrid-aware:
+    /// `llama_memory_hybrid::seq_pos_min` is the MAX of the halves' mins
+    /// (llama-memory-hybrid.cpp:172-175), and the recurrent half's one live
+    /// cell sits at the sequence's END (find_slot's `cell.pos`,
+    /// llama-memory-recurrent.cpp:655-665 — mirrored by the port's
+    /// `recurrent_live_seq` reading the KV's pos max, context.rs:3817-3822).
+    /// A hybrid whose cell is past the new prompt's prefix therefore reads
+    /// `pos_min` at the old end — exactly what makes the rollback fire.
+    fn mem_pos_min(&self, id: i32) -> i32 {
+        match &self.core {
+            Core::Decode(d) => {
+                let attn_min = d.seq_pos_min(id);
+                if d.weights.recurrent_dims().is_some() && d.recurrent_state_live_seq() == Some(id)
+                {
+                    // the live cell's position — the sequence's pos max
+                    attn_min.max(d.kv.seq_pos_max_of(id as usize))
+                } else {
+                    attn_min
+                }
+            }
+            _ => -1,
+        }
+    }
+
+    /// `llama_memory_seq_pos_max`, hybrid-aware: the MIN of the halves'
+    /// maxes (llama-memory-hybrid.cpp:177-180)
+    fn mem_pos_max(&self, id: i32) -> i32 {
+        match &self.core {
+            Core::Decode(d) => {
+                let attn_max = d.seq_pos_max(id);
+                if d.weights.recurrent_dims().is_some() && d.recurrent_state_live_seq() == Some(id)
+                {
+                    attn_max.min(d.kv.seq_pos_max_of(id as usize))
+                } else {
+                    attn_max
+                }
+            }
+            _ => -1,
+        }
+    }
+
+    /// `create_checkpoint` (server-context.cpp:2521-2584, PR #13194's
+    /// machinery, the 033df86b6 T2 remainder) — snapshot the parts of the
+    /// memory that cannot be rolled back, at the head of the current batch
+    /// (the caller runs it BEFORE the batch decodes, so the batch's tokens
+    /// are not in the snapshot). `n_tokens_cur` = the tokens this slot added
+    /// to the batch; the checkpoint's `n_tokens` is the slot's prompt length
+    /// below them.
+    ///
+    /// The reference saves `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (the swa half
+    /// of an iswa cache, the recurrent cells of a hybrid, everything of a
+    /// plain KV — llama-kv-cache-iswa.cpp:260-266 /
+    /// llama-memory-hybrid.cpp:190-196). The port's partial blob skips the
+    /// recurrent half (`state_write_attn_half`,
+    /// context.rs:3306-3313), so on a recurrent/hybrid memory the port
+    /// snapshots the FULL state instead — a superset that restores the same
+    /// cells plus the (already identical) attention prefix.
+    fn create_checkpoint(&mut self, si: usize, n_tokens_cur: usize) {
+        let id_task = self.slots[si].task.as_ref().map(|t| t.id).unwrap_or(-1);
+        let n_ctx_checkpoints = self.n_ctx_checkpoints.max(0) as usize;
+        let min_step = self.checkpoint_min_step;
+
+        // evict checkpoints within min-step of a previous one, unless they
+        // were created by the current task; only when the list is full —
+        // otherwise short prompts keep just the oldest checkpoint
+        // (server-context.cpp:2527-2541)
+        {
+            let mut last: i64 = -1;
+            let mut it = 0usize;
+            while self.slots[si].checkpoints.len() + 1 >= n_ctx_checkpoints
+                && it < self.slots[si].checkpoints.len()
+            {
+                let cur = &self.slots[si].checkpoints[it];
+                if cur.id_task != id_task
+                    && last >= 0
+                    && cur.n_tokens as i64 <= last + min_step as i64
+                {
+                    self.slots[si].checkpoints.remove(it);
+                    continue;
+                }
+                last = cur.n_tokens as i64;
+                it += 1;
+            }
+        }
+        // make room for the new checkpoint (server-context.cpp:2543-2551)
+        while self.slots[si].checkpoints.len() >= n_ctx_checkpoints {
+            self.slots[si].checkpoints.pop_front();
+        }
+
+        // replace an existing checkpoint at the same n_tokens instead of
+        // appending a duplicate (server-context.cpp:2553-2564)
+        let n_tokens_new = self.slots[si].prompt_tokens.len() - n_tokens_cur;
+        self.slots[si].checkpoints.retain(|c| c.n_tokens != n_tokens_new);
+
+        // `update_pos` + `update_tgt`/`update_dft` (PARTIAL_ONLY)
+        let id = self.slots[si].id;
+        let (pos_min, pos_max) = (self.mem_pos_min(id), self.mem_pos_max(id));
+        let recurrent = !self.ckpt_partial_only();
+        // the partial/full choice — see the doc comment above
+        let partial_only = !recurrent;
+        let (data_tgt, data_dft) = match &mut self.core {
+            Core::Decode(d) => (
+                d.state_seq_get_data(id, partial_only),
+                match self.spec.as_mut().and_then(|s| s.ctx_dft()) {
+                    Some(dft) => dft.state_seq_get_data(id, partial_only),
+                    None => Vec::new(),
+                },
+            ),
+            Core::Encode(_) | Core::Decision(_) => (Vec::new(), Vec::new()),
+        };
+        // `common_speculative_get_state` (server-context.cpp:2577) — the
+        // draft's speculative stash (eagle3's deferred g_embd row). The
+        // port's CommonSpeculative has no get/set-state surface, so the
+        // stash stays empty; nothing reads it on the port's rollback path
+        // (the draft sequence is rebuilt from the restored target state)
+        let data_spec = Vec::new();
+
+        self.slots[si].checkpoints.push_back(SlotCheckpoint {
+            id_task,
+            n_tokens: n_tokens_new,
+            pos_min,
+            pos_max,
+            data_tgt,
+            data_dft,
+            data_spec,
+        });
+        let cur = self.slots[si].checkpoints.back().unwrap();
+        // SLT_TRC — the trace log, behind the port's debug gate
+        if std::env::var("LLAMA_SERVER_DEBUG").is_ok() {
+            eprintln!(
+                "slot {}: created context checkpoint {} of {} (pos_min = {}, pos_max = {}, \
+                 n_tokens = {}, size = {:.3} MiB)",
+                self.slots[si].id,
+                self.slots[si].checkpoints.len(),
+                n_ctx_checkpoints,
+                cur.pos_min,
+                cur.pos_max,
+                cur.n_tokens,
+                cur.size() as f64 / 1024.0 / 1024.0
+            );
         }
     }
 
@@ -1858,8 +2304,12 @@ impl Engine {
                     None
                 }
             }
-            // an encoder-only context has no sequence state at all
-            Core::Encode(_) => Some("an encoder-only context has no sequence state"),
+            // an encoder-only context has no sequence state at all; the
+            // d1-omni decision core is stateless the same way (one forward
+            // per request, no memory module)
+            Core::Encode(_) | Core::Decision(_) => {
+                Some("an encoder-only context has no sequence state")
+            }
         };
 
         match task.kind {
@@ -1879,7 +2329,8 @@ impl Engine {
                 let framed = match &self.core {
                     Core::Decode(dctx) => dctx.state_seq_get_data(action.id_slot, false),
                     // an encoder-only context has no sequence state to save
-                    Core::Encode(_) => {
+                    // (the state_gap above already rejected these)
+                    Core::Encode(_) | Core::Decision(_) => {
                         err(task, "Unable to save slot", 500);
                         return;
                     }
@@ -2028,7 +2479,7 @@ impl Engine {
                         // pass includes but the file does not)
                         payload_end = 12 + packed_bytes.len() + dctx.state_seq_get_size(action.id_slot, false) - 8;
                     }
-                    Core::Encode(_) => {
+                    Core::Encode(_) | Core::Decision(_) => {
                         err(task, "Unable to restore slot: No available space in KV cache or invalid slot save file", 400);
                         return;
                     }
@@ -2432,7 +2883,10 @@ impl Engine {
 
         // shift the slot's token list (:2956-2968 — "add generated tokens to
         // cache", ref PR #16818): tokens [n_keep + n_discard, ..) move down by
-        // n_discard, the tail shrinks by n_discard
+        // n_discard, the tail shrinks by n_discard. The C rebuilds the prompt
+        // through `slot.prompt.clear()` + insert — clear() drops the context
+        // checkpoints too (server-task.h:611-616), so the shifted positions
+        // never collide with a stale checkpoint
         {
             let mut new_tokens = self.slots[si].prompt_tokens.clone();
             for i in (n_keep + n_discard) as usize..new_tokens.len() {
@@ -2440,6 +2894,7 @@ impl Engine {
             }
             new_tokens.truncate(self.slots[si].prompt_tokens.len() - n_discard as usize);
             self.slots[si].prompt_tokens = new_tokens;
+            self.slots[si].checkpoints.clear();
         }
 
         // the speculative draft context still holds the sequence's *unshifted*
@@ -2620,6 +3075,33 @@ impl Engine {
             {
                 let slot_id = self.slots[si].id;
                 let n_tokens_task = self.slots[si].task.as_ref().unwrap().tokens.len();
+
+                // ---- the checkpoint gates (server-context.cpp:3865-3878) ----
+                // `bool do_checkpoint = params_base.n_ctx_checkpoints > 0`
+                // (only completion tasks reach the slot machinery; the
+                // port's embedding/decision tasks decode inline)
+                // `&& (seq_rm FULL || RS || n_swa > 0)` — only the memories
+                // that cannot roll back a partial sequence need a checkpoint
+                let mut do_checkpoint =
+                    self.n_ctx_checkpoints > 0 && (self.seq_rm_bounded || self.n_swa > 0);
+                // `spans.is_user_start` / `spans.last_user_message_pos`
+                // (common/chat.h:168-182) over the task's message spans
+                let user_starts: Vec<usize> = self.slots[si]
+                    .task
+                    .as_ref()
+                    .unwrap()
+                    .params
+                    .message_user_starts
+                    .clone();
+                let last_user_pos = user_starts.last().map(|&p| p as i32).unwrap_or(-1);
+                let is_user_start_pos = move |pos: usize| user_starts.binary_search(&pos).is_ok();
+                // `n_ubatch` — the decode core's per-call cap
+                let n_ubatch = match &self.core {
+                    Core::Decode(d) => d.n_batch as i32,
+                    _ => 512,
+                };
+
+                let n_tokens_prev = batch.token.len();
                 let mut last = None;
                 while self.slots[si].prompt_tokens.len() < n_tokens_task && batch.token.len() < n_batch {
                     let tok = self.slots[si].task.as_ref().unwrap().tokens
@@ -2629,7 +3111,85 @@ impl Engine {
                     batch.add(tok, pos, &[slot_id], false);
                     self.slots[si].prompt_tokens.push(tok);
                     last = Some(batch.token.len() - 1);
+
+                    // break at the last user message, or at user messages at
+                    // least min step past the last checkpoint
+                    // (server-context.cpp:3977-3983)
+                    if do_checkpoint && is_user_start_pos(self.slots[si].prompt_tokens.len()) {
+                        let pos = self.slots[si].prompt_tokens.len() as i64;
+                        let back = self.slots[si].checkpoints.back().map(|c| c.n_tokens as i64);
+                        if pos as i32 == last_user_pos
+                            || back.is_none()
+                            || pos > back.unwrap() + self.checkpoint_min_step as i64
+                        {
+                            break;
+                        }
+                    }
+
+                    // process the last few tokens of the prompt separately so
+                    // a checkpoint can be created at their head —
+                    // {4 + n_ubatch, 4} before the end (PR #20288,
+                    // server-context.cpp:3985-3999)
+                    if do_checkpoint {
+                        let mut should_break = false;
+                        for offset in [4 + n_ubatch, 4] {
+                            let n_last = n_batch.min(offset as usize);
+                            if n_tokens_task == self.slots[si].prompt_tokens.len() + n_last {
+                                should_break = true;
+                                break;
+                            }
+                        }
+                        if should_break {
+                            break;
+                        }
+                    }
                 }
+                let n_tokens_cur = batch.token.len() - n_tokens_prev;
+                let n_tokens_start = self.slots[si].prompt_tokens.len() - n_tokens_cur;
+
+                // `near_prompt_end` / `is_user_start` of this batch's head
+                // (server-context.cpp:4028-4029)
+                let near_prompt_end =
+                    (n_tokens_task as i32) < (self.slots[si].prompt_tokens.len() as i32 + n_ubatch);
+                let is_user_start = is_user_start_pos(n_tokens_start);
+                let is_last_user_message = n_tokens_start as i32 == last_user_pos;
+
+                // skip ordinary mid-prompt checkpoints, unless the batch
+                // starts a user message or we are near the end of the prompt
+                // (server-context.cpp:4031-4035)
+                if self.slots[si].prompt_tokens.len() != n_tokens_task
+                    && !is_user_start
+                    && !near_prompt_end
+                {
+                    do_checkpoint = false;
+                }
+
+                // nothing to checkpoint yet (server-context.cpp:4041-4044);
+                // no mtmd chunks in the port (the :4047 gate)
+                if do_checkpoint && self.mem_pos_min(slot_id) < 0 {
+                    do_checkpoint = false;
+                }
+
+                // no need to create checkpoints that are too close together,
+                // unless it's the last user message or the prompt is ending
+                // (server-context.cpp:4050-4055)
+                let back_n = self.slots[si].checkpoints.back().map(|c| c.n_tokens as i64);
+                if do_checkpoint
+                    && back_n.is_some()
+                    && !is_last_user_message
+                    && !near_prompt_end
+                    && (n_tokens_start as i64) <= back_n.unwrap() + self.checkpoint_min_step as i64
+                {
+                    do_checkpoint = false;
+                }
+
+                // note: the checkpoint is taken before the batch decodes, so
+                // its state does not cover the batch's tokens
+                // (server-context.cpp:4057-4061)
+                if do_checkpoint {
+                    self.create_checkpoint(si, n_tokens_cur);
+                }
+
                 if self.slots[si].prompt_tokens.len() == n_tokens_task {
                     if let Some(idx) = last {
                         // `batch.set_output(batch.size() - 1, true)` (server-context.cpp:3591)
@@ -2716,6 +3276,30 @@ impl Engine {
             }
         };
 
+        // the post-decode prompt-bookkeeping loop (server-context.cpp:4595-
+        // 4606): every batch row of a prompt-processing slot bumps the
+        // slot's `n_prompt_processed` — the `timings.prompt_n` the client
+        // reads. The C reads the batch row's `is_prompt` flag (set by
+        // `batch.add(..., /* is_prompt = */ true)`); the port's equivalent
+        // is the slot's state — a ProcessingPrompt slot contributed only
+        // prompt rows to this batch (the last one carries the output flag
+        // and still counts, like the C's is_prompt row)
+        {
+            let seqs = batch.seq_id.as_ref();
+            for i in 0..batch.token.len() {
+                let Some(ids) = seqs.map(|s| &s[i]) else { continue };
+                let Some(&slot_id) = ids.first() else { continue };
+                let Some(si) = self.slots.iter().position(|s| s.id == slot_id) else {
+                    continue;
+                };
+                if self.slots[si].state == SlotState::ProcessingPrompt
+                    && self.slots[si].stats.is_set()
+                {
+                    self.slots[si].stats.n_prompt_processed += 1;
+                }
+            }
+        }
+
         // `common_speculative_process(spec, batch_view)` — feed the decoded
         // batch (prompt or generation) to the speculator, which decodes it on
         // the draft context (server-context.cpp:3742-3757). The target context
@@ -2777,6 +3361,84 @@ impl Engine {
             let cached = self.slots[si].prompt_tokens.clone();
             let input = self.slots[si].task.as_ref().unwrap().tokens.clone();
             n_past = common_prefix_len(&cached, &input);
+
+            // ---- the checkpoint rollback (server-context.cpp:3666-3784, PR
+            // #24110) ---- when the KV's oldest live cell sits past what the
+            // new prompt needs (the swa window evicted the prefix, or the
+            // memory cannot roll back at all), search the checkpoint list
+            // newest-first for one the sequence can restart from
+            let id = self.slots[si].id;
+            let mut pos_next = n_past as i32;
+            let has_new_tokens = n_past < n_task;
+            // `pos_min_thold = max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1))`
+            // (server-context.cpp:3674)
+            let pos_min_thold =
+                (pos_next - self.n_swa - if has_new_tokens { 0 } else { 1 }).max(0);
+
+            if n_past > 0 {
+                let pos_min = self.mem_pos_min(id);
+                if pos_min >= pos_min_thold {
+                    // find_if over the reversed list: `pos_max <= pos_next`
+                    // and (`pos_min < pos_min_thold` or `pos_min == 0`) —
+                    // guarantee at least one token gets processed
+                    // ([TAG_PROMPT_LOGITS] workaround of
+                    // [TAG_CHECKPOINTS_FIX_POS_MIN],
+                    // server-context.cpp:3728-3740)
+                    let restore = self.slots[si]
+                        .checkpoints
+                        .iter()
+                        .rev()
+                        .find(|c| c.pos_max <= pos_next && (c.pos_min < pos_min_thold || c.pos_min == 0))
+                        .cloned();
+                    let mut do_reset = true;
+                    let partial_only = self.ckpt_partial_only();
+                    if let Some(c) = restore.as_ref() {
+                        let ok = match &mut self.core {
+                            Core::Decode(d) => {
+                                d.state_seq_set_data(id, &c.data_tgt, partial_only).is_ok()
+                            }
+                            _ => false,
+                        } && match self.spec.as_mut().and_then(|s| s.ctx_dft()) {
+                            Some(dft) if !c.data_dft.is_empty() => {
+                                dft.state_seq_set_data(id, &c.data_dft, partial_only).is_ok()
+                            }
+                            _ => true,
+                        };
+                        if ok {
+                            do_reset = false;
+                            // `pos_next = min(pos_next, max(pos_min + 1, pos_max))`;
+                            // `n_past = min(size_up_to_pos(pos_next), n_tokens)`
+                            // (server-context.cpp:3755-3757 — the positions are
+                            // the token indices in the port, so
+                            // `size_up_to_pos(p) == p`)
+                            pos_next = pos_next.min((c.pos_min + 1).max(c.pos_max));
+                            n_past = (pos_next.max(0) as usize).min(c.n_tokens);
+                        } else if c.id_task != -1 {
+                            // `GGML_ABORT("failed to restore context checkpoint")`
+                            // (server-context.cpp:3748-3750) — a checkpoint
+                            // this process created must load
+                            return Err((
+                                "failed to restore context checkpoint",
+                                crate::api::ERROR_TYPE_SERVER.1,
+                            ));
+                        } else {
+                            // restored from a slot file, not guaranteed to
+                            // load — fall back to full prompt re-processing
+                            // (server-context.cpp:3751-3753)
+                        }
+                    }
+                    if do_reset {
+                        // "forcing full prompt re-processing due to lack of
+                        // cache data" (server-context.cpp:3765-3767)
+                        n_past = 0;
+                    }
+                }
+
+                // erase any checkpoints with pos_max > pos_next — they cover
+                // positions the new prompt no longer holds
+                // (server-context.cpp:3775-3786)
+                self.slots[si].checkpoints.retain(|c| c.pos_max <= pos_next);
+            }
         }
 
         // `[TAG_PROMPT_LOGITS]` (server-context.cpp:3401-3406): the last prompt

@@ -397,6 +397,77 @@ fn clef_get_spans_shapes() {
     assert!(!s.valid);
 }
 
+/// the batch-3 upstream guards (clef.cpp:126-165 @c35b66744): the
+/// token-presence half of `ok` (:128 — an embd-only batch has no ids for
+/// the head to read) and the mixed-batch media walk (:159-162 — "the head
+/// reads the token ids of the spans, they cannot be embeddings": an
+/// EMBD-typed row inside a span invalidates, an EMBD row OUTSIDE every
+/// span (order NONE) does not)
+#[test]
+fn clef_get_spans_mixed_batch_guards() {
+    use llama::batch as b;
+    // the canonical order: [NONE×3, QUESTION×3, OPTION×3, QUESTION×2,
+    // OPTION×1] (clef_get_spans_shapes' ORDERS)
+    let valid = llama::clef::clef_get_spans_ubatch(Some(&ORDERS), None, true, 12);
+    assert!(valid.valid, "a pure token batch keeps the canonical spans");
+
+    // an embd-only batch (no token ids) → degenerate + invalid (:128's
+    // `ubatch.token != nullptr` half)
+    let embd_only = llama::clef::clef_get_spans_ubatch(Some(&ORDERS), None, false, 12);
+    assert!(!embd_only.valid);
+    assert_eq!(embd_only.questions.len(), 1);
+    assert_eq!(embd_only.options.len(), 1);
+
+    // a mixed batch whose EMBD rows sit inside the OPTION span (batch idx
+    // 6..8 typed 1) → the media walk invalidates (:159-162)
+    let mut types = [0i8; 12];
+    types[6] = 1;
+    types[7] = 1;
+    let mixed_in_span =
+        llama::clef::clef_get_spans_ubatch(Some(&ORDERS), Some(&types), true, 12);
+    assert!(!mixed_in_span.valid, "an EMBD row inside a span invalidates");
+    assert_eq!(mixed_in_span.questions.len(), 1, "the degenerate fallback");
+
+    // the same EMBD rows OUTSIDE every span (order NONE, idx 0..2) stay
+    // usable — `!ubatch.type[i] || decision_order[i] == NONE` (:161)
+    let mut types_ok = [0i8; 12];
+    types_ok[0] = 1;
+    types_ok[1] = 1;
+    let mixed_outside =
+        llama::clef::clef_get_spans_ubatch(Some(&ORDERS), Some(&types_ok), true, 12);
+    assert!(mixed_outside.valid, "EMBD rows at order NONE do not invalidate");
+    assert_eq!(mixed_outside.questions.len(), 2);
+    assert_eq!(mixed_outside.options.len(), 2);
+}
+
+/// the no_tokens fallback of `input_decision::set_input` (clef.cpp:186-
+/// 187): an embd-only batch 0-fills the head's token input — the inputs
+/// build degenerately (one question/option) and the fill lands as 0s
+#[test]
+fn clef_decision_inputs_no_tokens_fallback() {
+    let mut gctx = ggml::Context::new();
+    let n = 6usize;
+    // an embd-only batch: no ids, no order — the guards degenerate
+    let dec = llama::clef::ClefDecisionInputs::build_ubatch(
+        &mut gctx,
+        n,
+        None,
+        None,
+        false,
+    );
+    assert_eq!(dec.n_questions, 1);
+    assert_eq!(dec.n_options, 1);
+    dec.set_input_ubatch(&mut gctx, &[], None, None);
+    let ids: Vec<i32> = bytemuck::cast_slice(gctx.data_bytes(dec.tokens).unwrap()).to_vec();
+    assert_eq!(ids, vec![0i32; n], "the no_tokens fallback 0-fills");
+
+    // the token-batch form still lands the ids verbatim
+    let dec2 = llama::clef::ClefDecisionInputs::build(&mut gctx, n, None);
+    dec2.set_input(&mut gctx, &[7, 8, 9, 10, 11, 12], None);
+    let ids2: Vec<i32> = bytemuck::cast_slice(gctx.data_bytes(dec2.tokens).unwrap()).to_vec();
+    assert_eq!(ids2, vec![7, 8, 9, 10, 11, 12]);
+}
+
 /// in-port smoke (no reference needed): the scores are finite and distinct
 #[test]
 fn clef_synth_smoke() {

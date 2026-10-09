@@ -319,6 +319,36 @@ pub type FnSchedGetBackend =
 pub type FnSchedGetBufferSize =
     unsafe extern "C" fn(*mut GgmlBackendSchedT, *mut GgmlBackendT) -> usize;
 
+/// `ggml_backend_sched_copy_callback` (ggml-backend.h:317-327 @c35b66744,
+/// added by 6753a033f): callback while copying input weights of a split —
+/// `src` is the tensor in the previous split, `dst` its copy in the split,
+/// `graph` the split's compute graph; returning false makes the scheduler
+/// copy the entire weight instead.
+pub type CbSchedCopy = unsafe extern "C" fn(
+    *mut GgmlBackendT,
+    *const GgmlCTensor,
+    *mut GgmlCTensor,
+    *mut GgmlCgraph,
+    *mut c_void,
+) -> bool;
+/// `ggml_backend_sched_set_copy_callback` (ggml-backend.cpp:2140-2143
+/// @c35b66744, 6753a033f).
+pub type FnSchedSetCopyCallback =
+    unsafe extern "C" fn(*mut GgmlBackendSchedT, Option<CbSchedCopy>, *mut c_void);
+
+// ---- async transport + graph access (ggml-backend.h:88-100, ggml.h:2897) —
+// what a copy callback needs to read the ids back and upload the used
+// experts (llama-context.cpp:2690-2735). Base APIs, present in every build. ----
+pub type FnBackendSynchronize = unsafe extern "C" fn(*mut GgmlBackendT);
+pub type FnTensorSetAsync =
+    unsafe extern "C" fn(*mut GgmlBackendT, *mut GgmlCTensor, *const c_void, usize, usize);
+pub type FnTensorGetAsync =
+    unsafe extern "C" fn(*mut GgmlBackendT, *const GgmlCTensor, *mut c_void, usize, usize);
+pub type FnGraphNode =
+    unsafe extern "C" fn(*mut GgmlCgraph, c_int) -> *mut GgmlCTensor;
+pub type FnGraphNodes =
+    unsafe extern "C" fn(*mut GgmlCgraph) -> *mut *mut GgmlCTensor;
+
 /// enum ggml_backend_dev_type (ggml-backend.h:134-145) for `ggml_backend_dev_by_type`
 pub const GGML_BACKEND_DEV_TYPE_CPU: c_int = 0;
 pub const GGML_BACKEND_DEV_TYPE_GPU: c_int = 1;
@@ -478,6 +508,19 @@ pub struct CLibSyms {
     pub ggml_backend_sched_get_backend: FnSchedGetBackend,
     pub ggml_backend_sched_get_buffer_size: FnSchedGetBufferSize,
     pub ggml_backend_time_us: unsafe extern "C" fn() -> i64,
+    // async transport + graph access (base APIs — ggml-backend.h:88-100,
+    // ggml.h:2897-2899)
+    pub ggml_backend_synchronize: FnBackendSynchronize,
+    pub ggml_backend_tensor_set_async: FnTensorSetAsync,
+    pub ggml_backend_tensor_get_async: FnTensorGetAsync,
+    pub ggml_graph_node: FnGraphNode,
+    pub ggml_graph_nodes: FnGraphNodes,
+    /// `ggml_backend_sched_set_copy_callback` (ggml-backend.cpp:2140-2143
+    /// @c35b66744, 6753a033f) — **optional**: the symbol postdates the
+    /// pinned bd4f514db1 build, so a pinned .so resolves it to None and the
+    /// ForeignExecutor copy-callback installation reports "unsupported"
+    /// instead of failing the whole load.
+    pub ggml_backend_sched_set_copy_callback: Option<FnSchedSetCopyCallback>,
 }
 
 impl CLibSyms {
@@ -504,6 +547,23 @@ impl CLibSyms {
                     }
                 }
                 found.ok_or_else(|| concat!($name, " missing").to_string())?
+            }};
+        }
+        // optional symbol: None when absent in both libs (the
+        // sched_set_copy_callback of 6753a033f is not in the pinned build)
+        macro_rules! sym_opt {
+            ($name:literal, $ty:ty) => {{
+                let mut found: Option<$ty> = base.get_sym($name).map(|p| unsafe {
+                    std::mem::transmute::<*mut c_void, $ty>(p)
+                });
+                if found.is_none() {
+                    if let Some(f) = full {
+                        found = f.get_sym($name).map(|p| unsafe {
+                            std::mem::transmute::<*mut c_void, $ty>(p)
+                        });
+                    }
+                }
+                found
             }};
         }
         let _ = c_uint::MAX; // keep the import honest
@@ -556,6 +616,15 @@ impl CLibSyms {
             ggml_backend_sched_get_backend: sym!("ggml_backend_sched_get_backend", FnSchedGetBackend),
             ggml_backend_sched_get_buffer_size: sym!("ggml_backend_sched_get_buffer_size", FnSchedGetBufferSize),
             ggml_backend_time_us: sym!("ggml_time_us", unsafe extern "C" fn() -> i64),
+            ggml_backend_synchronize: sym!("ggml_backend_synchronize", FnBackendSynchronize),
+            ggml_backend_tensor_set_async: sym!("ggml_backend_tensor_set_async", FnTensorSetAsync),
+            ggml_backend_tensor_get_async: sym!("ggml_backend_tensor_get_async", FnTensorGetAsync),
+            ggml_graph_node: sym!("ggml_graph_node", FnGraphNode),
+            ggml_graph_nodes: sym!("ggml_graph_nodes", FnGraphNodes),
+            ggml_backend_sched_set_copy_callback: sym_opt!(
+                "ggml_backend_sched_set_copy_callback",
+                FnSchedSetCopyCallback
+            ),
         })
     }
 }

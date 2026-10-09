@@ -303,7 +303,7 @@ impl Ge2Driver {
             mean: None,
             cls: None,
         };
-        let result = graph_arch::build_gemma_embedding2_forward(&mut self.gctx, &self.w, &self.p, &inp, n);
+        let result = graph_arch::build_gemma_embedding2_forward(&mut self.gctx, &self.w, &self.p, &inp, None, n);
         let embd = result.embd;
         let mut gf = result.graph;
         ggml::compute::graph_compute(&mut self.gctx, &mut gf, 8);
@@ -346,6 +346,124 @@ fn ge2_synth_load_and_encode() {
         "ge2: non-finite embeddings"
     );
     println!("gemma-embedding2 encode ok ({} tokens)", ids.len());
+}
+
+/// the mixed-batch tok_scale form (task 5): `build_inp_embd(tok_scale =
+/// sqrt(n_embd))` on a type-marked 2-row batch — the TOKEN row scales by
+/// sqrt(n_embd), the raw EMBD row stays unscaled ("raw embeddings are
+/// assumed to be multimodal inputs that should not be scaled",
+/// llama-graph.cpp:2553-2554 + gemma-embedding2.cpp:86). The reference has
+/// no direct mixed input face for this encoder, so the construction is at
+/// the llm_graph_input_embd level (the ref probe precedent) — the ge2 graph
+/// runs over the mixed rows and the first `attn_norm` input (the scaled
+/// inpL) is read back through an eval callback.
+#[test]
+fn ge2_mixed_batch_tok_scale_rows() {
+    build_file();
+    let (mut m, _vocab) = open_synth();
+    let mut d = Ge2Driver::new(&mut m);
+    let n_embd = N_EMBD as usize;
+
+    // the batch: [token row (id 5), raw embd row]
+    let n = 2usize;
+    let t = n as i64;
+    let watermark = d.gctx.mark();
+    d.gctx.reset_graph_to(watermark);
+
+    let tokens_t = d.gctx.new_tensor_1d(GgmlType::I32, t);
+    let pos_t = d.gctx.new_tensor_1d(GgmlType::I32, t);
+    let kq_mask = d.gctx.new_tensor_2d(GgmlType::F32, t, t);
+    let kq_mask_swa = d.gctx.new_tensor_2d(GgmlType::F32, t, t);
+    let out_ids = d.gctx.new_tensor_1d(GgmlType::I32, t);
+    // the mixed inputs (llm_graph_input_embd's tensors,
+    // llama-graph.cpp:87-104): the token row's id + slot 0, the embd rows
+    // (the token row's bytes are placeholders the set_rows overwrites)
+    let mixed_tokens = d.gctx.new_tensor_1d(GgmlType::I32, 1);
+    let mixed_slots = d.gctx.new_tensor_1d(GgmlType::I64, 1);
+    let mixed_embd = d.gctx.new_tensor_2d(GgmlType::F32, n_embd as i64, t);
+    for x in [tokens_t, pos_t, kq_mask, kq_mask_swa, out_ids, mixed_tokens, mixed_slots, mixed_embd] {
+        d.gctx.arena_resize_tensor(x);
+    }
+    d.gctx.with_i32_mut(tokens_t, |q| q.copy_from_slice(&[5, 0])).unwrap();
+    d.gctx.with_i32_mut(pos_t, |q| q.copy_from_slice(&[0, 1])).unwrap();
+    d.gctx.with_i32_mut(out_ids, |q| q.copy_from_slice(&[0, 1])).unwrap();
+    d.gctx.with_f32_mut(kq_mask, |q| q.fill(0.0)).unwrap();
+    d.gctx.with_f32_mut(kq_mask_swa, |q| q.fill(0.0)).unwrap();
+    d.gctx.with_i32_mut(mixed_tokens, |q| q[0] = 5).unwrap();
+    {
+        let bytes = d.gctx.data_bytes_mut(mixed_slots).unwrap();
+        bytes.copy_from_slice(&0i64.to_le_bytes());
+    }
+    // the raw embd row: a fixed recognizable pattern, at BATCH ROW 1 (the
+    // typed-1 row; [n_embd, 2] row-major: element (i, j) at j*n_embd + i)
+    let raw_row: Vec<f32> = (0..n_embd).map(|i| 0.01 * (i as f32) - 0.05).collect();
+    d.gctx.with_f32_mut(mixed_embd, |q| {
+        q[..n_embd].fill(0.0); // the token row's placeholder bytes
+        q[n_embd..].copy_from_slice(&raw_row);
+    })
+    .unwrap();
+
+    let inp = EncodeInputs {
+        tokens: tokens_t,
+        pos: Some(pos_t),
+        pos_bucket: None,
+        kq_mask,
+        kq_mask_swa: Some(kq_mask_swa),
+        out_ids,
+        mean: None,
+        cls: None,
+    };
+    let mixed = llama::graph::InpMixed {
+        tokens: mixed_tokens,
+        slots: mixed_slots,
+        embd: mixed_embd,
+        type_: vec![0, 1], // row 0 token, row 1 embd
+    };
+    let result = graph_arch::build_gemma_embedding2_forward(
+        &mut d.gctx, &d.w, &d.p, &inp, Some(&mixed), n,
+    );
+    let mut gf = result.graph;
+    ggml::compute::graph_compute(&mut d.gctx, &mut gf, 4);
+
+    // read the graph's "inp_scaled" node back (build_inp_embd's output):
+    // the token row = tok_embd[5] * sqrt(n_embd), the embd row = raw_row
+    let inp_scaled = gf
+        .nodes
+        .iter()
+        .copied()
+        .find(|&nd| d.gctx.name(nd) == "inp_scaled")
+        .expect("the inp_scaled node");
+    let got: Vec<f32> = bytemuck::cast_slice(d.gctx.data_bytes(inp_scaled).unwrap()).to_vec();
+    let scale = (n_embd as f32).sqrt();
+    // the token embedding row straight off the mmap'd table
+    let tok_row: Vec<f32> = bytemuck::cast_slice(
+        &m_toks_bytes(&d, 5)[..n_embd * 4],
+    )
+    .to_vec();
+    for i in 0..n_embd {
+        assert!(
+            (got[i] - tok_row[i] * scale).abs() < 1e-4,
+            "token row {i}: {} != {}*sqrt",
+            got[i],
+            tok_row[i]
+        );
+        assert!(
+            (got[n_embd + i] - raw_row[i]).abs() < 1e-6,
+            "embd row {i}: {} != raw {} (the raw embd row must stay unscaled)",
+            got[n_embd + i],
+            raw_row[i]
+        );
+    }
+    println!("ge2 mixed batch: token row scaled, raw embd row unscaled");
+}
+
+/// the mmap'd token table row `id` of the loaded synth (the driver owns the
+/// model's Context)
+fn m_toks_bytes(d: &Ge2Driver, id: usize) -> &[u8] {
+    let w = d.w.tok_embd;
+    let ne = d.gctx.ne(w);
+    let row = d.gctx.ty(w).row_size(ne[0] as usize);
+    &d.gctx.data_bytes(w).unwrap()[id * row..(id + 1) * row]
 }
 
 // ---------------------------------------------------------------------------

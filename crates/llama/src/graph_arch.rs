@@ -415,6 +415,14 @@ fn build_gemma_forward(
     let mut graph = Graph::new(1024);
 
     // inpL = embd * sqrt(n_embd) (gemma2.cpp:68, gemma3.cpp:91 — token path)
+    // [TASK5-FAMILY-AUDIT] the upstream form is build_inp_embd(tok_scale =
+    // sqrt(n_embd)) (gemma3.cpp:89 / gemma3n.cpp:100 / gemma4.cpp:163 /
+    // gemma-embedding.cpp:81) — on token batches this inline get_rows +
+    // lora + SCALE is the identical op sequence, and the port's decode
+    // drivers do not yet construct type-marked mixed batches for these
+    // archs (only qwen2 consumes InpMixed), so the per-row scale mul of
+    // the mixed arm has no reachable input face here; gemma-embedding2
+    // (the encoder with the face) switched to graph::build_inp_embd
     let mut inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
     // lora delta of build_inp_embd (llama-graph.cpp:2389-2405) — added before
     // gemma's embedding scale (:2430-2438), exactly like the C
@@ -24704,6 +24712,7 @@ pub fn build_qwen4exp_forward(
     sinfo: SlotInfo,
     n_kv: u32,
     n_tokens: usize,
+    nextn_unmasked: bool,
 ) -> ForwardResult {
     let t = n_tokens as i64;
     let n_layer = w.layers.len();
@@ -24813,11 +24822,24 @@ pub fn build_qwen4exp_forward(
         ctx.set_name(res_hc, &format!("l_last-{il}"));
     }
 
+    // the MTP head reads the hc-wide residual, before the final mixer
+    // (qwen4exp.cpp:498-503, f0c41e016): t_h_nextn = the flat [n_embd*hc, T]
+    // residual — set unconditionally in the C ("the next draft step reads
+    // this residual as its h"), the host-side reads stay gated by
+    // cparams.embeddings_nextn. crop_after_nextn's gather narrows the
+    // residual for the head (the port's shared out_rows)
+    let flat = ctx.reshape_2d(res_hc, p.n_embd * hc, t);
+    ctx.set_name(flat, "h_nextn");
+    graph.build_forward(ctx, flat);
+    let flat_out = graph::out_rows(ctx, flat, inp.out_ids);
+    let n_out = ctx.ne(flat_out)[1];
+    let res_hc_out = ctx.reshape_3d(flat_out, p.n_embd, hc, n_out);
+
     // the final mixer is the output norm: there is no separate one
     // (qwen4exp.cpp:446-448)
     let (cur, _) = build_qwen4exp_hc_mix(
         ctx,
-        res_hc,
+        res_hc_out,
         w.hc_head_norm,
         w.hc_head_down,
         w.hc_head_up,
@@ -24827,14 +24849,15 @@ pub fn build_qwen4exp_forward(
         -1,
     );
     ctx.set_name(cur, "result_norm");
-    let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
     ctx.set_name(logits, "result_output");
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
         graph,
-        embd: Some(cur),
+        // the unmasked tap reads t_h_nextn (the flat hc-wide residual,
+        // every row); every other consumer reads t_embd (result_norm)
+        embd: Some(if nextn_unmasked { flat } else { cur }),
     }
 }
 
@@ -38880,16 +38903,24 @@ pub fn build_mimo2_forward(
     ctx.set_name(inp_l, &format!("layer_inp-{n_layer}"));
     graph.build_forward(ctx, inp_l);
 
-    let cur = build_norm_rms(ctx, inp_l, w.output_norm, p.norm_rms_eps);
+    // f0c41e016 (mimo2.cpp:241-243): the pre-norm state IS t_h_nextn — "set
+    // even when extraction is off"; the host-side reads stay gated by
+    // cparams.embeddings_nextn. crop_after_nextn's gather then
+    // result_norm → t_embd → the lm head (the port's shared out_rows is the
+    // gather; the norm is row-wise, so gathering before or after it is
+    // value-identical for the logits rows)
+    let h_nextn = inp_l;
+    ctx.set_name(h_nextn, "h_nextn");
+    let cur = graph::out_rows(ctx, h_nextn, inp.out_ids);
+    let cur = build_norm_rms(ctx, cur, w.output_norm, p.norm_rms_eps);
     ctx.set_name(cur, "result_norm"); // cb :353
-    let cur = graph::out_rows(ctx, cur, inp.out_ids);
     let logits = crate::adapter::lora_mm(ctx, w.output, cur);
     ctx.set_name(logits, "result_output"); // cb :358
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
         graph,
-        embd: Some(cur),
+        embd: Some(h_nextn),
     }
 }
 
@@ -43329,30 +43360,348 @@ pub fn build_glm5_forward(
         ctx.set_name(res_hc, &format!("l_out-{il}"));
     }
 
-    // narrow to the output rows, then collapse the streams (:653-660 — the
-    // port's decode takes its own rows, so `narrow_early` always holds in
-    // the single-output driver)
-    let flat = ctx.reshape_2d(res_hc, p.n_embd * hc, t);
-    let flat = graph::out_rows(ctx, flat, inp.out_ids);
-    let n_out = ctx.ne(flat)[1];
-    let res_hc = ctx.reshape_3d(flat, p.n_embd, hc, n_out);
-
+    // narrow to the output rows, then collapse the streams (:653-660). The
+    // f0c41e016 crop helpers: crop_before_nextn (masked/off taps) narrows
+    // inpL before the capture, crop_after_nextn (the unmasked tap) gathers
+    // the captured h_nextn — the port's shared out_rows after the capture is
+    // the crop_after arm, and hc_mean/norm are row-wise so both arms are
+    // value-identical for the logits rows; the embd slot carries the
+    // uncaptured-rows norm (t_h_nextn == t_embd on this arch,
+    // glm5-next.cpp:780-793)
     let cur = glm5_hc_mean(ctx, res_hc, hc);
     ctx.set_name(cur, "hc_head");
 
     // the post-norm hidden state feeds the draft head (:667-669) — the
-    // t_h_nextn tap; already narrowed above (the C's narrow_early arm,
-    // :655-660), so no second gather here
+    // t_h_nextn tap, every token row
     let normed = build_norm_rms(ctx, cur, w.output_norm, p.attn.norm_eps);
     ctx.set_name(normed, "result_norm");
 
-    let logits = ctx.mul_mat(w.output, normed);
+    let cur = graph::out_rows(ctx, normed, inp.out_ids);
+    let logits = ctx.mul_mat(w.output, cur);
     ctx.set_name(logits, "result_output");
     graph.build_forward(ctx, logits);
     ForwardResult {
         logits,
         graph,
         embd: Some(normed),
+    }
+}
+
+/// the glm5-next MTP block's weights (b9acf138a, glm5-next.cpp:543-666) —
+/// the nextn trio (+ the optional own embedding table / shared head) plus
+/// the MTP layer `model.layers[n_layer]`'s full trunk-shaped set (the DSA
+/// block: the nope-MLA half, the full k-pool indexer, the MoE FFN).
+pub struct Glm5NextMtpWeights {
+    pub tok_embd: TensorId,
+    pub output_norm: TensorId,
+    pub output: TensorId,
+    pub nextn: MtpNextn,
+    /// the MTP layer (`model.layers[n_layer]`) — its trunk-shaped tensors
+    pub layer: Glm5NextLayerWeights,
+}
+
+/// verify against src/models/glm5-next.cpp:543-666 `graph_mtp` (b9acf138a) —
+/// the eh_proj concat → one plain DSA layer (the NextN block always has a
+/// full indexer, :1059) → MoE + shared expert → shared_head_norm → the LM
+/// head, reusing the trunk's builders. `h_in` is the F32 `[n_embd,
+/// n_tokens]` hidden-state input (the previous position's target `h_nextn`
+/// row); the returned `embd` slot carries `res->t_h_nextn`.
+///
+/// The draft context's caches are the filtered ones of llama-model.cpp:2501-
+/// 2508 (`filter_attn = filter_idx = il >= n_layer()`, `filter_recr` empty)
+/// — the port models them as an `(n_layer+1)`-layer cache whose trunk rows
+/// are zero-wide and a HybridIdxCache whose only `is_idx` layer is the last,
+/// so the shared [`build_glm5_dsa_layer`] addresses `kv.layers[il]` /
+/// `idx_cache.layers[il]` at the real layer index `il = n_layer` (the C's
+/// `cparams.nextn_layer_offset` is 0 — the single-block mode the ported
+/// driver supports, speculative.cpp's `n_layer_nextn == 1` family).
+///
+/// The `crop_before/after_nextn` row-pruning of :609-613/:653-655 follows
+/// the port-wide convention — the graph computes every row and the driver
+/// gathers by output flags (`inp.out_ids` is None in the draft-mtp driver's
+/// batches, so both predicates are false there, exactly like the C's
+/// `inp_out_ids == nullptr` arm).
+pub fn build_glm5_mtp_forward(
+    ctx: &mut Context,
+    w: &Glm5NextMtpWeights,
+    p: &Glm5NextParams,
+    kv: &KvCache,
+    idx_cache: &crate::kv_cache::HybridIdxCache,
+    kpool_step: &Glm5KpoolStep,
+    inp: &DecodeInputs,
+    h_in: MtpHInput,
+    n_kv: u32,
+    n_tokens: usize,
+) -> ForwardResult {
+    // glm5-next.cpp:546-547 — "GLM5-Next MTP requires n_layer_nextn > 0 /
+    // currently supports a single NextN block" (assembled-model asserts) and
+    // :549-552 nextn_layer_offset == 0 in [0, n_layer_nextn)
+    let il = p.is_recr.len(); // hparams.n_layer() + nextn_layer_offset(0)
+    // :556-557 — "GLM5-Next MTP block is missing - load the model with MTP
+    // enabled" (the port's MtpNextn carries the trio as required tensors,
+    // so the expect()s of the projections below are the port's twin)
+    // :559 — "GLM5-Next MTP hidden width mismatch" (n_embd_out == n_embd)
+    let lw = &w.layer;
+    let eps = p.attn.norm_eps;
+
+    let mut graph = Graph::new(4096);
+
+    // llm_graph_input_embd_h (:571-589): tokens → the nextn table or the
+    // model's (`layer.nextn.embed_tokens ? ... : model.tok_embd`, :583-584);
+    // `h` is the driver-provided hidden-state input (:579-581,
+    // "mtp_h_input")
+    let tok_embd_w = w.nextn.embed_tokens.unwrap_or(w.tok_embd);
+    let tok_embd = ctx.get_rows(tok_embd_w, inp.tokens);
+    ctx.set_name(tok_embd, &format!("mtp_tok_embd-{il}"));
+
+    // :591-595 — enorm/hnorm (RMS) over the two halves
+    let e_norm = build_norm_rms(ctx, tok_embd, w.nextn.enorm, eps);
+    ctx.set_name(e_norm, &format!("mtp_enorm-{il}"));
+    let h_norm = build_norm_rms(ctx, h_in, w.nextn.hnorm, eps);
+    ctx.set_name(h_norm, &format!("mtp_hnorm-{il}"));
+
+    // :597-598 — eh_proj over the concat
+    let eh_in = ctx.concat(e_norm, h_norm, 0);
+    let inp_sa = crate::adapter::lora_mm(ctx, w.nextn.eh_proj, eh_in);
+    ctx.set_name(inp_sa, &format!("mtp_eh_proj-{il}"));
+
+    // :600-603 — attn_norm over the eh_proj output
+    let cur = build_norm_rms(ctx, inp_sa, lw.attn_norm, eps);
+    ctx.set_name(cur, &format!("mtp_attn_norm-{il}"));
+
+    // :605-607 — one plain DSA layer (the k-pool select + the nope-MLA
+    // sparse attention; il >= is_indexer_full.len() ⇒ the full-indexer arm,
+    // glm5-next.cpp:1059)
+    let mut prev_sel: Option<TensorId> = None;
+    let cur = build_glm5_dsa_layer(
+        ctx, &mut graph, p, lw, kv, idx_cache, kpool_step, inp, n_kv, cur, &mut prev_sel, il,
+    );
+    ctx.set_name(cur, &format!("mtp_attn_out-{il}"));
+
+    // :609-615 — crop_before_nextn(inp_out_ids) narrows cur AND inpSA before
+    // the position-wise FFN ("unmasked nextn embeddings need all rows"); the
+    // port's draft driver passes no out_ids, so the gather stays elided
+    // (values identical — the FFN is row-wise)
+    let ffn_inp = ctx.add(cur, inp_sa);
+    ctx.set_name(ffn_inp, &format!("mtp_ffn_inp-{il}"));
+
+    // :617-619 — ffn_norm
+    let cur = build_norm_rms(ctx, ffn_inp, lw.ffn_norm, eps);
+    ctx.set_name(cur, &format!("mtp_ffn_norm-{il}"));
+
+    // :621-641 — the MoE + shared expert (build_moe_ffn's deepseek shape +
+    // build_ffn shexp, SILU/PAR)
+    let moe_out = build_moe_ffn_deepseek2_like(
+        ctx,
+        &mut graph,
+        cur,
+        lw.ffn_gate_inp.expect("glm5 mtp ffn_gate_inp"),
+        lw.ffn_exp_probs_b,
+        lw.ffn_gate_exps,
+        lw.ffn_up_exps,
+        lw.ffn_down_exps.expect("glm5 mtp ffn_down_exps"),
+        p.n_expert,
+        p.n_expert_used,
+        p.expert_weights_norm,
+        p.expert_weights_scale,
+        p.expert_gating_func,
+    );
+    ctx.set_name(moe_out, &format!("mtp_ffn_moe_out-{il}"));
+
+    let ffn_shexp = build_ffn_silu_par(
+        ctx,
+        cur,
+        lw.ffn_gate_shexp.expect("glm5 mtp ffn_gate_shexp"),
+        None,
+        lw.ffn_up_shexp.expect("glm5 mtp ffn_up_shexp"),
+        None,
+        lw.ffn_down_shexp.expect("glm5 mtp ffn_down_shexp"),
+        None,
+    );
+    ctx.set_name(ffn_shexp, &format!("mtp_ffn_shexp-{il}"));
+
+    let cur = ctx.add(moe_out, ffn_shexp);
+    ctx.set_name(cur, &format!("mtp_ffn_out-{il}"));
+
+    let cur = ctx.add(cur, ffn_inp);
+    ctx.set_name(cur, &format!("mtp_post_ffn-{il}"));
+
+    // :647-651 — the shared head norm (nextn.shared_head_norm or the model's
+    // output_norm) mounts t_h_nextn ("h_nextn", il = -1 → no suffix)
+    let head_norm_w = w.nextn.shared_head_norm.unwrap_or(w.output_norm);
+    let h_nextn = build_norm_rms(ctx, cur, head_norm_w, eps);
+    ctx.set_name(h_nextn, "h_nextn");
+
+    // :653-656 — crop_after_nextn(inp_out_ids); elided like above
+    ctx.set_name(h_nextn, "mtp_shared_head_norm");
+
+    // :658-662 — the LM head (nextn.shared_head_head or the model's output)
+    let head_w = w.nextn.shared_head_head.unwrap_or(w.output);
+    let logits = crate::adapter::lora_mm(ctx, head_w, h_nextn);
+    ctx.set_name(logits, "result_output");
+
+    graph.build_forward(ctx, logits);
+    ForwardResult {
+        logits,
+        graph,
+        embd: Some(h_nextn),
+    }
+}
+
+/// the qwen4exp MTP block's weights (qwen4exp.cpp:526-612, c061df198+)
+/// — the nextn trio plus the MTP block's own hc head mixer
+/// (`hc_head_norm/down/up`, the NEXTN_HC_* tensors) and the MTP layer's
+/// full trunk-shaped set. The trunk params' per-layer vectors arrive
+/// **extended** past index n_layer by the assembler (the MTP layer's own
+/// geometry + its compress ratio, the bailingmoe3 clamp-extension
+/// precedent), so `p.n_head[il]`/`p.compress_ratios[il]` read the MTP
+/// layer's facts at il = n_layer.
+pub struct Qwen4ExpMtpWeights {
+    pub tok_embd: TensorId,
+    pub output: TensorId,
+    pub nextn_eh_proj: TensorId,
+    pub nextn_enorm: TensorId,
+    pub nextn_hnorm: TensorId,
+    /// `nextn.hc_head_norm/down/up` (required — the C asserts them,
+    /// qwen4exp.cpp:541-542)
+    pub nextn_hc_head_norm: TensorId,
+    pub nextn_hc_head_down: TensorId,
+    pub nextn_hc_head_up: TensorId,
+    /// the MTP layer (`model.layers[n_layer]`) — its trunk-shaped set
+    pub layer: Qwen4ExpLayerWeights,
+}
+
+/// verify against src/models/qwen4exp.cpp:526-612 `graph_mtp` — the hc-wide
+/// eh_proj (enorm repeated over the streams, hnorm over the [n_embd, hc, T]
+/// h input), one hc_mix → attention (QSA when the draft context's idx cache
+/// exists — llama-model.cpp:2750-2756's `il >= n_layer()` filter keeps the
+/// MTP layer's indexer — else dense) → hc_combine → hc_mix → FFN →
+/// hc_combine round, then the flat [n_embd*hc, T] residual IS `t_h_nextn`
+/// (masked: gathered; unmasked: every row) and the nextn hc head mixer +
+/// `model.output` produce the logits.
+///
+/// The draft context's caches mirror glm5's: an (n_layer+1)-layer kv with
+/// zero-width trunk rows + a HybridIdxCache whose only `is_idx` layer is the
+/// last (kpool_row = 2, by-order pools, llama-model.cpp:2725-2736's qwen4exp
+/// arm), so `il = n_layer` addresses both the naming and the caches.
+pub fn build_qwen4exp_mtp_forward(
+    ctx: &mut Context,
+    w: &Qwen4ExpMtpWeights,
+    p: &Qwen4ExpParams,
+    kv: &KvCache,
+    idx_cache: Option<&crate::kv_cache::HybridIdxCache>,
+    kpool_step: Option<&Qwen4KpoolStep>,
+    inp: &DecodeInputs,
+    h_in: MtpHInput,
+    n_kv: u32,
+    n_tokens: usize,
+) -> ForwardResult {
+    // qwen4exp.cpp:527-535 — "qwen4exp MTP has a single block" / token
+    // input / n_embd_out == n_embd*hc (assembled-model asserts). The
+    // params' per-layer vectors cover n_layer_all — the MTP layer is the
+    // LAST entry
+    let il = p.is_recr.len() - 1; // hparams.n_layer()
+    let lw = &w.layer;
+    let a = &p.attn;
+    let hc = p.hc;
+    let eps = a.norm_eps;
+    let t = n_tokens as i64;
+
+    let mut graph = Graph::new(4096);
+
+    // llm_graph_input_embd_h (:544-563): the model's own tok_embd (no
+    // nextn.embed_tokens on this arch, :560) + the hc-wide h input
+    let tok_embd = ctx.get_rows(w.tok_embd, inp.tokens);
+    ctx.set_name(tok_embd, &format!("mtp_tok_embd-{il}"));
+
+    // :580-587 — hnorm over the [n_embd, hc, T] view of h; enorm over the
+    // embedding, repeated over the streams
+    let h3 = ctx.reshape_3d(h_in, p.n_embd, hc, t);
+    let h_norm = build_norm_rms(ctx, h3, w.nextn_hnorm, eps);
+    ctx.set_name(h_norm, &format!("mtp_hnorm-{il}"));
+    let e_norm = build_norm_rms(ctx, tok_embd, w.nextn_enorm, eps);
+    let e3 = ctx.reshape_3d(e_norm, p.n_embd, 1, t);
+    let e_norm = ctx.repeat_4d(e3, p.n_embd, hc, t, 1);
+    ctx.set_name(e_norm, &format!("mtp_enorm-{il}"));
+
+    // :589-590 — eh_proj over the concat → [n_embd, hc, T]
+    let eh_in = ctx.concat(e_norm, h_norm, 0);
+    let res_hc = crate::adapter::lora_mm(ctx, w.nextn_eh_proj, eh_in);
+    ctx.set_name(res_hc, &format!("mtp_eh_proj-{il}"));
+
+    // :592-595 — the attention round: hc_mix → build_layer_attn (QSA when
+    // the draft memory has an idx cache, else dense) → hc_combine
+    let (cur, inject) = build_qwen4exp_hc_mix(
+        ctx,
+        res_hc,
+        lw.hc_attn_norm,
+        lw.hc_attn_down,
+        lw.hc_attn_up,
+        Some(lw.hc_attn_inject),
+        hc,
+        eps,
+        il as i64,
+    );
+    graph.build_forward(ctx, cur);
+    let cur = match (idx_cache, kpool_step) {
+        (Some(ic), Some(ks)) => build_qwen4exp_attn_layer_qsa(
+            ctx, &mut graph, p, lw, kv, ic, ks, inp, n_kv, il, cur, t,
+        ),
+        _ => build_qwen4exp_attn_layer(ctx, &mut graph, p, lw, kv, inp, n_kv, il, cur, t),
+    };
+    let res_hc =
+        build_qwen4exp_hc_combine(ctx, res_hc, cur, inject.expect("hc_attn_inject"), hc, il as i64);
+
+    // :596-598 — the FFN round
+    let (cur, inject) = build_qwen4exp_hc_mix(
+        ctx,
+        res_hc,
+        lw.hc_ffn_norm,
+        lw.hc_ffn_down,
+        lw.hc_ffn_up,
+        Some(lw.hc_ffn_inject),
+        hc,
+        eps,
+        il as i64,
+    );
+    let cur = build_qwen4exp_ffn(ctx, &mut graph, cur, lw, p);
+    ctx.set_name(cur, &format!("ffn_out-{il}"));
+    let res_hc =
+        build_qwen4exp_hc_combine(ctx, res_hc, cur, inject.expect("hc_ffn_inject"), hc, il as i64);
+
+    // :600-607 — the flat hc-wide residual IS the next draft step's h:
+    // masked taps read the gathered rows, unmasked every row (the port's
+    // draft driver passes no out_ids, so the gather stays elided — the
+    // value-identical port convention)
+    let flat = ctx.reshape_2d(res_hc, p.n_embd * hc, t);
+    let flat_out = graph::out_rows(ctx, flat, inp.out_ids);
+    let h_nextn = flat;
+    ctx.set_name(h_nextn, &format!("h_nextn-{il}"));
+
+    // :609-614 — the nextn hc head mixer collapses the streams of the
+    // (gathered) flat residual → result_norm → model.output
+    let n_out = ctx.ne(flat_out)[1];
+    let fo3 = ctx.reshape_3d(flat_out, p.n_embd, hc, n_out);
+    let (cur, _) = build_qwen4exp_hc_mix(
+        ctx,
+        fo3,
+        w.nextn_hc_head_norm,
+        w.nextn_hc_head_down,
+        w.nextn_hc_head_up,
+        None,
+        hc,
+        eps,
+        il as i64,
+    );
+    ctx.set_name(cur, "result_norm");
+    let logits = crate::adapter::lora_mm(ctx, w.output, cur);
+    ctx.set_name(logits, "result_output");
+
+    graph.build_forward(ctx, logits);
+    ForwardResult {
+        logits,
+        graph,
+        embd: Some(h_nextn),
     }
 }
 
@@ -44523,14 +44872,19 @@ fn gemma_embedding2_inp_per_layer(
 /// (:127), kq_scale = f_attention_scale (:141, no Q pre-scale), the
 /// per-layer embedding input (gate*view -> proj -> post-norm -> residual,
 /// :172-193), the per-layer `out_scale` multiply (:196) and the final
-/// n_embd_out projection (:210). `inpL` is scaled by sqrt(n_embd) — the
-/// token-batch half of build_inp_embd(tok_scale); raw-embedding rows stay
-/// unscaled (the B-side mixed-batch machinery owns that path).
+/// n_embd_out projection (:210). `inpL` goes through the shared
+/// [`crate::graph::build_inp_embd`] with `tok_scale = sqrt(n_embd)`
+/// (gemma-embedding2.cpp:86): the token rows scale uniformly (the SCALE op
+/// the inline form emitted — bit-identical), and a type-marked mixed batch
+/// routes through the per-row scale mul (1.0 on the raw embd rows — "raw
+/// embeddings are assumed to be multimodal inputs that should not be
+/// scaled", llama-graph.cpp:2553-2554).
 pub fn build_gemma_embedding2_forward(
     ctx: &mut Context,
     w: &GemmaEmbedding2ModelWeights,
     p: &GemmaEmbedding2Params,
     inp: &EncodeInputs,
+    mixed: Option<&crate::graph::InpMixed>,
     n_tokens: usize,
 ) -> EncodeResult {
     let t = n_tokens as i64;
@@ -44539,11 +44893,21 @@ pub fn build_gemma_embedding2_forward(
     let hd = p.n_embd_head;
     let mut graph = Graph::new(4096);
 
-    // inpL x sqrt(n_embd) (gemma-embedding2.cpp:86; encode batches carry
-    // tokens — the tts/encode driver shape)
-    let mut inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
-    inp_l = crate::adapter::lora_embd(ctx, w.tok_embd, inp_l, inp.tokens);
-    inp_l = ctx.scale(inp_l, (ctx.ne(w.tok_embd)[0] as f32).sqrt());
+    // inpL x sqrt(n_embd) — build_inp_embd(tok_scale) (gemma-embedding2.
+    // cpp:86; the encode batches carry tokens, the mixed form carries the
+    // raw embd rows beside them)
+    let n_embd = ctx.ne(w.tok_embd)[0];
+    let mut inp_l = crate::graph::build_inp_embd(
+        ctx,
+        w.tok_embd,
+        inp.tokens,
+        mixed,
+        (n_embd as f32).sqrt(),
+        crate::graph::InpEmbdScale {
+            n_embd_inp: n_embd,
+            ..Default::default()
+        },
+    );
     ctx.set_name(inp_l, "inp_scaled"); // cb(inpL, "inp_scaled", -1) :87
 
     let swa_mask = inp.kq_mask_swa.expect("gemma-embedding2 needs the swa mask");

@@ -2099,6 +2099,10 @@ pub struct DecodeContext {
     /// readback + used bitmap of `sched_copy_experts`; reset before every
     /// graph compute (llama-context.cpp:2643)
     copy_experts: crate::moe_cache::CopyExpertsState,
+    /// the foreign-scheduler twin of `copy_experts` — installed on the GPU
+    /// executor when `moe_cache_size > 0` (X-domain handoff), driven from
+    /// the same reset point (llama-context.cpp:2643 covers both)
+    foreign_copy_experts: Option<crate::moe_cache::ForeignCopyExpertsReset>,
     /// the per-step k_rot Hadamard input of the deepseek4 MTP attention
     /// (`build_input_k_rot`, llama-kv-cache.cpp:1437-1455)
     mtp_k_rot: Option<TensorId>,
@@ -2239,6 +2243,22 @@ pub enum MtpForward {
     HyV3(graph_arch::HyV3MtpWeights, graph_arch::HyV3Params, MtpHeadFacts),
     Mimo2(graph_arch::Mimo2MtpWeights, graph_arch::Mimo2Params, MtpHeadFacts),
     Step35(graph_arch::Step35MtpWeights, graph_arch::Step35Params, MtpHeadFacts),
+    /// b9acf138a — glm5-next's graph_mtp (glm5-next.cpp:543-666): the
+    /// DSA+kpool NextN block. Unlike every other arm the draft context is a
+    /// *hybrid-idx* one (llama-model.cpp:2501-2508 — the MTP filters keep
+    /// only the nextn block's attention AND indexer layers, the recurrent
+    /// half is empty), so `new_mtp` also mounts the port's `idx`
+    /// HybridIdxCache + the per-step `idx_step` kpool inputs
+    Glm5Next(graph_arch::Glm5NextMtpWeights, graph_arch::Glm5NextParams),
+    /// batch 42f follow-up — qwen4exp's graph_mtp (qwen4exp.cpp:526-612):
+    /// the hc-wide eh_proj + one QSA/dense attention round + the nextn hc
+    /// head mixer. Also a hybrid-idx draft context (llama-model.cpp:2750-
+    /// 2756: attn + idx filters keep the MTP block, the recurrent half is
+    /// empty — the is_empty semantics batch 42e armed), so `new_mtp` mounts
+    /// the q4e idx cache (kpool_row = 2, by-order) + the per-step
+    /// `q4e_kpool_step`/`ple_input`. The params' per-layer vectors arrive
+    /// extended to n_layer+1 by the assembler (the MTP layer's own facts)
+    Qwen4Exp(graph_arch::Qwen4ExpMtpWeights, graph_arch::Qwen4ExpParams),
 }
 
 /// The MTP layer's facts the trunk params cannot supply (MTP batch 18) —
@@ -2290,6 +2310,12 @@ impl MtpForward {
             | MtpForward::HyV3(_, _, f)
             | MtpForward::Mimo2(_, _, f)
             | MtpForward::Step35(_, _, f) => f.n_embd,
+            // b9acf138a — glm5-next's n_embd_out() == n_embd (no
+            // EMBEDDING_LENGTH_OUT override, glm5-next.cpp:559's assert)
+            MtpForward::Glm5Next(_, p) => p.n_embd,
+            // qwen4exp's n_embd_out() == n_embd * hc (qwen4exp.cpp:534's
+            // assert — the h input rows are the hc-wide flat residual)
+            MtpForward::Qwen4Exp(_, p) => p.n_embd * p.hc,
         }
     }
 
@@ -2486,6 +2512,12 @@ impl DecodeContext {
             // the gemma4 trunk's t_h_nextn is the post-final-norm state
             // (gemma4.cpp:407-414) — n_embd wide (no EMBEDDING_LENGTH_OUT)
             (None, None, _, ForwardWeights::Gemma4(_, p)) => p.n_embd as usize,
+            // b9acf138a — glm5-next's t_h_nextn is the post-hc_mean final
+            // norm (glm5-next.cpp:783-787), n_embd wide
+            (None, None, _, ForwardWeights::Glm5Next(_, p)) => p.n_embd as usize,
+            // qwen4exp's t_h_nextn is the flat hc-wide residual
+            // (qwen4exp.cpp:500-503) — n_embd*hc wide
+            (None, None, _, ForwardWeights::Qwen4Exp(_, p)) => (p.n_embd * p.hc) as usize,
             // MTP batch 18 — the nine GLM4-style trunks whose graphs set
             // t_h_nextn (the final-norm hidden, e.g. qwen35.cpp:206-209):
             // their params carry no n_embd, so the width comes off the
@@ -2880,6 +2912,7 @@ impl DecodeContext {
             mixed_step: None,
             moe_cache_size: 0,
             copy_experts: crate::moe_cache::CopyExpertsState::default(),
+            foreign_copy_experts: None,
             mtp_k_rot: None,
             eagle: None,
             eagle_g_input: None,
@@ -2924,6 +2957,9 @@ impl DecodeContext {
         n_batch: usize,
     ) -> Self {
         let n_embd_out = mtp.n_embd_out() as usize;
+        // the hybrid-idx MTP arm's idx cache (glm5-next — set inside the kv
+        // match below)
+        let mut mtp_idx = None;
         let kv = match &mtp {
             MtpForward::Deepseek2(_, p) => KvCache::new_with_dims(
                 &mut gctx,
@@ -2997,6 +3033,72 @@ impl DecodeContext {
                     )
                 }
             }
+            // b9acf138a — glm5-next's MTP context is a hybrid-idx one
+            // (llama-model.cpp:2501-2508: `filter_attn = filter_idx =
+            // il >= n_layer()`, `filter_recr` identically false — "the draft
+            // head is a single DSA layer"). The port keeps the layer
+            // indexing of the shared DSA builder (`kv.layers[il]` /
+            // `idx_cache.layers[il]` at il = n_layer) by sizing both caches
+            // n_layer_all with zero-width/filtered trunk rows — the
+            // kimi-k3 precedent for the recurrent half of hybrid trunks.
+            // The attn half is the K-only MLA latent cache (`kv.k_only`,
+            // has_v = !is_mla), the idx cache the glm5 kpool layout
+            // (key | gate | pooled, row = 3, position-grouped pools).
+            MtpForward::Glm5Next(_, p) => {
+                let n_trunk = p.is_recr.len();
+                let mut k_row = vec![0i64; n_trunk];
+                let mut v_row = vec![0i64; n_trunk];
+                k_row.push(p.n_lora_kv);
+                v_row.push(p.n_lora_kv); // unread (K-only MLA cache)
+                let mut kv = KvCache::new_with_dims(&mut gctx, &k_row, &v_row, n_ctx);
+                kv.k_only = true;
+                let mut is_idx = vec![false; n_trunk];
+                is_idx.push(true);
+                mtp_idx = Some(crate::kv_cache::HybridIdxCache::new(
+                    &mut gctx,
+                    n_ctx,
+                    p.indexer_head_size,
+                    p.indexer_kpool as u32,
+                    3,
+                    false,
+                    is_idx,
+                ));
+                kv
+            }
+            // qwen4exp's MTP context — the same hybrid-idx shape with the
+            // q4e layout (llama-model.cpp:2750-2756 + :2725-2736: kpool_row
+            // = 2 raw|pooled, by-order pools); files without
+            // attention.compress_ratios (indexer_kpool == 0) get no idx
+            // cache — the MTP layer runs dense like the C's
+            // `mctx_hyb->get_idx()` null arm (qwen4exp.cpp:570-578)
+            MtpForward::Qwen4Exp(_, p) => {
+                // the extended convention: the per-layer vectors cover
+                // n_layer_all, the MTP layer is the LAST entry
+                let il = p.is_recr.len() - 1;
+                let k_last = p.n_embd_head_k[il] as i64 * p.n_head_kv[il] as i64;
+                let v_last = p.n_embd_head_v[il] as i64 * p.n_head_kv[il] as i64;
+                let n_trunk = il;
+                let mut k_row = vec![0i64; n_trunk];
+                let mut v_row = vec![0i64; n_trunk];
+                k_row.push(k_last);
+                v_row.push(v_last);
+                let kv = KvCache::new_with_dims(&mut gctx, &k_row, &v_row, n_ctx);
+                if p.indexer_kpool > 0 {
+                    let n_trunk = il;
+                    let mut is_idx = vec![false; n_trunk];
+                    is_idx.push(true);
+                    mtp_idx = Some(crate::kv_cache::HybridIdxCache::new(
+                        &mut gctx,
+                        n_ctx,
+                        p.indexer_head_size,
+                        p.indexer_kpool as u32,
+                        2,
+                        true,
+                        is_idx,
+                    ));
+                }
+                kv
+            }
         };
         let n_vocab = gctx.ne(weights.output())[1] as usize;
         let watermark = gctx.mark();
@@ -3036,10 +3138,11 @@ impl DecodeContext {
             mixed_step: None,
             moe_cache_size: 0,
             copy_experts: crate::moe_cache::CopyExpertsState::default(),
+            foreign_copy_experts: None,
             mtp_k_rot: None,
             msa: None,
             msa_step: None,
-            idx: None,
+            idx: mtp_idx,
             idx_step: None,
             q4e_kpool_step: None,
             ple_input: None,
@@ -3118,6 +3221,7 @@ impl DecodeContext {
             mixed_step: None,
             moe_cache_size: 0,
             copy_experts: crate::moe_cache::CopyExpertsState::default(),
+            foreign_copy_experts: None,
             mtp_k_rot: None,
             msa: None,
             msa_step: None,
@@ -3237,6 +3341,7 @@ impl DecodeContext {
             mixed_step: None,
             moe_cache_size: 0,
             copy_experts: crate::moe_cache::CopyExpertsState::default(),
+            foreign_copy_experts: None,
             mtp_k_rot: None,
             msa: None,
             msa_step: None,
@@ -4436,6 +4541,16 @@ impl DecodeContext {
         let n_layer_all = n_blks + 1;
         let ngl = cfg.n_gpu_layers;
         let mut exe = ggml::backend_emit::ForeignExecutor::new(&cfg)?;
+        // `cparams.moe_cache_size > 0` installs the expert-copy callback on
+        // the foreign scheduler (llama-context.cpp:466-468 constructs the
+        // cache, `ggml_backend_sched_set_copy_callback` at :651/:692) — the
+        // Rust-side `MoeCache` banks are a GPU-enablement follow-up, so this
+        // passes `None` (the callback then behaves like the upstream
+        // cache-disabled path: the used-expert bitmap still trims the upload)
+        if self.moe_cache_size > 0 {
+            self.foreign_copy_experts =
+                crate::moe_cache::install_copy_callback_foreign(&mut exe, None).ok();
+        }
         let n_offloaded = (0..=n_layer_all)
             .filter(|&il| ggml::backend_emit::layer_on_gpu(n_layer_all, ngl, il))
             .count();
@@ -4496,7 +4611,10 @@ impl DecodeContext {
     fn run_graph(&mut self, gf: &mut ggml::Graph, root: ggml::TensorId, also_sync: &[ggml::TensorId]) -> Result<(), String> {
         // `copy_experts.reset()` before every graph compute
         // (llama-context.cpp:2643, d6cf9acb2): the ids readback cache dies
-        // with the graph it belonged to
+        // with the graph it belonged to — the foreign twin resets with it
+        if let Some(h) = &self.foreign_copy_experts {
+            h.reset();
+        }
         self.copy_experts.reset();
         match self.gpu.as_mut() {
             Some(exe) => {
@@ -5048,6 +5166,38 @@ impl DecodeContext {
                     self.kv.n_kv(),
                     n,
                 ),
+                // b9acf138a — glm5-next's graph_mtp (glm5-next.cpp:543-666):
+                // the DSA+kpool NextN block over this context's own
+                // hybrid-idx caches (the kv layers were built n_layer_all
+                // wide with zero-width trunk rows, so il = n_layer indexes
+                // the last layer)
+                MtpForward::Glm5Next(w, p) => graph_arch::build_glm5_mtp_forward(
+                    &mut self.gctx,
+                    w,
+                    p,
+                    &self.kv,
+                    self.idx.as_ref().expect("glm5 MTP: the idx cache"),
+                    self.idx_step.as_ref().expect("glm5 MTP: the kpool step"),
+                    &inp,
+                    h,
+                    self.kv.n_kv(),
+                    n,
+                ),
+                // batch 42f — qwen4exp's graph_mtp (qwen4exp.cpp:526-612):
+                // QSA over the draft context's own idx cache when the file
+                // has one, dense otherwise
+                MtpForward::Qwen4Exp(w, p) => graph_arch::build_qwen4exp_mtp_forward(
+                    &mut self.gctx,
+                    w,
+                    p,
+                    &self.kv,
+                    self.idx.as_ref(),
+                    self.q4e_kpool_step.as_ref(),
+                    &inp,
+                    h,
+                    self.kv.n_kv(),
+                    n,
+                ),
             };
             self.mtp = Some(mtp);
             return (result.logits, result.embd, result.graph);
@@ -5336,6 +5486,10 @@ impl DecodeContext {
                 sinfo,
                 n_kv,
                 n,
+                // f0c41e016 (qwen4exp.cpp:498-503): the unmasked nextn tap
+                // returns t_h_nextn — the flat hc-wide residual — through
+                // the embd slot instead of t_embd (the deepseek4 precedent)
+                self.embeddings_nextn && !self.embeddings_nextn_masked,
             ),
             // ==================================================================
             // arch batch 11b (2026-10) — the long-tail queue, second half
@@ -7700,6 +7854,19 @@ impl DecodeContext {
             let gctx = &mut self.gctx;
             dsv4_step_inputs(gctx, &mut self.kv, &q_pos, &q_seq, use_fa);
         }
+        // the hybrid_idx step (glm5-next trunk/target + the glm5 MTP draft
+        // context — b9acf138a) — the same `build_idx_step` the single-seq
+        // decode() path runs, now on the decode_batch prologue: the C's
+        // apply() hooks kpool_layout_update + kpool_build_state + the input
+        // fills into every ubatch of `llama_context::decode`
+        // (llama-context.cpp:1850-1900), which is the path the draft-mtp
+        // driver (speculative.cpp:1552-1571) and the spec target both take
+        self.idx_step = None;
+        self.q4e_kpool_step = None;
+        if self.idx.is_some() {
+            let tokens: Vec<i32> = ub.token[..n].to_vec();
+            self.build_idx_step(&tokens, &q_pos, n, sinfo);
+        }
         self.inputs = Some(inputs);
 
         // build_inp_out_ids for this ubatch (llama-graph.cpp:2480-2496): the
@@ -9485,9 +9652,18 @@ impl EncoderContext {
             }
             // gemma-embedding2 — the arch's own graph (gemma-embedding2.cpp:
             //79-234): the bundled params carry the per-layer-input + SWA
-            // facts, the rope pair the test assembly mirrors
+            // facts, the rope pair the test assembly mirrors. The mixed
+            // form rides build_inp_embd's tok_scale (gemma-embedding2.cpp:
+            //86) — the encode driver's batches carry tokens today, the
+            // mixed construction is exercised at the builder level
+            // (tests/gemma_embedding2_e2e.rs)
             EncoderWeights::GemmaEmbedding2(w, p) => {
-                graph_arch::build_gemma_embedding2_forward(&mut self.gctx, w, p, &inputs, n)
+                // the encoder driver's batches carry tokens — the mixed
+                // construction is exercised at the builder level
+                // (tests/gemma_embedding2_e2e.rs)
+                graph_arch::build_gemma_embedding2_forward(
+                    &mut self.gctx, w, p, &inputs, None, n,
+                )
             }
         };
         let embd = result.embd;

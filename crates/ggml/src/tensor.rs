@@ -656,6 +656,17 @@ impl Context {
         let n = params.len().min(MAX_OP_PARAMS / 4);
         self.tensors[id.0 as usize].op_params[..n].copy_from_slice(&params[..n]);
     }
+    /// ggml_set_op_params_i32 (ggml-impl.h:175-178): write one i32 slot of
+    /// op_params in place, leaving the rest untouched (unlike the slice
+    /// [`Context::set_op_params_i32`], which overwrites from slot 0).
+    /// Consumers: ggml_prec_set_acc / prec_set_src (ggml.c:3291-3345) —
+    /// [TAG_GGML_PREC] layout per ggml-impl.h:163-173:
+    ///   MUL_MAT / MUL_MAT_ID: [0]=acc, [1]=hint, [2]=src0 prec, [3]=src1 prec
+    ///   FLASH_ATTN_EXT: [3]=prec (after scale/max_bias/logit_softcap f32s)
+    pub fn set_op_params_i32_at(&mut self, id: TensorId, slot: usize, value: i32) {
+        assert!(slot < MAX_OP_PARAMS / 4, "set_op_params_i32_at: slot out of range");
+        self.tensors[id.0 as usize].op_params[slot] = value;
+    }
 
     // ---- data accessors (arena only; views through view_src chain) ----
 

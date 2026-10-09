@@ -37,7 +37,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use ggml::{Context, Gguf, GgufType, TensorId, Value};
+use ggml::{Context, GgmlPrec, GgmlType, Gguf, GgufType, TensorId, Value};
 
 use crate::arch::{kv_name, LlmArch, LlmKv};
 
@@ -614,11 +614,15 @@ pub fn lora_mm(ctx: &mut Context, w: TensorId, cur: TensorId) -> TensorId {
 pub fn lora_mm_s(ctx: &mut Context, w: TensorId, cur: TensorId, w_s: Option<TensorId>) -> TensorId {
     let mut res = ctx.mul_mat(w, cur);
 
-    // a7b94df2c (llama-graph.cpp:1526-1530): NVFP4 weights take a BF16
+    // a7b94df2c (llama-graph.cpp:1560-1562): NVFP4 weights take a BF16
     // accumulator hint — `if (w->type == GGML_TYPE_NVFP4)
-    // ggml_prec_set_acc(res, GGML_PREC_BF16)`. The port's ggml crate has no
-    // `ggml_prec_set_acc` yet (a GPU-side kernel hint; the CPU build ignores
-    // it like the prec_policy above) — pending the ggml lane's API.
+    // ggml_prec_set_acc(res, GGML_PREC_BF16)`. Batch 42b wired the port's
+    // `Context::prec_set_acc`: the flag lands in op_params[0] bit-for-bit
+    // like the reference (a GPU W4A4 kernel hint; the CPU backend has no
+    // consumer for the slot, so numerics are unchanged).
+    if ctx.ty(w) == GgmlType::Nvfp4 {
+        ctx.prec_set_acc(res, GgmlPrec::Bf16);
+    }
 
     if let Some(s) = w_s {
         res = ctx.mul(res, s);
@@ -659,6 +663,12 @@ pub fn lora_mm_s(ctx: &mut Context, w: TensorId, cur: TensorId, w_s: Option<Tens
 /// the formula is the same one [`LoraWeight::get_scale`] implements.
 pub fn lora_mm_id(ctx: &mut Context, w: TensorId, cur: TensorId, ids: TensorId) -> TensorId {
     let mut res = ctx.mul_mat_id(w, cur, ids);
+
+    // a7b94df2c (llama-graph.cpp:1604-1606): the mul_mat_id twin of the
+    // NVFP4 BF16 accumulator hint above.
+    if ctx.ty(w) == GgmlType::Nvfp4 {
+        ctx.prec_set_acc(res, GgmlPrec::Bf16);
+    }
 
     if !has_active_loras() {
         return res;
@@ -1253,5 +1263,39 @@ mod tests {
             }
             assert!((base[i] as f64 - acc).abs() < 1e-5);
         }
+    }
+
+    /// a7b94df2c (llama-graph.cpp:1560-1562 / 1604-1606): NVFP4 weights flag
+    /// the mul_mat result with the BF16 accumulator hint
+    /// (`ggml_prec_set_acc(res, GGML_PREC_BF16)` → op_params[0] == 15, the
+    /// exact bytes parity/prec_acc_ref.txt pins on the reference .so); any
+    /// other weight type leaves the slot untouched.
+    #[test]
+    fn lora_mm_nvfp4_prec_acc() {
+        let mut ctx = Context::new();
+        // NVFP4 w [64,4] (block size 64), cur [64,2] F32
+        let w4 = ctx.new_tensor_2d(GgmlType::Nvfp4, 64, 4);
+        let cur = ctx.new_tensor_2d(GgmlType::F32, 64, 2);
+        let out = lora_mm(&mut ctx, w4, cur);
+        assert_eq!(ctx.op(out), ggml::tensor::GgmlOp::MulMat);
+        assert_eq!(ctx.op_params(out)[0], 15); // GGML_PREC_BF16
+
+        // F32 weight: no hint
+        let wf = ctx.new_tensor_2d(GgmlType::F32, 64, 4);
+        let out2 = lora_mm(&mut ctx, wf, cur);
+        assert_eq!(ctx.op_params(out2)[0], 0);
+
+        // mul_mat_id twin: experts [64,4,2] NVFP4, cur3 [64,2,2], ids [2,2]
+        let we4 = ctx.new_tensor_3d(GgmlType::Nvfp4, 64, 4, 2);
+        let cur3 = ctx.new_tensor_3d(GgmlType::F32, 64, 2, 2);
+        let ids = ctx.new_tensor_2d(GgmlType::I32, 2, 2);
+        let out3 = lora_mm_id(&mut ctx, we4, cur3, ids);
+        assert_eq!(ctx.op(out3), ggml::tensor::GgmlOp::MulMatId);
+        assert_eq!(ctx.op_params(out3)[0], 15); // GGML_PREC_BF16
+
+        // F32 experts: no hint
+        let wef = ctx.new_tensor_3d(GgmlType::F32, 64, 4, 2);
+        let out4 = lora_mm_id(&mut ctx, wef, cur3, ids);
+        assert_eq!(ctx.op_params(out4)[0], 0);
     }
 }
