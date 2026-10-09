@@ -8247,3 +8247,55 @@ Wiring（llama-cli 的既有模式搬到 server 的 load_engine）: 目标上下
 - **qwen4exp graph_mtp 的草稿上下文 idx/recurrent 过滤接线**（llama-model.cpp:2719-2727 的端口面 = DecodeContext 草稿构造）: 记忆侧 is_empty 语义已铺（本批）; MtpForward::Qwen4Exp + 草稿 kpool 步随 A2 道开档的驱动批次接。
 - **mrope-2D 图像输入面**（KvCell 无 ext.x/y; 序模式池/尾已按 rank 处理重位, 真 2D 位置仍无输入路径——批次 20b §2 开档不变, 本批 kpool_rank 即为其预铺）。
 - build_rs 单 gather / can_reuse / graph_max_nodes / dsv4 raw-write ubatch / load_mode GGML_ABORT: 均为无端口面的机械（§1 表内逐条豁免依据）。
+
+## 同步批次 3（四域全量）: 基线 a7b94df2c → c35b66744（2026-10-09, 112 提交, 33 个 CPU 面有效提交）
+
+上游 2026-10-05→10-08 增量; GPU 域（hexagon/sycl/cuda/metal/openvino/vulkan/webgpu/spacemit/amx/kleidiai/hbm）照旧零转写。四域代理并行（A=models+arch / B=src core / C=common+server+mtmd / D=ggml）+ 集成者收尾接线与复验。**锚点 token 对新旧参考逐字节相同**（qwen25+gptoss 双 IDENTICAL 前后各验一次）——存量行为未漂移, 本轮以增量新增为主。
+
+### 1. 新架构（3 个, 全部节点流位比验证 + CLI 冒烟）
+
+- **K2-Horizon**（462524043, dense+MoVA）: `build_routed_value`（attn_v_gate 路由 softmax/sigmoid→top-k→renorm clamp 6.103515625e-5→silu(W_k x)·w_k 求和, value_views 保序 build_forward）+ wqkv_gate 门控注意力 + log2(1+2^x) 输出门 + group-RMS norm; k2-horizon 分词器（unicode.cpp +156 的 custom split: \p{L}|\p{M}|ZWNJ/ZWJ letter run + 长s折叠 + \p{N}{1,3}, clean_spaces=false）。**验证**: dense 572 + mova 1079 命名节点位同（parity/gen_k2_ref.sh, ref --fa off）; CLI 级 mova 12/12 token 与参考 server 逐 id 相同。
+- **gemma-embedding2**（4fbc76dec, text+vision+audio 嵌入）: per-layer 投影塔（inp_gate/proj/post_norm/layer_output_scale）+ V 无权 RMS norm + SWA 非因果（NULL memory 家族, attn_no_cache_il）。**验证**: 55 命名节点位同; /embedding 端到端 **64/64 位同**（双 -fa off; fa=auto 下 cos 0.9999998 = encoder 家族无 FA 臂的既有已档缺口, 同 gemma-embedding v1/bert）。
+- **lfm2-d1/d1-omni 决策模型**（88dcc460d+a657f7e98）: 决策头块装载（bias 版 pre-norm）+ graph_decision（双 no-cache 注意力: 主干 enc + 头部 head; d1-omni 的 conv_mask/媒体 mask 规则）+ 居中 3-tap 无状态短卷积 + 3 题型头（LN/无位置注意力/gelu_erf 评分器）。**验证**: 50 命名节点位同 + mask 规则单测; 参考 llama-cli 无法驱动决策文件（wait_ready 挂起→SIGABRT, 参考驱动层缺陷）→ 端口可加载+生成, 库级位比为验收。lfm2 决策文件 create_memory=null（B 侧）。
+
+### 2. src 核心大项（B 域）
+
+- **batch 混合 token+embd 批**（0bb496dbd）: allow_mixed（`llm_arch_supports_mixed_batch` 六例外: cogvlm/deepseek4/granite-switch/eagle3/dflash/gemma4-assistant）+ 三计数校验 + is_embd_vec 占位 + **pos 展开移位**（token 行 [p,p,p,0] section-major, M-RoPE 展开从 graph 层移到 batch 层）+ ubatch.type 数组 + 单类拆分退化 + seq_first_embd 位置规则。测试 16/16（原 12 保绿+4 新增）。
+- **build_inp_embd 3 路重构**: mixed 路 = set_rows(dup(mixed_embd), tok(mixed_tokens), mixed_slots) + 逐行 scale_rows（token 行 scale_tok/embd 行 1.0, deepstack scale_tok_only 重构）; 端口在步建图时解析选择（值等价, 注释说明——参考 forward_select 保留三臂导致其 dump 含未计算死分支节点, 位置对比器会误报, glm5 门已切换为命名配对协议）。
+- **MoE cache 子系统**（d6cf9acb2+c811cb8f0, 681 行新）: moe_cache.rs 全量（LRU slot_map/plan/touch/跨层逐出 + sched_copy_experts 的 MUL_MAT_ID 首 node 探测 + used 位图 + 连续段合并上传 + 512B padding 尾）; 单测 7/7 钉死 LRU 语义; CPU-only 本机 GPU e2e 不可测（诚实记录）。
+- **dsv4 旋转元数据**（210791069）: n_rot_k/n_rot_v 构造期定宽 + state blob 持久化 + 不匹配拒绝; **发现上游 SIGFPE**: 全 SWA dsv4 的 base 半 n_embd_head_k_all=0 使 n_rot 翻倍回绕 0 → 除零（gdb 复现, indexer 条款缺 >0 复查）; 端口写守护值绕开, dsv4 state 字节 parity 被上游崩溃阻塞（复现在案, 上游修复后自动恢复）。
+- **hybrid-idx 修复**（43fe9c642+c173a53bd）: seq_cp 断言整序列 + rep_gen 状态标记（数据竞争修复）+ set_input_kpool 签名 gather_mask→sel_mask + gather 路径整体移除（glm5 DSA 只留散射）。
+- **PLaMo-3 分词器**（abeada335+42b021b4d）: VocabType::Plamo3 + 两段预分词（<|plamo:…|> 体≤64/重复≥4/空格≥2/U+EE00 边界不发射）+ BOM 保留语义（P3 留 P2 删）+ fim 四 token; 探针双端逐点一致（k2_plamo_split_parity 2/2）。
+- **classifier_activation**（37ac63456）: act_cls hparam（gelu→GELU_ERF/silu/tanh）替换 modern-bert 硬编码——**上游行为变化跟随**: 分类头从 tanh/近似 gelu 改精确 erf。
+
+### 3. common/server/mtmd（C 域）
+
+- **common_chat_input 累积**（18b5f8b18）: text+token 对齐输入结构 + server slot.generated 增量解析 + stop-word 分支 send_text 保持 true 语义（**修正端口基线偏差**）; send_partial 的 content=token 对齐块。
+- **slot save/restore 检查点附录**（033df86b6）: SCKP 附录（u64 长度三 blob + id_task=-1 标记 + draft 试载不匹配全弃 + 32 上限）追加到 llama state 之后; **顺修两处端口文件格式偏差**（STATE_SEQ_VERSION 3→4 + 剥帧直写布局）达成**双端互读**（端口文件→参考 restore / 参考文件→端口 restore, qwen+mamba2 续写全一致, run_server_slots_parity.sh MATCH）。
+- **server-decision 新臂**: PPLX_DECIDER + LFM2_D1（null-state/d1_labels/label_groups 归并）+ LFM2_D1_OMNI（¦转义/标记族/token 预算 16384/896/15360/input_audio）; systemone 12/12 保持 + 7 新单测; d1 e2e 待 A 域 builder 驱动接线（本轮 builder 已落地, 协议面已覆盖）。
+- **/models 模态**（4d60b4d08）+ **keep_first 截断拒绝**（8e1642198, 端口无媒体面 N/A）+ **贪心温度零链**（d0b490f25: 链尾 TEMPERATURE@0/无 dynatemp 或 TOP_K@1 且无 probs → greedy）+ **专化解析器**（k2-horizon 193 行 + translate-gemma 63 行 + 5de733437 规则索引命名全量清扫）; chat_tools_parity 对 NEW 参考**重采 153/153 逐字节**（+17 新用例）。
+- **mtmd cohere2 视觉阻塞**: 需 siglip 塔 + llava-uhd 切片族（既有缺口非本增量, 开档）。
+
+### 4. ggml（D 域）
+
+- **copy callback API**（6753a033f）: sched 存回调 + copy_input 三段语义（INPUT 立即拷/event 等待/回调命中即返/async→sync 回退）+ 两遍拷贝序（非宿主权重先, 宿主权重后——回调可读 split 其余输入）+ 旧 moe_copy_used_experts 特例删除; 契约测试 6/6（单后端不触发 + 双后端 mock 时序）。
+- **CLAMP 非连续视图修复**（65840ed53）: i1/i2/i3 三维分解替换 j*nb1; **顺带补齐端口 F16 clamp 内核缺口**（上游 dispatcher 本就两支）; 位比探针 8/8（6 非连续节仅匹配新寻址, 2 连续对照字节不变, parity/ref_clamp_dump.c+clamp_ref.bin）。
+
+### 5. 集成收尾（集成者）
+
+- **ForwardWeights/CLI 路由三新架构**（接线代理死于机器卡死, 集成者验证其落地）: context.rs +370/main.rs +97; arch 计数 pin 149→**151**。
+- **glm5 门协议修复**: 位置对比器把端口活节点对上参考未计算死分支（forward_select 三臂, dump 读零）→ 判定切换为命名配对（76 名×13 图位同, glm5_parity.sh 已改）。
+- **机器卡死×1**（10:00 重启清 /tmp + LM Studio）: 会话封顶重挂; 合成件再生成后全部复验; 模板 e2e 自愈重采。
+
+### 6. 锚点与门禁
+
+- **双锚 IDENTICAL×2**（qwen25 fa off + gptoss fa on, 锚 token 对新旧参考逐字节相同——上游未漂移存量贪心行为）。
+- **全量串行门禁**: `cargo test --workspace --release --no-fail-fast -- --test-threads 1` → **909 passed / 0 failed / 131 ignored**（含 1 个自愈项复跑; 基线 874→909, +34 为本批新增——mixed-batch 4/moe_cache 7/decision 7/slots 附录 8/k2+plamo 4/glm5 协议 2 等）。
+- 独立复验（集成者亲跑）: slots 交叉互读 MATCH / chat_tools 11 测试（153 用例）绿 / k2 位比 ok / gemma2 64/64 位同 / glm5 命名节点位同 / 三新架构 CLI 冒烟。
+
+### 7. 未做（开档）
+
+- **glm5-next graph_mtp**（b9acf138a ①）: 需 MTP 上下文的 HybridIdxCache 步进复刻（DSA+kpool 层的 nextn）, 与 qwen4exp graph_mtp 驱动同型开档。
+- **f0c41e016 的 19-builder 裁剪接线**: B 需把 embeddings_nextn(_masked) 下放 builder——现有驱动路径值不变（域内回归佐证）, embeddings-nextn 上下文的行为差待接。
+- **mtmd cohere2 视觉**（siglip 塔+llava-uhd, 既有缺口）; **d1/pplx/omni e2e**（协议面已单测, 待驱动接线）; **sysffi copy callback**（ForeignExecutor GPU 路径, D 落地 Rust 侧）; **prompt-cache 检查点生成/回滚**（T2 复用类断言）。
+- **上游 bug 待报**: dsv4 全 SWA base 半 SIGFPE（§2）; 参考 llama-cli 驱动决策文件挂起。
