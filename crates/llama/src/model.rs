@@ -6407,31 +6407,56 @@ fn load_arch_tensors(
                 output = Some(dup_fallback!((lc.n_embd, lc.n_vocab)));
             }
 
-            // the port has no load_mtp switch (no TENSOR_SKIP, see module
-            // docs): the C trunk_flags/mtp_flags are 0 for a normally-loaded
-            // file, so every req!/opt! below already carries the right flag
-            // and the mtp-only / skip-mtp shapes cannot occur
+            // nextn_flags (448147d42, nemotron-h.cpp:52-54): the shared
+            // trunk/mtp NOT_REQUIRED pair — a file without the first trunk
+            // layer is MTP-only, one without the first NextN layer is
+            // trunk-only. The port has no load_mtp switch (no TENSOR_SKIP,
+            // see module docs), so TENSOR_SKIP never applies — the flags
+            // degrade to NOT_REQUIRED exactly like the port's other nextn
+            // arms (deepseek4's convention)
+            let nf = nextn_flags(
+                ld.gguf,
+                LlmTensor::ATTN_NORM,
+                hparams.n_layer_all,
+                hparams.n_layer_nextn,
+            );
+            let trunk_flags = nf.trunk;
+            let mtp_flags = nf.mtp;
+            let tskip = nf.trunk != 0;
+            let mskip = nf.mtp != 0;
+            // the trunk-loop twin of req! carrying nf.trunk
+            macro_rules! treq {
+                ($t:expr, $suf:expr, $bid:expr, $ne:expr) => {
+                    opt_or_req!($t, $suf, $bid, $ne, tskip)
+                };
+            }
+            // the MTP-block twin carrying nf.mtp
+            macro_rules! mreq {
+                ($t:expr, $suf:expr, $bid:expr, $ne:expr) => {
+                    opt_or_req!($t, $suf, $bid, $ne, mskip)
+                };
+            }
             for (i, l) in layers.iter_mut().enumerate().take(lc.n_layer) {
                 let bid = i as i32;
 
                 // all blocks use the attn norm (nemotron-h.cpp:83)
-                l.attn_norm = Some(req!(LlmTensor::ATTN_NORM, "weight", bid, &[lc.n_embd]));
+                l.attn_norm = treq!(LlmTensor::ATTN_NORM, "weight", bid, &[lc.n_embd]);
 
                 if hparams.is_recr(i) {
                     // ssm layers (nemotron-h.cpp:86-101)
-                    l.ssm_in = Some(req!(
+                    l.ssm_in = treq!(
                         LlmTensor::SSM_IN,
                         "weight",
                         bid,
                         &[lc.n_embd, d_in_proj]
-                    ));
+                    );
 
-                    l.ssm_conv1d = Some(req!(
+                    l.ssm_conv1d = treq!(
                         LlmTensor::SSM_CONV1D,
                         "weight",
                         bid,
                         &[d_conv, d_inner + 2 * n_group * d_state]
-                    ));
+                    );
                     l.ssm_conv1d_b = opt!(
                         LlmTensor::SSM_CONV1D,
                         "bias",
@@ -6439,26 +6464,26 @@ fn load_arch_tensors(
                         &[d_inner + 2 * n_group * d_state]
                     );
 
-                    l.ssm_dt_b = Some(req!(LlmTensor::SSM_DT, "bias", bid, &[n_ssm_head]));
+                    l.ssm_dt_b = treq!(LlmTensor::SSM_DT, "bias", bid, &[n_ssm_head]);
 
                     // no "weight" suffix for these (nemotron-h.cpp:95-96)
-                    l.ssm_a = Some(req!(LlmTensor::SSM_A, "", bid, &[1, n_ssm_head]));
-                    l.ssm_d = Some(req!(LlmTensor::SSM_D, "", bid, &[1, n_ssm_head]));
+                    l.ssm_a = treq!(LlmTensor::SSM_A, "", bid, &[1, n_ssm_head]);
+                    l.ssm_d = treq!(LlmTensor::SSM_D, "", bid, &[1, n_ssm_head]);
 
-                    l.ssm_norm = Some(req!(
+                    l.ssm_norm = treq!(
                         LlmTensor::SSM_NORM,
                         "weight",
                         bid,
                         &[d_inner / n_group, n_group]
-                    ));
+                    );
 
                     // out_proj
-                    l.ssm_out = Some(req!(
+                    l.ssm_out = treq!(
                         LlmTensor::SSM_OUT,
                         "weight",
                         bid,
                         &[d_inner, lc.n_embd]
-                    ));
+                    );
                 } else if hparams.n_ff(i) == 0 {
                     // attention layers (with optional bias) (nemotron-h.cpp:103-109)
                     let n_head_i = hparams.n_head(i) as i64;
@@ -6472,14 +6497,14 @@ fn load_arch_tensors(
                         lc.n_embd_head_k * n_head_i,
                         n_embd_k_gqa_i,
                         n_embd_v_gqa_i,
-                        0,
+                        trunk_flags,
                     )?;
-                    l.wo = Some(req!(
+                    l.wo = treq!(
                         LlmTensor::ATTN_OUT,
                         "weight",
                         bid,
                         &[lc.n_embd_head_k * n_head_i, lc.n_embd]
-                    ));
+                    );
                     l.wo_b = opt!(LlmTensor::ATTN_OUT, "bias", bid, &[lc.n_embd]);
                 } else if lc.n_expert != 0 {
                     // MoE layers (nemotron-h.cpp:111-130). Per-layer n_ff_exp
@@ -6491,18 +6516,18 @@ fn load_arch_tensors(
                     };
                     let n_ff_shexp = hparams.n_ff_shexp as i64;
 
-                    l.ffn_gate_inp = Some(req!(
+                    l.ffn_gate_inp = treq!(
                         LlmTensor::FFN_GATE_INP,
                         "weight",
                         bid,
                         &[lc.n_embd, lc.n_expert]
-                    ));
-                    l.ffn_exp_probs_b = Some(req!(
+                    );
+                    l.ffn_exp_probs_b = treq!(
                         LlmTensor::FFN_EXP_PROBS_B,
                         "bias",
                         bid,
                         &[lc.n_expert]
-                    ));
+                    );
 
                     // optional latent projections (:122-123)
                     l.ffn_latent_down = opt!(
@@ -6518,48 +6543,48 @@ fn load_arch_tensors(
                         &[moe_n_embd, lc.n_embd]
                     );
 
-                    l.ffn_down_exps = Some(req!(
+                    l.ffn_down_exps = treq!(
                         LlmTensor::FFN_DOWN_EXPS,
                         "weight",
                         bid,
                         &[n_ff_exp_i, moe_n_embd, lc.n_expert]
-                    ));
-                    l.ffn_up_exps = Some(req!(
+                    );
+                    l.ffn_up_exps = treq!(
                         LlmTensor::FFN_UP_EXPS,
                         "weight",
                         bid,
                         &[moe_n_embd, n_ff_exp_i, lc.n_expert]
-                    ));
+                    );
 
                     // Shared expert branch (:129-130) — n_ff_shexp comes from
                     // `expert_shared_feed_forward_length` (required nonzero for
                     // a MoE file to satisfy the {n_ff_shexp, n_embd} shape)
-                    l.ffn_down_shexp = Some(req!(
+                    l.ffn_down_shexp = treq!(
                         LlmTensor::FFN_DOWN_SHEXP,
                         "weight",
                         bid,
                         &[n_ff_shexp, lc.n_embd]
-                    ));
-                    l.ffn_up_shexp = Some(req!(
+                    );
+                    l.ffn_up_shexp = treq!(
                         LlmTensor::FFN_UP_SHEXP,
                         "weight",
                         bid,
                         &[lc.n_embd, n_ff_shexp]
-                    ));
+                    );
                 } else {
                     // mlp layers (nemotron-h.cpp:133-138)
-                    l.ffn_down = Some(req!(
+                    l.ffn_down = treq!(
                         LlmTensor::FFN_DOWN,
                         "weight",
                         bid,
                         &[hparams.n_ff(i) as i64, lc.n_embd]
-                    ));
-                    l.ffn_up = Some(req!(
+                    );
+                    l.ffn_up = treq!(
                         LlmTensor::FFN_UP,
                         "weight",
                         bid,
                         &[lc.n_embd, hparams.n_ff(i) as i64]
-                    ));
+                    );
                     l.ffn_down_b = opt!(LlmTensor::FFN_DOWN, "bias", bid, &[lc.n_embd]);
                     l.ffn_up_b = opt!(LlmTensor::FFN_UP, "bias", bid, &[hparams.n_ff(i) as i64]);
                 }
@@ -6592,23 +6617,23 @@ fn load_arch_tensors(
                 let n_ff_shexp = hparams.n_ff_shexp as i64;
 
                 // NextN input-fusion tensors (:160-163)
-                l.nextn.enorm = Some(req!(LlmTensor::NEXTN_ENORM, "weight", bid, &[lc.n_embd]));
-                l.nextn.hnorm = Some(req!(LlmTensor::NEXTN_HNORM, "weight", bid, &[lc.n_embd]));
-                l.nextn.eh_proj = Some(req!(
+                l.nextn.enorm = mreq!(LlmTensor::NEXTN_ENORM, "weight", bid, &[lc.n_embd]);
+                l.nextn.hnorm = mreq!(LlmTensor::NEXTN_HNORM, "weight", bid, &[lc.n_embd]);
+                l.nextn.eh_proj = mreq!(
                     LlmTensor::NEXTN_EH_PROJ,
                     "weight",
                     bid,
                     &[2 * lc.n_embd, lc.n_embd]
-                ));
-                l.nextn.shared_head_norm = Some(req!(
+                );
+                l.nextn.shared_head_norm = mreq!(
                     LlmTensor::NEXTN_SHARED_HEAD_NORM,
                     "weight",
                     bid,
                     &[lc.n_embd]
-                ));
+                );
 
                 // attention sub-layer (:166-169)
-                l.attn_norm = Some(req!(LlmTensor::ATTN_NORM, "weight", bid, &[lc.n_embd]));
+                l.attn_norm = mreq!(LlmTensor::ATTN_NORM, "weight", bid, &[lc.n_embd]);
                 create_tensor_qkv(
                     l,
                     ld,
@@ -6617,31 +6642,31 @@ fn load_arch_tensors(
                     lc.n_embd_head_k * n_head_i,
                     n_embd_k_gqa_i,
                     n_embd_v_gqa_i,
-                    0,
+                    mtp_flags,
                 )?;
-                l.wo = Some(req!(
+                l.wo = mreq!(
                     LlmTensor::ATTN_OUT,
                     "weight",
                     bid,
                     &[lc.n_embd_head_k * n_head_i, lc.n_embd]
-                ));
+                );
                 l.wo_b = opt!(LlmTensor::ATTN_OUT, "bias", bid, &[lc.n_embd]);
 
                 // MoE sub-layer (:172-180)
                 l.attn_post_norm =
-                    Some(req!(LlmTensor::ATTN_POST_NORM, "weight", bid, &[lc.n_embd]));
-                l.ffn_gate_inp = Some(req!(
+                    mreq!(LlmTensor::ATTN_POST_NORM, "weight", bid, &[lc.n_embd]);
+                l.ffn_gate_inp = mreq!(
                     LlmTensor::FFN_GATE_INP,
                     "weight",
                     bid,
                     &[lc.n_embd, lc.n_expert]
-                ));
-                l.ffn_exp_probs_b = Some(req!(
+                );
+                l.ffn_exp_probs_b = mreq!(
                     LlmTensor::FFN_EXP_PROBS_B,
                     "bias",
                     bid,
                     &[lc.n_expert]
-                ));
+                );
                 l.ffn_latent_down = opt!(
                     LlmTensor::FFN_LATENT_DOWN,
                     "weight",
@@ -6654,30 +6679,30 @@ fn load_arch_tensors(
                     bid,
                     &[moe_n_embd, lc.n_embd]
                 );
-                l.ffn_down_exps = Some(req!(
+                l.ffn_down_exps = mreq!(
                     LlmTensor::FFN_DOWN_EXPS,
                     "weight",
                     bid,
                     &[n_ff_exp, moe_n_embd, lc.n_expert]
-                ));
-                l.ffn_up_exps = Some(req!(
+                );
+                l.ffn_up_exps = mreq!(
                     LlmTensor::FFN_UP_EXPS,
                     "weight",
                     bid,
                     &[moe_n_embd, n_ff_exp, lc.n_expert]
-                ));
-                l.ffn_down_shexp = Some(req!(
+                );
+                l.ffn_down_shexp = mreq!(
                     LlmTensor::FFN_DOWN_SHEXP,
                     "weight",
                     bid,
                     &[n_ff_shexp, lc.n_embd]
-                ));
-                l.ffn_up_shexp = Some(req!(
+                );
+                l.ffn_up_shexp = mreq!(
                     LlmTensor::FFN_UP_SHEXP,
                     "weight",
                     bid,
                     &[lc.n_embd, n_ff_shexp]
-                ));
+                );
             }
             (tok_embd, output_norm, None, output.unwrap(), None)
         }

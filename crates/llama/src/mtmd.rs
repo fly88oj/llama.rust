@@ -159,6 +159,8 @@ enum AudioPreproc {
     Qwen3a(crate::mtmd_audio::Qwen3aPreproc),
     /// lfm2a conformer (mtmd.cpp:967-971)
     Conformer(crate::mtmd_audio::ConformerPreproc),
+    /// d1omni_a conformer + 30 s cut / 0.5 s pad (mtmd.cpp:990-993)
+    D1omni(crate::mtmd_audio::D1omniPreproc),
     /// gemma4ua — raw waveform frames (mtmd.cpp:985-990)
     Gemma4ua(crate::mtmd_audio::Gemma4uaPreproc),
     /// granite_speech (mtmd.cpp:977-980)
@@ -182,6 +184,7 @@ impl AudioPreproc {
             AudioPreproc::Whisper(p) => p.hparams().audio_sample_rate,
             AudioPreproc::Qwen3a(p) => p.hparams().audio_sample_rate,
             AudioPreproc::Conformer(p) => p.hparams().audio_sample_rate,
+            AudioPreproc::D1omni(p) => p.hparams().audio_sample_rate,
             AudioPreproc::Gemma4ua(p) => p.hparams().audio_sample_rate,
             AudioPreproc::GraniteSpeech(p) => p.hparams().audio_sample_rate,
             AudioPreproc::Gemma4a(p) => p.hparams().audio_sample_rate,
@@ -198,6 +201,7 @@ impl AudioPreproc {
             AudioPreproc::Whisper(p) => p.initialize(),
             AudioPreproc::Qwen3a(p) => p.initialize(),
             AudioPreproc::Conformer(p) => p.initialize(),
+            AudioPreproc::D1omni(p) => p.initialize(),
             AudioPreproc::Gemma4ua(p) => p.initialize(),
             AudioPreproc::GraniteSpeech(p) => p.initialize(),
             AudioPreproc::Gemma4a(p) => p.initialize(),
@@ -214,6 +218,7 @@ impl AudioPreproc {
             AudioPreproc::Whisper(p) => p.preprocess(samples, output),
             AudioPreproc::Qwen3a(p) => p.preprocess(samples, output),
             AudioPreproc::Conformer(p) => p.preprocess(samples, output),
+            AudioPreproc::D1omni(p) => p.preprocess(samples, output),
             AudioPreproc::Gemma4ua(p) => p.preprocess(samples, output),
             AudioPreproc::GraniteSpeech(p) => p.preprocess(samples, output),
             AudioPreproc::Gemma4a(p) => p.preprocess(samples, output),
@@ -241,6 +246,12 @@ pub struct MtmdContext {
     pub aud_beg: String,
     pub aud_end: String,
     audio_preproc: AudioPreproc,
+    /// mtmd.cpp:513/515 — the token after each slice / after the overview
+    /// (llava-uhd tiling; cohere2v uses <|IMG_LINE_BREAK|> for both,
+    /// mtmd.cpp:805-806). Empty == no marker; a missing vocab piece yields
+    /// the C's LLAMA_TOKEN_NULL (-1) sentinel, like `lookup_token`.
+    pub tok_sli_img_end: Vec<i32>,
+    pub tok_ov_img_end: Vec<i32>,
     out_embd: Vec<f32>,
     /// `ctx_gen_a` (mtmd.cpp:485) — the gen-audio context of a MIXED
     /// audio+gen mmproj. The primary `clip` stays the audio (speaker
@@ -289,6 +300,13 @@ impl MtmdContext {
 
         // mtmd.cpp:696 — the vision markers of this projector family
         let (img_beg, img_end, aud_beg, aud_end, audio_preproc);
+        // mtmd.cpp:508-517 — the llava-uhd tiling markers. Only the two
+        // cohere2v sets are populated (mtmd.cpp:801-810): every tile and the
+        // thumbnail end with <|IMG_LINE_BREAK|>. The remaining marker sets
+        // (ov/slices/slice start, mid-row, row end) stay empty like the C's
+        // defaults for this projector.
+        let mut tok_sli_img_end: Vec<i32> = Vec::new();
+        let mut tok_ov_img_end: Vec<i32> = Vec::new();
         match clip.model.proj_type {
             clip::ProjectorType::Qwen2Vl
             | clip::ProjectorType::Qwen25Vl
@@ -300,6 +318,23 @@ impl MtmdContext {
                 aud_beg = String::new();
                 aud_end = String::new();
                 audio_preproc = AudioPreproc::None;
+                tok_sli_img_end = Vec::new();
+                tok_ov_img_end = Vec::new();
+            }
+            // mtmd.cpp:801-810 — <|START_OF_IMG|> (tile embeddings)
+            // <|IMG_LINE_BREAK|> ... <|END_OF_IMG|>; slices first, then the
+            // thumbnail (ov_img_first = false)
+            clip::ProjectorType::Cohere2V => {
+                img_beg = "<|START_OF_IMG|>".to_string();
+                img_end = "<|END_OF_IMG|>".to_string();
+                aud_beg = String::new();
+                aud_end = String::new();
+                audio_preproc = AudioPreproc::None;
+                let lookup = |text: &str| -> Vec<i32> {
+                    lookup_token(text_model.map(|(v, _, _)| v), text)
+                };
+                tok_sli_img_end = lookup("<|IMG_LINE_BREAK|>");
+                tok_ov_img_end = tok_sli_img_end.clone();
             }
             // mtmd.cpp:623 `init_audio` + :933-963 — every whisper-enc family
             // projector uses the whisper mel preprocessor; only qwen2a,
@@ -394,6 +429,20 @@ impl MtmdContext {
                 aud_beg = String::new();
                 aud_end = String::new();
                 audio_preproc = AudioPreproc::Conformer(preproc);
+            }
+            // mtmd.cpp:990-993 — d1omni_a: the same conformer preprocessing
+            // (30 s cut / 0.5 s pad, mtmd-audio.cpp:998) with bare embeddings
+            clip::ProjectorType::D1OmniA => {
+                eprintln!(
+                    "mtmd_context_init: audio input is in experimental stage and may have reduced quality:\n    https://github.com/ggml-org/llama.cpp/discussions/13759"
+                );
+                let mut preproc = crate::mtmd_audio::D1omniPreproc::new(clip.audio_hparams());
+                preproc.initialize();
+                img_beg = String::new();
+                img_end = String::new();
+                aud_beg = String::new();
+                aud_end = String::new();
+                audio_preproc = AudioPreproc::D1omni(preproc);
             }
             // mtmd.cpp:985-990 — <|audio> ... <audio|>, raw-waveform embedder
             clip::ProjectorType::Gemma4UA => {
@@ -527,6 +576,8 @@ impl MtmdContext {
             aud_beg,
             aud_end,
             audio_preproc,
+            tok_sli_img_end,
+            tok_ov_img_end,
             out_embd: Vec::new(),
             clip_gen,
         })
@@ -739,7 +790,70 @@ impl MtmdContext {
                 bmp.nx, bmp.ny
             ));
         }
-        let entries = self.clip.image_preprocess(bmp)?;
+        let preproc = self.clip.image_preprocess_full(bmp)?;
+
+        // mtmd.cpp:1478 — handle llava-uhd style preprocessing (output either
+        // a grid, or overview-only)
+        let has_tiling_grid = (preproc.grid_x > 0 && preproc.grid_y > 0) || preproc.has_overview();
+        if has_tiling_grid {
+            // mtmd.cpp:1482: no "frame merging" for llava-uhd style — one
+            // bitmap per call, and each tile is its own image chunk
+            // (split_batch_to_chunk, mtmd.cpp:1676-1716)
+            let n_col = preproc.grid_x;
+            let n_row = preproc.grid_y;
+            let overview = preproc.overview.clone().ok_or(
+                "split_batch_to_chunk: invalid overview image for llava-uhd style preprocessing",
+            )?;
+
+            // the tile chunks, row-major (chunks[y * n_col + x], mtmd.cpp:1507)
+            if !preproc.entries.is_empty() {
+                assert_eq!(preproc.entries.len() as i32, n_row * n_col);
+                for y in 0..n_row {
+                    for x in 0..n_col {
+                        let e = &preproc.entries[(y * n_col + x) as usize];
+                        let n_tokens = self.clip.n_output_tokens(e);
+                        assert!(n_tokens > 0);
+                        chunks.push(MtmdChunk::Image(MtmdImageTokens {
+                            nx: n_tokens as u32,
+                            ny: 1,
+                            pos: self.pos_type,
+                            batch_f32: ClipImageF32Batch {
+                                entries: vec![e.clone()],
+                                is_audio: false,
+                            },
+                        }));
+                        // mtmd.cpp:1513 — the marker after every slice
+                        // (tok_sli_img_mid / tok_row_end are empty for cohere2v)
+                        push_text(chunks, self.tok_sli_img_end.clone());
+                    }
+                }
+            }
+
+            // mtmd.cpp:1530-1534 — the overview last (ov_img_first == false)
+            let n_tokens = self.clip.n_output_tokens(&overview);
+            assert!(n_tokens > 0);
+            chunks.push(MtmdChunk::Image(MtmdImageTokens {
+                nx: n_tokens as u32,
+                ny: 1,
+                pos: self.pos_type,
+                batch_f32: ClipImageF32Batch {
+                    entries: vec![overview],
+                    is_audio: false,
+                },
+            }));
+            push_text(chunks, self.tok_ov_img_end.clone());
+
+            // the end marker (mtmd.cpp:1567)
+            let end = vocab.tokenize(&self.img_end.clone(), false, true);
+            push_text(chunks, end);
+            return Ok(());
+        }
+
+        if preproc.entries.is_empty() {
+            // mtmd.cpp:1543: no image tokens produced by preprocessor
+            return Err("no image tokens produced by preprocessor".into());
+        }
+        let entries = preproc.entries;
         let n_tokens = self.clip.n_output_tokens(&entries[0]);
         let (nx, ny) = if self.pos_type == MtmdPosType::Mrope {
             // mtmd.cpp:1507 — M-RoPE needs the grid, others only the count
@@ -805,6 +919,21 @@ fn push_text(chunks: &mut Vec<MtmdChunk>, toks: Vec<i32>) {
         Some(MtmdChunk::Text(t)) => t.extend(toks),
         _ => chunks.push(MtmdChunk::Text(toks)),
     }
+}
+
+/// mtmd.cpp:652 `lookup_token` — the exact-piece scan over the whole vocab
+/// (special form). No vocab / no match returns the C's LLAMA_TOKEN_NULL (-1).
+fn lookup_token(vocab: Option<&Vocab>, token_text: &str) -> Vec<i32> {
+    let Some(vocab) = vocab else {
+        return vec![-1];
+    };
+    let n_vocab = vocab.n_tokens();
+    for i in 0..n_vocab {
+        if vocab.token_to_piece(i as i32) == token_text {
+            return vec![i as i32];
+        }
+    }
+    vec![-1]
 }
 
 // ======================================================================

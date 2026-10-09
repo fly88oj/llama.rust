@@ -13,11 +13,15 @@
 //! the e2e path; the pure-logic pieces (the LRU's touch/evict/fill ordering,
 //! the slot-map gate, the run-merging of the uploads and of
 //! [`sched_copy_experts`]'s used-bitmap walk) are pinned by the unit tests
-//! below. The scheduler wiring needs the copy callback on the *foreign*
-//! scheduler of `ForeignExecutor` (C-side `ggml_backend_sched`); D domain
-//! landed the Rust-side `ggml::backend_sched::backend_sched_set_copy_callback`
-//! (6753a033f) which [`install_copy_callback`] targets — the sysffi binding
-//! for the foreign scheduler is still pending (recorded in the sync report).
+//! below. The scheduler wiring exists on both paths: D domain landed the
+//! Rust-side `ggml::backend_sched::backend_sched_set_copy_callback`
+//! (6753a033f) which [`install_copy_callback`] targets, and the sysffi
+//! binding for the foreign (C) scheduler of `ForeignExecutor` landed with
+//! [`install_copy_callback_foreign`] (batch 3 B-domain handoff) — verified
+//! by the stub round-trip + real-.so registration tests in
+//! crates/ggml/src/backend_emit.rs. The foreign path's MoE-cache slot-map
+//! half stays fall-through (see [`sched_copy_experts_foreign`]'s port note);
+//! GPU e2e is not runnable on this host.
 
 use ggml::backend::{
     backend_buffer_get_size, backend_buffer_get_type, backend_buffer_get_usage,
@@ -916,6 +920,199 @@ pub fn install_copy_callback(
             sched_copy_experts(&moe, backend, ctx, src, dst, graph)
         }),
     );
+}
+
+// ---------------------------------------------------------------------------
+// the foreign (C) scheduler twin — ForeignExecutor's copy callback
+// (sysffi binding of ggml_backend_sched_set_copy_callback, 6753a033f)
+// ---------------------------------------------------------------------------
+
+/// The `copy_experts` state of the foreign path — `llama_context::copy_experts`
+/// (llama-context.cpp:2680-2687) keyed by the C `ggml_tensor *` instead of
+/// the Rust `TensorId`: the foreign callback receives C pointers only.
+pub struct CopyExpertsStateForeign {
+    ids: Option<*const ggml::sysffi::GgmlCTensor>,
+    ids_data: Vec<i32>,
+    used: Vec<bool>,
+}
+
+impl Default for CopyExpertsStateForeign {
+    fn default() -> Self {
+        CopyExpertsStateForeign { ids: None, ids_data: Vec::new(), used: Vec::new() }
+    }
+}
+
+impl CopyExpertsStateForeign {
+    /// `copy_experts.reset()` (llama-context.cpp:2643 + :3800).
+    pub fn reset(&mut self) {
+        self.ids = None;
+        self.ids_data.clear();
+        self.used.clear();
+    }
+}
+
+// the raw C pointers are owned by the foreign executor's loaded ggml; the
+// state only caches what it read back (host `ids_data`), like the C
+unsafe impl Send for CopyExpertsStateForeign {}
+
+/// The per-graph-compute reset handle of [`install_copy_callback_foreign`] —
+/// the engine must call [`ForeignCopyExpertsReset::reset`] before every
+/// `ForeignExecutor::graph_compute`, exactly where the C resets
+/// `lctx->copy_experts` (llama-context.cpp:2643).
+pub struct ForeignCopyExpertsReset(std::sync::Arc<std::sync::Mutex<CopyExpertsStateForeign>>);
+
+impl ForeignCopyExpertsReset {
+    pub fn reset(&self) {
+        self.0.lock().unwrap().reset();
+    }
+}
+
+/// The foreign-scheduler twin of [`install_copy_callback`]: installs the
+/// port's [`sched_copy_experts_foreign`] on the *C* scheduler of the
+/// ForeignExecutor through the sysffi `ggml_backend_sched_set_copy_callback`
+/// binding (batch 3 B-domain handoff). Fails when the loaded ggml predates
+/// the symbol (the pinned build — see
+/// `ForeignExecutor::sched_set_copy_callback`).
+///
+/// The returned reset handle must be driven before every graph compute
+/// (see [`ForeignCopyExpertsReset`]) — the calling side owns that step.
+pub fn install_copy_callback_foreign(
+    exec: &mut ggml::backend_emit::ForeignExecutor,
+    moe_cache: Option<std::sync::Arc<std::sync::Mutex<MoeCache>>>,
+) -> Result<ForeignCopyExpertsReset, String> {
+    let syms = exec.syms_copy();
+    let st = std::sync::Arc::new(std::sync::Mutex::new(CopyExpertsStateForeign::default()));
+    let st_cb = st.clone();
+    exec.sched_set_copy_callback(Box::new(move |backend, src, dst, graph| {
+        let mut st = st_cb.lock().unwrap();
+        sched_copy_experts_foreign(&syms, &moe_cache, &mut st, backend, src, dst, graph)
+    }))?;
+    Ok(ForeignCopyExpertsReset(st))
+}
+
+/// `llama_context::sched_copy_experts` (llama-context.cpp:2655-2737,
+/// d6cf9acb2) — the foreign-scheduler twin of [`sched_copy_experts`]: the
+/// same callback body over the raw C ABI (`CLibSyms` instead of the Rust
+/// backend layer, C `ggml_tensor *` instead of `TensorId`).
+///
+/// Honest port note (no GPU on this host): the MoE-cache slot-map half of
+/// the C (`lctx->moe_cache->copy(backend, src, dst, graph)`, :2658-2661)
+/// returns false here — the Rust `MoeCache`'s device banks live in the Rust
+/// backend layer (its constructor requires a GPU `BackendRef`), so on the
+/// foreign path the slot maps fall through to the scheduler's whole-tensor
+/// copy (the C's behavior with the cache disabled — data-correct, just not
+/// cached). Wiring the slot-map half needs the MoE banks constructed in C
+/// memory, which is GPU-enablement follow-up work; the expert-id selective
+/// upload half below is the complete 1:1.
+#[allow(clippy::too_many_arguments)]
+pub fn sched_copy_experts_foreign(
+    syms: &ggml::sysffi::CLibSyms,
+    moe_cache: &Option<std::sync::Arc<std::sync::Mutex<MoeCache>>>,
+    st: &mut CopyExpertsStateForeign,
+    backend: *mut ggml::sysffi::GgmlBackendT,
+    src: *const ggml::sysffi::GgmlCTensor,
+    dst: *mut ggml::sysffi::GgmlCTensor,
+    graph: *mut ggml::sysffi::GgmlCgraph,
+) -> bool {
+    let _ = moe_cache; // slot-map half: see the port note above — always falls through
+
+    unsafe {
+        // the ids must be computed before the split starts, so only the
+        // first node of the split is considered (:2667-2675)
+        if (syms.ggml_graph_n_nodes)(graph) == 0 {
+            return false;
+        }
+        let node = (syms.ggml_graph_node)(graph, 0);
+        if (*node).op != ggml::sysffi::op::MUL_MAT_ID || (*node).src[0] != dst {
+            return false;
+        }
+
+        let ids = (*node).src[2];
+        // ggml_nelements (ggml.c:1432) for the ids view
+        let nelem = |t: *const ggml::sysffi::GgmlCTensor| -> i64 {
+            let t = &*t;
+            t.ne[0] * t.ne[1].max(1) * t.ne[2].max(1) * t.ne[3].max(1)
+        };
+        if nelem(ids) == 0 {
+            return true;
+        }
+
+        let n_expert = (*src).ne[2];
+        let expert_size = (*src).nb[2];
+
+        if st.ids != Some(ids) || st.used.len() != n_expert as usize {
+            // ggml_nbytes (ggml.c:1447)
+            let ids_bytes = |t: *const ggml::sysffi::GgmlCTensor| -> usize {
+                let t = &*t;
+                (t.nb[0] * t.ne[0].max(1) as usize).max(t.nb[1] * t.ne[1].max(1) as usize)
+                    .max(t.nb[2] * t.ne[2].max(1) as usize)
+                    .max(t.nb[3] * t.ne[3].max(1) as usize)
+            };
+            let nbytes = ids_bytes(ids);
+            st.ids_data.resize(nbytes / 4, 0);
+            (syms.ggml_backend_tensor_get_async)(
+                backend,
+                ids,
+                st.ids_data.as_mut_ptr() as *mut std::ffi::c_void,
+                0,
+                nbytes,
+            );
+            (syms.ggml_backend_synchronize)(backend);
+
+            st.used.clear();
+            st.used.resize(n_expert as usize, false);
+            for i1 in 0..(*ids).ne[1] {
+                for i0 in 0..(*ids).ne[0] {
+                    let idx = ((*ids).nb[1] / 4 * i1 as usize) + (*ids).nb[0] / 4 * i0 as usize;
+                    let id = st.ids_data[idx] as usize;
+                    assert!(id < n_expert as usize, "expert id out of range");
+                    st.used[id] = true;
+                }
+            }
+
+            st.ids = Some(ids);
+        }
+
+        // group consecutive experts and copy them together (:2706-2713)
+        let mut first: i64 = 0;
+        while first < n_expert {
+            if !st.used[first as usize] {
+                first += 1;
+                continue;
+            }
+            let mut last = first;
+            while last + 1 < n_expert && st.used[(last + 1) as usize] {
+                last += 1;
+            }
+
+            // the experts in the MoE cache are copied from device memory,
+            // the others are uploaded (:2716-2724) — on the foreign path the
+            // cache half is not wired (see the port note), so every expert
+            // of the run uploads, which is the C's `next` at its floor
+            let next = first;
+
+            // copy a bit extra to ensure there are no NaNs in the padding of
+            // the last expert — MMQ in the CUDA backend reads it
+            // (:2726-2734)
+            let offset = next as usize * expert_size;
+            let padding = if last < n_expert - 1 { expert_size.min(512) } else { 0 };
+            let size = (last + 1 - next) as usize * expert_size + padding;
+            if size > 0 {
+                let base = (*src).data as *const u8;
+                (syms.ggml_backend_tensor_set_async)(
+                    backend,
+                    dst,
+                    base.add(offset) as *const std::ffi::c_void,
+                    offset,
+                    size,
+                );
+            }
+
+            first = last + 1;
+        }
+
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------

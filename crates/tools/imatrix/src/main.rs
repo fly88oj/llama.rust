@@ -279,10 +279,64 @@ fn build_attn(hp: &llama::hparams::LlamaHparams, flash_attn: bool) -> AttnParams
     }
 }
 
+/// `qwen35_weights` (the llama-server/llama-bench dispatch's copy, weights.rs
+/// :604-644 — qwen35.cpp:31-153): the trunk slice of the layer table;
+/// attention layers carry separate q/k/v + q/k norms, recurrent (gated
+/// delta net) layers the fused wqkv + ssm tensors.
+fn qwen35_trunk_weights(m: &llama::model::LlamaModel, attn: AttnParams) -> ForwardWeights {
+    let hp = &m.hparams;
+    let n_trunk = hp.n_layer() as usize;
+    ForwardWeights::Qwen35(
+        llama::graph_arch::Qwen35ModelWeights {
+            tok_embd: m.tok_embd,
+            output_norm: m.output_norm,
+            output: m.output,
+            cls_out: m.cls_out,
+            cls_out_b: m.cls_out_b,
+            layers: m.layers[..n_trunk]
+                .iter()
+                .enumerate()
+                .map(|(il, l)| qwen35_layer_of_trunk(il, l))
+                .collect(),
+        },
+        qwen35_params_of(m, attn),
+    )
+}
+
+/// the trunk twin of [`qwen35_layer_of`] — the required-tensor panics of the
+/// server's copy (a trunk file must carry its layers).
+fn qwen35_layer_of_trunk(il: usize, l: &llama::model::LayerTensors) -> llama::graph_arch::Qwen35LayerWeights {
+    llama::graph_arch::Qwen35LayerWeights {
+        attn_norm: l.attn_norm.unwrap_or_else(|| panic!("layer {il}: attn_norm")),
+        attn_post_norm: l
+            .attn_post_norm
+            .unwrap_or_else(|| panic!("layer {il}: attn_post_norm")),
+        wq: l.wq,
+        wk: l.wk,
+        wv: l.wv,
+        wo: l.wo,
+        attn_q_norm: l.attn_q_norm,
+        attn_k_norm: l.attn_k_norm,
+        wqkv: l.wqkv,
+        wqkv_gate: l.wqkv_gate,
+        ssm_conv1d: l.ssm_conv1d,
+        ssm_dt_b: l.ssm_dt_b,
+        ssm_a: l.ssm_a,
+        ssm_beta: l.ssm_beta,
+        ssm_alpha: l.ssm_alpha,
+        ssm_norm: l.ssm_norm,
+        ssm_out: l.ssm_out,
+        ffn_gate: l.ffn_gate.unwrap_or_else(|| panic!("layer {il}: ffn_gate")),
+        ffn_up: l.ffn_up.unwrap_or_else(|| panic!("layer {il}: ffn_up")),
+        ffn_down: l.ffn_down.unwrap_or_else(|| panic!("layer {il}: ffn_down")),
+    }
+}
+
 /// Arch dispatch (same supported set as llama-perplexity / llama-cli's qwen2,
-/// llama, phi3, gemma2/3 arms).
+/// llama, phi3, gemma2/3 arms + the qwen35 trunk the NextN collection needs).
 fn build_weights(model: &llama::model::LlamaModel, attn: AttnParams) -> ForwardWeights {
     match model.arch {
+        LlmArch::QWEN35 => qwen35_trunk_weights(model, attn),
         LlmArch::QWEN2 => {
             let layers: Vec<LayerWeights> = model
                 .layers
@@ -617,8 +671,23 @@ struct NextnCollector {
 
 impl NextnCollector {
     /// `nextn_collector_init` (imatrix.cpp:1411-1425): an
-    /// `LLAMA_CONTEXT_TYPE_MTP` context (`n_rs_seq = 0`) over the model.
-    fn init(model: &mut llama::model::LlamaModel, n_threads: usize, n_ubatch: usize, n_ctx: u32, flash_attn: bool) -> Result<Self, String> {
+    /// `LLAMA_CONTEXT_TYPE_MTP` context (`n_rs_seq = 0`, common.cpp:1216)
+    /// over the model — the draft file for `-md`, the trunk's own nextn
+    /// block for `--nextn`. `draft_side` switches the `weights` bundle to a
+    /// sizing-only stub: an MTP-only draft has no trunk tensors, and
+    /// `DecodeContext::new_mtp` never dispatches `weights` (the MTP branch
+    /// of forward returns first — the `new_eagle3` weights_stub precedent,
+    /// context.rs:3158-3166); it only reads `output` (the logits buffer's
+    /// n_vocab) and `n_layer()` (the layer-input tap count, unused on an MTP
+    /// context).
+    fn init(
+        model: &mut llama::model::LlamaModel,
+        n_threads: usize,
+        n_ubatch: usize,
+        n_ctx: u32,
+        flash_attn: bool,
+        draft_side: bool,
+    ) -> Result<Self, String> {
         let facts = mtp_head_facts(&model.hparams);
         let attn = build_attn(&model.hparams, flash_attn);
         let mtp = llama::context::MtpForward::Qwen35(
@@ -627,7 +696,21 @@ impl NextnCollector {
             facts,
         );
         let own_lm_head = mtp_head_own_lm_head(model);
-        let weights = build_weights(model, attn);
+        let weights = if draft_side {
+            ForwardWeights::Qwen35(
+                llama::graph_arch::Qwen35ModelWeights {
+                    tok_embd: model.tok_embd,
+                    output_norm: model.output_norm,
+                    output: model.output,
+                    cls_out: None,
+                    cls_out_b: None,
+                    layers: Vec::new(),
+                },
+                qwen35_params_of(model, attn),
+            )
+        } else {
+            build_weights(model, attn)
+        };
         let n_embd = model.hparams.n_embd_out() as usize;
         let gctx = std::mem::replace(&mut model.ctx, ggml::Context::new());
         let ctx = DecodeContext::new_mtp(
@@ -1261,6 +1344,9 @@ fn main() -> ExitCode {
     };
 
     let attn = build_attn(&model.hparams, args.flash_attn.on());
+    // cached before `model.ctx` moves into the trunk DecodeContext (the
+    // `--nextn` arm's own_lm_head probe, imatrix.cpp:2020)
+    let trunk_own_lm_head = mtp_head_own_lm_head(&model);
     let weights = build_weights(&model, attn);
     let mut dctx = DecodeContext::new_with(
         model.ctx,
@@ -1274,31 +1360,109 @@ fn main() -> ExitCode {
     // ---- the NextN collector (imatrix.cpp:1983-2038, upstream a7b94df2c) ----
     let mut nextn: Option<NextnCollector> = None;
     if load_mtp {
-        // `llama_model_n_layer_nextn(model_src)` — the trunk model (the `-md`
-        // arm of the reference constructs the context over the *draft* file;
-        // the port's imatrix tool has no mtp-only draft trunk-weight stub
-        // yet, so `-md` stops at the validated gate below)
-        if use_draft {
-            eprintln!(
-                "main: -md/--model-draft: the imatrix tool's draft-side NextN context is not \
-                 ported (only the trunk's own --nextn block); see PARITY.md"
-            );
-            return ExitCode::from(1);
-        }
-        let n_heads = model.hparams.n_layer_nextn;
-        let n_trunk_src = model.hparams.n_layer();
+        // `model_src = use_draft ? model_draft : model` (imatrix.cpp:1998):
+        // the `-md` arm loads the draft file with `load_mtp = true`
+        // (imatrix.cpp:1969-1972, `mparams_sidecar.load_mtp = true`) and
+        // constructs the collector's MTP context over *it*; the `--nextn`
+        // arm reuses the trunk's own nextn block.
+        let mut model_src: Option<llama::model::LlamaModel> = None;
+        let (n_heads, n_trunk_src, own_lm_head) = if use_draft {
+            let path_md = args.model_draft.clone().unwrap();
+            let gguf_md = match Gguf::open(&path_md) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("main: unable to load draft '{path_md}': {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            let mmap_md: Arc<memmap2::Mmap> = {
+                let Ok(f) = std::fs::File::open(&path_md) else {
+                    eprintln!("main: failed to open '{path_md}'");
+                    return ExitCode::from(1);
+                };
+                // SAFETY: read-only usage of a model file
+                Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() })
+            };
+            let mut md = match load_model(&gguf_md, mmap_md) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("main: failed to load the draft model '{path_md}': {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            // `common_speculative_are_compatible(model, model_draft)`
+            // (imatrix.cpp:1982-1987): the trunk/draft vocabularies must
+            // line up — the port checks the token counts and the type
+            {
+                let v_md = match Vocab::load(&gguf_md) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        eprintln!("main: failed to load the draft vocabulary: {e}");
+                        return ExitCode::from(1);
+                    }
+                };
+                if v_md.n_tokens() != vocab.n_tokens() {
+                    eprintln!("main: the target and draft vocab are not compatible");
+                    return ExitCode::from(1);
+                }
+            }
+            // `nextn_read_model_info(path_md, n_trunk, n_heads)`
+            // (imatrix.cpp:1256-1280): own_lm_head = the file carries
+            // `blk.<n_trunk>.nextn.shared_head_head.weight`
+            let n_heads = md.hparams.n_layer_nextn;
+            let n_trunk = md.hparams.n_layer();
+            let own = md
+                .layers
+                .get(n_trunk as usize)
+                .map(|l| l.nextn.shared_head_head.is_some())
+                .unwrap_or(false);
+            let r = (n_heads, n_trunk, own);
+            model_src = Some(md);
+            r
+        } else {
+            let n_heads = model.hparams.n_layer_nextn;
+            let n_trunk = model.hparams.n_layer();
+            (n_heads, n_trunk, trunk_own_lm_head)
+        };
         let n_trunk = model.hparams.n_layer();
 
         if n_heads == 0 {
-            eprintln!("main: the model has no NextN layers, '--nextn' has no effect");
+            eprintln!(
+                "main: the model has no NextN layers, '{}' has no effect",
+                if use_draft { "-md" } else { "--nextn" }
+            );
         } else if n_trunk_src == 0 {
             eprintln!("main: NextN layers sharing the trunk's KV cache are not supported");
             return ExitCode::from(1);
         } else if n_heads > 1 {
             eprintln!("main: multi-layer NextN drafts are not supported (found {n_heads})");
             return ExitCode::from(1);
-        } else if model.layers.get(n_trunk as usize).map(|l| l.nextn.eh_proj.is_none()).unwrap_or(true) {
-            eprintln!("main: no NextN tensor in '{model_path}', '--nextn' has no effect");
+        } else if !(if use_draft {
+            // `!info.has_layers` (imatrix.cpp:2030-2031) — probed on the
+            // *source* file, i.e. the draft when `-md`
+            model_src
+                .as_ref()
+                .unwrap()
+                .layers
+                .get(n_trunk_src as usize)
+                .map(|l| l.nextn.eh_proj.is_some())
+                .unwrap_or(false)
+        } else {
+            model
+                .layers
+                .get(n_trunk as usize)
+                .map(|l| l.nextn.eh_proj.is_some())
+                .unwrap_or(false)
+        }) {
+            let path_src = if use_draft {
+                args.model_draft.clone().unwrap()
+            } else {
+                model_path.clone()
+            };
+            eprintln!(
+                "main: no NextN tensor in '{path_src}', '{}' has no effect",
+                if use_draft { "-md" } else { "--nextn" }
+            );
         } else if !matches!(model.arch, LlmArch::QWEN35) {
             eprintln!(
                 "main: '--nextn' collection for arch {} is not ported in the imatrix tool yet \
@@ -1307,30 +1471,45 @@ fn main() -> ExitCode {
             );
             return ExitCode::from(1);
         } else {
-            // a second LlamaModel: the port cannot host two DecodeContexts
-            // over one ggml Context, and the trunk ctx took `model.ctx`
-            let gguf2 = match Gguf::open(&model_path) {
-                Ok(g) => g,
-                Err(e) => {
-                    eprintln!("main: unable to reload model '{model_path}': {e}");
-                    return ExitCode::from(1);
+            // `nextn_collector_init(model_src, ...)` (imatrix.cpp:1411-1425):
+            // the MTP context over the source model — the draft for `-md`,
+            // a fresh reload of the trunk file for `--nextn` (the port
+            // cannot host two DecodeContexts over one ggml Context, and the
+            // trunk ctx took `model.ctx`)
+            let mut model_mtp = match model_src.take() {
+                Some(md) => md,
+                None => {
+                    let gguf2 = match Gguf::open(&model_path) {
+                        Ok(g) => g,
+                        Err(e) => {
+                            eprintln!("main: unable to reload model '{model_path}': {e}");
+                            return ExitCode::from(1);
+                        }
+                    };
+                    let mmap2: Arc<memmap2::Mmap> = {
+                        let Ok(f) = std::fs::File::open(&model_path) else {
+                            eprintln!("main: failed to open '{model_path}'");
+                            return ExitCode::from(1);
+                        };
+                        Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() })
+                    };
+                    match load_model(&gguf2, mmap2) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            eprintln!("main: failed to reload model: {e}");
+                            return ExitCode::from(1);
+                        }
+                    }
                 }
             };
-            let mmap2: Arc<memmap2::Mmap> = {
-                let Ok(f) = std::fs::File::open(&model_path) else {
-                    eprintln!("main: failed to open '{model_path}'");
-                    return ExitCode::from(1);
-                };
-                Arc::new(unsafe { memmap2::Mmap::map(&f).unwrap() })
-            };
-            let mut model2 = match load_model(&gguf2, mmap2) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("main: failed to reload model: {e}");
-                    return ExitCode::from(1);
-                }
-            };
-            match NextnCollector::init(&mut model2, n_threads, n_batch as usize, n_kv as u32, args.flash_attn.on()) {
+            match NextnCollector::init(
+                &mut model_mtp,
+                n_threads,
+                n_batch as usize,
+                n_kv as u32,
+                args.flash_attn.on(),
+                use_draft,
+            ) {
                 Ok(nc) => nextn = Some(nc),
                 Err(e) => {
                     eprintln!("main: {e}");

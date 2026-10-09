@@ -2392,6 +2392,42 @@ fn run_speculative(
             (llama::context::ForwardWeights::Step35(_, p), _) => {
                 llama::context::MtpForward::Step35(step35_mtp_weights(&model_dft), p.clone(), facts)
             }
+            // b9acf138a — glm5-next's graph_mtp (the DSA+kpool NextN block);
+            // the MTP layer's is_recr slot is absent from the trunk-length
+            // vector, so the layer carries no hc mixers and no KDA set (the
+            // nextn block is always a DSA layer, glm5-next.cpp:1059)
+            (llama::context::ForwardWeights::Glm5Next(_, p), _) => {
+                llama::context::MtpForward::Glm5Next(glm5_next_mtp_weights(&model_dft), p.clone())
+            }
+            // batch 42f — qwen4exp's graph_mtp (the hc-wide eh_proj + one
+            // QSA/dense attention round + the nextn hc head mixer); the
+            // params clone extends the per-layer vectors past n_layer with
+            // the MTP layer's own facts (the bailingmoe3 precedent)
+            (llama::context::ForwardWeights::Qwen4Exp(_, p), _) => {
+                let il = model_dft.hparams.n_layer() as usize;
+                let hp = &model_dft.hparams;
+                let mut p = p.clone();
+                p.n_head.push(hp.n_head(il));
+                p.n_head_kv.push(hp.n_head_kv(il));
+                p.n_embd_head_k.push(hp.n_embd_head_k(il));
+                p.n_embd_head_v.push(hp.n_embd_head_v(il));
+                p.n_rot.push(hp.n_rot(il));
+                p.is_recr.push(hp.is_recr(il));
+                p.is_ple.push(hp.is_ple(il));
+                // the one shared compress ratio (qwen4exp.cpp:64-72) — the
+                // MTP layer's own entry when the array covers n_layer_all
+                p.compress_ratios.push(
+                    hp.dsv4_compress_ratios
+                        .get(il)
+                        .copied()
+                        .unwrap_or(if hp.indexer_kpool > 0 {
+                            hp.indexer_kpool
+                        } else {
+                            0
+                        }),
+                );
+                llama::context::MtpForward::Qwen4Exp(qwen4exp_mtp_weights(&model_dft), p)
+            }
             (_, arch) => {
                 eprintln!(
                     "draft-mtp: arch {} has no ported MTP graph (see PARITY.md)",
@@ -4878,6 +4914,70 @@ fn mtp_nextn_of(l: &llama::model::LayerTensors) -> graph_arch::DeepseekMtpNextn 
         embed_tokens: n.embed_tokens,
         shared_head_head: n.shared_head_head,
         shared_head_norm: n.shared_head_norm,
+    }
+}
+
+/// glm5-next's MTP block (b9acf138a, glm5-next.cpp:543-666) — the nextn trio
+/// plus the MTP layer `model.layers[n_layer]`'s trunk-shaped DSA block
+fn glm5_next_mtp_weights(m: &LlamaModel) -> graph_arch::Glm5NextMtpWeights {
+    let il = m.hparams.n_layer() as usize;
+    let l = &m.layers[il];
+    graph_arch::Glm5NextMtpWeights {
+        tok_embd: m.tok_embd,
+        output_norm: m.output_norm,
+        output: m.output,
+        nextn: mtp_nextn_of(&m.layers[il]),
+        layer: graph_arch::Glm5NextLayerWeights {
+            attn_norm: l.attn_norm.unwrap_or_else(|| panic!("mtp layer {il}: attn_norm")),
+            ffn_norm: l.ffn_norm.unwrap_or_else(|| panic!("mtp layer {il}: ffn_norm")),
+            hc_attn_fn: None,
+            hc_attn_base: None,
+            hc_attn_scale: None,
+            hc_ffn_fn: None,
+            hc_ffn_base: None,
+            hc_ffn_scale: None,
+            ssm_q_conv: None,
+            ssm_k_conv: None,
+            ssm_v_conv: None,
+            wq: None,
+            wk: None,
+            wv: None,
+            wqkv: None,
+            ssm_f_a: None,
+            ssm_f_b: None,
+            ssm_beta: None,
+            ssm_a: None,
+            ssm_dt_b: None,
+            ssm_g_a: None,
+            ssm_g_b: None,
+            ssm_o_norm: None,
+            wo: l.wo,
+            attn_q_a_norm: l.attn_q_a_norm,
+            attn_kv_a_norm: l.attn_kv_a_norm,
+            wq_a: l.wq_a,
+            wq_b: l.wq_b,
+            wkv_a_mqa: l.wkv_a_mqa,
+            wk_b: l.wk_b,
+            wv_b: l.wv_b,
+            indexer_k_norm: l.indexer_k_norm,
+            indexer_k_norm_b: l.indexer_k_norm_b,
+            indexer_proj: l.indexer_proj,
+            indexer_attn_k: l.indexer_attn_k,
+            indexer_attn_q_b: l.indexer_attn_q_b,
+            indexer_kpool_gate: l.indexer_kpool_gate,
+            indexer_kpool_ape: l.indexer_kpool_ape,
+            ffn_gate: l.ffn_gate,
+            ffn_down: l.ffn_down,
+            ffn_up: l.ffn_up,
+            ffn_gate_inp: l.ffn_gate_inp,
+            ffn_exp_probs_b: l.ffn_exp_probs_b,
+            ffn_gate_exps: l.ffn_gate_exps,
+            ffn_down_exps: l.ffn_down_exps,
+            ffn_up_exps: l.ffn_up_exps,
+            ffn_gate_shexp: l.ffn_gate_shexp,
+            ffn_down_shexp: l.ffn_down_shexp,
+            ffn_up_shexp: l.ffn_up_shexp,
+        },
     }
 }
 
@@ -8148,8 +8248,74 @@ fn minimax_m3_params(hp: &LlamaHparams, _n_layer: usize, attn: AttnParams) -> gr
 }
 
 /// qwen4exp.cpp:150-259 — the HC mixers + the GDN/gated-attention layers.
-fn qwen4exp_weights(m: &LlamaModel, n_trunk: usize) -> graph_arch::Qwen4ExpModelWeights {
-    graph_arch::Qwen4ExpModelWeights {
+/// qwen4exp's MTP block (qwen4exp.cpp:526-612) — the nextn trio + the
+/// nextn hc head mixer + the MTP layer's trunk-shaped set
+fn qwen4exp_mtp_weights(m: &LlamaModel) -> graph_arch::Qwen4ExpMtpWeights {
+    let il = m.hparams.n_layer() as usize;
+    let l = &m.layers[il];
+    graph_arch::Qwen4ExpMtpWeights {
+        tok_embd: m.tok_embd,
+        output: m.output,
+        nextn_eh_proj: l.nextn.eh_proj.expect("mtp nextn.eh_proj"),
+        nextn_enorm: l.nextn.enorm.expect("mtp nextn.enorm"),
+        nextn_hnorm: l.nextn.hnorm.expect("mtp nextn.hnorm"),
+        nextn_hc_head_norm: l.nextn.hc_head_norm.expect("mtp nextn hc_head_norm"),
+        nextn_hc_head_down: l.nextn.hc_head_down.expect("mtp nextn hc_head_down"),
+        nextn_hc_head_up: l.nextn.hc_head_up.expect("mtp nextn hc_head_up"),
+        layer: graph_arch::Qwen4ExpLayerWeights {
+            hc_attn_norm: l.hc_attn_norm.unwrap_or_else(|| panic!("mtp layer {il}: hc_attn_norm")),
+            hc_attn_down: l.hc_attn_down.unwrap_or_else(|| panic!("mtp layer {il}: hc_attn_down")),
+            hc_attn_up: l.hc_attn_up.unwrap_or_else(|| panic!("mtp layer {il}: hc_attn_up")),
+            hc_attn_inject: l
+                .hc_attn_inject
+                .unwrap_or_else(|| panic!("mtp layer {il}: hc_attn_inject")),
+            hc_ffn_norm: l.hc_ffn_norm.unwrap_or_else(|| panic!("mtp layer {il}: hc_ffn_norm")),
+            hc_ffn_down: l.hc_ffn_down.unwrap_or_else(|| panic!("mtp layer {il}: hc_ffn_down")),
+            hc_ffn_up: l.hc_ffn_up.unwrap_or_else(|| panic!("mtp layer {il}: hc_ffn_up")),
+            hc_ffn_inject: l
+                .hc_ffn_inject
+                .unwrap_or_else(|| panic!("mtp layer {il}: hc_ffn_inject")),
+            wq: l.wq,
+            wk: l.wk,
+            wv: l.wv,
+            wo: l.wo,
+            attn_q_norm: l.attn_q_norm,
+            attn_k_norm: l.attn_k_norm,
+            index_q_proj: l.index_q_proj,
+            index_k_proj: l.index_k_proj,
+            index_q_norm: l.index_q_norm,
+            index_k_norm: l.index_k_norm,
+            ple_key: l.ple_key,
+            ple_value: l.ple_value,
+            ple_norm_key: l.ple_norm_key,
+            ple_norm_query: l.ple_norm_query,
+            ple_norm_conv: l.ple_norm_conv,
+            ple_conv1d: l.ple_conv1d,
+            wqkv: l.wqkv,
+            wqkv_gate: l.wqkv_gate,
+            ssm_conv1d: l.ssm_conv1d,
+            ssm_dt_b: l.ssm_dt_b,
+            ssm_a: l.ssm_a,
+            ssm_beta: l.ssm_beta,
+            ssm_alpha: l.ssm_alpha,
+            ssm_norm: l.ssm_norm,
+            ssm_out: l.ssm_out,
+            ffn_gate_inp: l.ffn_gate_inp.unwrap_or_else(|| panic!("mtp layer {il}: ffn_gate_inp")),
+            ffn_gate_up_exps: l.ffn_gate_up_exps,
+            ffn_gate_exps: l.ffn_gate_exps,
+            ffn_up_exps: l.ffn_up_exps,
+            ffn_down_exps: l
+                .ffn_down_exps
+                .unwrap_or_else(|| panic!("mtp layer {il}: ffn_down_exps")),
+            ffn_gate_inp_shexp: l.ffn_gate_inp_shexp,
+            ffn_gate_shexp: l.ffn_gate_shexp,
+            ffn_up_shexp: l.ffn_up_shexp,
+            ffn_down_shexp: l.ffn_down_shexp,
+        },
+    }
+}
+
+fn qwen4exp_weights(m: &LlamaModel, n_trunk: usize) -> graph_arch::Qwen4ExpModelWeights {    graph_arch::Qwen4ExpModelWeights {
         tok_embd: m.tok_embd,
         hc_head_norm: m.hc_head_norm.unwrap_or_else(|| panic!("hc_head_norm")),
         hc_head_down: m.hc_head_down.unwrap_or_else(|| panic!("hc_head_down")),

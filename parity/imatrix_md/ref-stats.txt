@@ -1,0 +1,37 @@
+
+Computing tensor statistics for /tmp/closx-md/ref-md.gguf (23 tensors)
+
+ Layer | Tensor                                   |       Mean    StdDev        Skew        Kurt   H Norm |        ∑ E[A²]    Gain |      L2 Dist       PCC       Cov
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+     0 | blk.0.attn_gate.weight                   |    -0.0096    0.1392      1.0323      6.0446   89.82% |        39.7895     nan |          nan       nan       nan
+     0 | blk.0.attn_qkv.weight                    |    -0.0096    0.1392      1.0323      6.0446   89.82% |        39.7895     nan |          nan       nan       nan
+     0 | blk.0.ffn_down.weight                    |     0.0014    0.0149     -0.9812      4.6259   93.43% |         0.1855     nan |          nan       nan       nan
+     0 | blk.0.ffn_gate.weight                    |     0.0038    0.1224     -0.0464      1.9005   90.52% |        38.6357     nan |          nan       nan       nan
+     0 | blk.0.ffn_up.weight                      |     0.0038    0.1224     -0.0464      1.9005   90.52% |        38.6357     nan |          nan       nan       nan
+     0 | blk.0.ssm_alpha.weight                   |    -0.0096    0.1392      1.0323      6.0446   89.82% |        39.7895     nan |          nan       nan       nan
+     0 | blk.0.ssm_beta.weight                    |    -0.0096    0.1392      1.0323      6.0446   89.82% |        39.7895     nan |          nan       nan       nan
+     0 | blk.0.ssm_out.weight                     |    -0.0023    0.0114     -0.0990      0.3214   88.53% |         0.1123     nan |          nan       nan       nan
+     1 | blk.1.attn_k.weight                      |     0.0056    0.1506      0.2708      1.2995   91.89% |        47.9216     nan |          nan       nan       nan
+     1 | blk.1.attn_output.weight                 |    -0.0056    0.0505      0.0185     -0.5447   92.41% |         0.5089     nan |          nan       nan       nan
+     1 | blk.1.attn_q.weight                      |     0.0056    0.1506      0.2708      1.2995   91.89% |        47.9216     nan |          nan       nan       nan
+     1 | blk.1.attn_v.weight                      |     0.0056    0.1506      0.2708      1.2995   91.89% |        47.9216     nan |          nan       nan       nan
+     1 | blk.1.ffn_down.weight                    |    -0.0037    0.0205     -1.2255      4.4267   89.55% |         0.2474    1.15 |       0.2211   -0.1610   -0.0000
+     1 | blk.1.ffn_gate.weight                    |     0.0150    0.2746     -0.1631      0.7896   90.44% |        43.9986    1.07 |       3.4867   -0.0664   -0.0022
+     1 | blk.1.ffn_up.weight                      |     0.0150    0.2746     -0.1631      0.7896   90.44% |        43.9986    1.07 |       3.4867   -0.0664   -0.0022
+  mtp0 | blk.2.attn_k.weight                      |    -0.0132    0.2245     -0.1925      0.6375   90.76% |        43.4729     nan |          nan       nan       nan
+  mtp0 | blk.2.attn_output.weight                 |     0.0012    0.0800     -0.0021      0.2990   87.74% |         0.9702     nan |          nan       nan       nan
+  mtp0 | blk.2.attn_q.weight                      |    -0.0132    0.2245     -0.1925      0.6375   90.76% |        43.4729     nan |          nan       nan       nan
+  mtp0 | blk.2.attn_v.weight                      |    -0.0132    0.2245     -0.1925      0.6375   90.76% |        43.4729     nan |          nan       nan       nan
+  mtp0 | blk.2.ffn_down.weight                    |     0.0023    0.0181      1.1465      2.2845   93.61% |         0.2252     nan |          nan       nan       nan
+  mtp0 | blk.2.ffn_gate.weight                    |    -0.0326    0.2510     -0.1729      2.7170   89.88% |        44.7360     nan |          nan       nan       nan
+  mtp0 | blk.2.ffn_up.weight                      |    -0.0326    0.2510     -0.1729      2.7170   89.88% |        44.7360     nan |          nan       nan       nan
+  mtp0 | blk.2.nextn.eh_proj.weight               |    -0.0096    0.2275     -1.0471      6.6076   87.23% |        82.9814     nan |          nan       nan       nan
+
+Computing layer statistics for /tmp/closx-md/ref-md.gguf (3 layers)
+
+ Layer |        ∑ E[A²]    Gain |      L2 Dist   CosSim      PCC         Cov
+----------------------------------------------------------------------------
+     0 |       236.7273     nan |          nan      nan      nan         nan
+     1 |       232.5183    1.07 |       4.9359  -0.0648  -0.0666     -0.0018
+  mtp0 |       304.0674     nan |          nan      nan      nan         nan
+

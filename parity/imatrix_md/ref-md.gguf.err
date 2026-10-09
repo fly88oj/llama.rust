@@ -1,0 +1,13 @@
+0.00.067.993 W llama_context: n_ctx_seq (256) > n_ctx_train (64) -- possible training context overflow
+0.00.068.513 I cmn          init: llama threadpool init, n_threads = 4
+0.00.090.175 W llama_context: n_ctx_seq (256) > n_ctx_train (64) -- possible training context overflow
+0.00.090.491 I main: processing 1 NextN layer(s) from block 2
+0.00.090.493 I 
+0.00.090.560 I system_info: n_threads = 4 (n_threads_batch = 4) / 32 | CPU : SSE3 = 1 | SSSE3 = 1 | AVX = 1 | AVX_VNNI = 1 | AVX2 = 1 | F16C = 1 | FMA = 1 | BMI2 = 1 | AVX512 = 1 | AVX512_VBMI = 1 | AVX512_VNNI = 1 | AVX512_BF16 = 1 | LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.00.090.562 I compute_imatrix: tokenizing the input ..
+0.00.090.999 I compute_imatrix: tokenization took 0.436 ms
+0.00.091.001 I compute_imatrix: computing over 6 chunks, n_ctx=64, batch_size=64, n_seq=1
+0.00.099.185 I compute_imatrix: 0.01 seconds per pass - ETA 0.00.114.529 W compute_tensor_statistics: no preceding-layer tensor for 'blk.1.attn_output.weight'
+0.00.114.531 W compute_tensor_statistics: no preceding-layer tensor for 'blk.1.attn_q.weight'
+0.00.114.533 W compute_tensor_statistics: no preceding-layer tensor for 'blk.1.attn_v.weight'
+0.00.114.533 W compute_tensor_statistics: no preceding-layer tensor for 'blk.1.attn_k.weight'

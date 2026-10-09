@@ -110,15 +110,38 @@ pub struct ClefSpans {
 }
 
 /// `clef_get_spans` (clef.cpp:150-180) — if the batch has no usable order,
-/// returns one empty question with one empty option.
+/// returns one empty question with one empty option. The full ubatch form
+/// ([`clef_get_spans_ubatch`]) adds the token-presence and mixed-batch
+/// media guards of the C (`ubatch.token != nullptr` at :128 and the
+/// "spans cannot be embeddings" walk at :159-162); this plain form is the
+/// token-batch specialization the tests drove before the guards landed.
 pub fn clef_get_spans(decision_order: Option<&[i32]>, n_tokens: usize) -> ClefSpans {
+    clef_get_spans_ubatch(decision_order, None, true, n_tokens)
+}
+
+/// the full `clef_get_spans` (clef.cpp:126-165 @c35b66744):
+///   * `ok = ubatch.decision_order != nullptr && ubatch.token != nullptr
+///     && ubatch.n_seqs_unq == 1` (:128) — `has_tokens` carries the token
+///     half (an embd-only batch has no ids for the head to read; the port's
+///     driver is single-sequence, so the n_seqs_unq == 1 half always holds
+///     here);
+///   * the mixed-batch media guard (:159-162): "the head reads the token
+///     ids of the spans, they cannot be embeddings" — an EMBD-typed row
+///     inside a span (`type[i] == 1` with `decision_order[i] != NONE`)
+///     invalidates the whole batch.
+pub fn clef_get_spans_ubatch(
+    decision_order: Option<&[i32]>,
+    ub_types: Option<&[i8]>,
+    has_tokens: bool,
+    n_tokens: usize,
+) -> ClefSpans {
     let mut questions: Vec<(i32, i32, i32)> = Vec::new();
     let mut options: Vec<(i32, i32, i32)> = Vec::new();
     let mut has_option: Vec<bool> = Vec::new();
 
     // TODO(upstream): support multiple sequences
     let order = decision_order.unwrap_or(&[]);
-    let mut ok = !order.is_empty();
+    let mut ok = !order.is_empty() && has_tokens;
 
     let mut i = 0i32;
     while ok && (i as usize) < n_tokens {
@@ -143,6 +166,21 @@ pub fn clef_get_spans(decision_order: Option<&[i32]>, n_tokens: usize) -> ClefSp
             _ => ok = false,
         }
         i = end;
+    }
+
+    // "the head reads the token ids of the spans, they cannot be embeddings"
+    // (clef.cpp:159-162) — `ok = !ubatch.type[i] || decision_order[i] ==
+    // LLAMA_DECISION_ORDER_NONE` over the mixed ubatch's rows
+    if let (Some(types), Some(ord)) = (ub_types, decision_order) {
+        let mut i = 0usize;
+        while ok && i < n_tokens {
+            if types.get(i).copied().unwrap_or(0) != 0
+                && ord.get(i).copied().unwrap_or(DECISION_ORDER_NONE) != DECISION_ORDER_NONE
+            {
+                ok = false;
+            }
+            i += 1;
+        }
     }
 
     // each question needs an option
@@ -181,12 +219,35 @@ pub struct ClefDecisionInputs {
     pub status: TensorId,
     pub n_questions: usize,
     pub n_options: usize,
+    /// the ubatch the inputs were built for (the C's `const int64_t
+    /// n_tokens`, clef.cpp:238) — the embd-only set_input passes an empty
+    /// token slice, so the size lives here
+    pub n_tokens: usize,
 }
 
 impl ClefDecisionInputs {
-    /// the tensor set of `build_head`'s input creation (clef.cpp:537-548)
-    pub fn build(gctx: &mut Context, n_tokens: usize, order: Option<&[i32]>) -> Self {
-        let spans = clef_get_spans(order, n_tokens);
+    /// the tensor set of `build_head`'s input creation (clef.cpp:537-548) —
+    /// the shapes come from the spans of the FULL ubatch form (the
+    /// mixed-batch guards included), so an embd-typed span sizes the
+    /// degenerate one-question graph like the C's `input_decision` ctor
+    /// (:186-190)
+    pub fn build(
+        gctx: &mut Context,
+        n_tokens: usize,
+        order: Option<&[i32]>,
+    ) -> Self {
+        Self::build_ubatch(gctx, n_tokens, order, None, true)
+    }
+
+    /// the full-ubatch form of [`ClefDecisionInputs::build`]
+    pub fn build_ubatch(
+        gctx: &mut Context,
+        n_tokens: usize,
+        order: Option<&[i32]>,
+        ub_types: Option<&[i8]>,
+        has_tokens: bool,
+    ) -> Self {
+        let spans = clef_get_spans_ubatch(order, ub_types, has_tokens, n_tokens);
         let n_q = spans.questions.len();
         let n_o = spans.options.len();
         let t = n_tokens as i64;
@@ -218,25 +279,51 @@ impl ClefDecisionInputs {
             status,
             n_questions: n_q,
             n_options: n_o,
+            n_tokens,
         }
     }
 
-    /// `input_decision::set_input` (clef.cpp:193-227)
+    /// `input_decision::set_input` (clef.cpp:193-227). `tokens` carries the
+    /// ubatch's token ids; an embd-only batch passes an empty slice — the
+    /// C's `no_tokens` fallback then fills the head's token input with 0s
+    /// ("a batch of embeddings has no token ids, and no usable spans",
+    /// :195-187)
     pub fn set_input(
         &self,
         gctx: &mut Context,
         tokens: &[i32],
         decision_order: Option<&[i32]>,
     ) {
-        let n_tokens = tokens.len();
-        let spans = clef_get_spans(decision_order, n_tokens);
+        self.set_input_ubatch(gctx, tokens, decision_order, None)
+    }
+
+    /// the full-ubatch form of [`ClefDecisionInputs::set_input`] — the
+    /// mixed types feed the span guards, and an empty `tokens` (no ids) is
+    /// the 0-fill of the C's `no_tokens` vector
+    pub fn set_input_ubatch(
+        &self,
+        gctx: &mut Context,
+        tokens: &[i32],
+        decision_order: Option<&[i32]>,
+        ub_types: Option<&[i8]>,
+    ) {
+        let n_tokens = self.n_tokens;
+        let spans = clef_get_spans_ubatch(decision_order, ub_types, !tokens.is_empty(), n_tokens);
         assert!(
             spans.questions.len() == self.n_questions
                 && spans.options.len() == self.n_options,
             "clef: span shape changed (can_reuse would have rebuilt the graph)"
         );
 
-        gctx.with_i32_mut(self.tokens, |p| p.copy_from_slice(tokens)).unwrap();
+        // the no_tokens fallback (clef.cpp:186-187): a batch of embeddings
+        // has no token ids — 0-fill the head's token input (the spans are
+        // the degenerate one-question form, so the ids are never read as
+        // span members)
+        if tokens.is_empty() {
+            gctx.with_i32_mut(self.tokens, |p| p.fill(0)).unwrap();
+        } else {
+            gctx.with_i32_mut(self.tokens, |p| p.copy_from_slice(tokens)).unwrap();
+        }
 
         // the scores are NaN if the batch has a decision order that cannot
         // be used

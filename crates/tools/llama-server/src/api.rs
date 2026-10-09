@@ -489,6 +489,14 @@ pub struct TaskParams {
     /// `embd_normalize` (-1 none, 0 max-abs int16, 1 taxicab, 2 euclidean,
     /// >2 p-norm; common.h:614 defaults 2)
     pub embd_normalize: i32,
+    /// `message_spans` (server-task.h:96) — the prompt positions where user
+    /// messages start, from `server_tokens::find_message_spans` over the
+    /// request's `message_delimiters` (server-context.cpp:4813-4829). The
+    /// checkpoint machinery reads them: a prompt batch that starts at a user
+    /// message is checkpointed even mid-prompt
+    /// (server-context.cpp:3978-3983), and the last user message bypasses
+    /// the min-step spacing (:4053-4055)
+    pub message_user_starts: Vec<usize>,
 }
 
 impl Default for TaskParams {
@@ -530,6 +538,7 @@ impl Default for TaskParams {
             reasoning_format: "none".into(),
             preserved_tokens: Vec::new(),
             embd_normalize: 2,
+            message_user_starts: Vec::new(),
         }
     }
 }

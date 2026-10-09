@@ -310,6 +310,54 @@ struct PendingBind {
     placement: Placement,
 }
 
+/// `ggml_backend_sched_copy_callback` closure shape for the foreign (C)
+/// scheduler — raw C pointers exactly like ggml-backend.h:321-327 @c35b66744
+/// (the C `user_data` becomes the captured environment).
+pub type ForeignSchedCopyCallback = Box<
+    dyn Fn(*mut GgmlBackendT, *const GgmlCTensor, *mut GgmlCTensor, *mut GgmlCgraph) -> bool + Send,
+>;
+
+/// The C→Rust trampoline of the foreign copy callback: `user_data` is the
+/// `&ForeignSchedCopyCallback` the slot handed the C scheduler
+/// (ggml-backend.cpp:1835-1836 dispatches through `callback_copy_user_data`).
+unsafe extern "C" fn sched_copy_trampoline(
+    backend: *mut GgmlBackendT,
+    src: *const GgmlCTensor,
+    dst: *mut GgmlCTensor,
+    graph: *mut GgmlCgraph,
+    user_data: *mut c_void,
+) -> bool {
+    let cb = &*(user_data as *const ForeignSchedCopyCallback);
+    cb(backend, src, dst, graph)
+}
+
+/// Owns the closure registered on a foreign scheduler so the `user_data`
+/// pointer stays valid for the scheduler's lifetime (the `Box` target is
+/// heap-pinned). Replacing the closure re-registers the new pointer before
+/// the old box is dropped, so the C side never sees a stale one.
+pub(crate) struct SchedCopyCbSlot {
+    cb: Option<ForeignSchedCopyCallback>,
+}
+
+impl SchedCopyCbSlot {
+    pub(crate) fn empty() -> Self {
+        SchedCopyCbSlot { cb: None }
+    }
+
+    /// `ggml_backend_sched_set_copy_callback(sched, cb, user_data)`
+    /// (ggml-backend.cpp:2140-2143 @c35b66744).
+    pub(crate) fn install(
+        &mut self,
+        set: crate::sysffi::FnSchedSetCopyCallback,
+        sched: *mut GgmlBackendSchedT,
+        cb: ForeignSchedCopyCallback,
+    ) {
+        self.cb = Some(cb);
+        let user_data = self.cb.as_ref().unwrap() as *const ForeignSchedCopyCallback as *mut c_void;
+        unsafe { set(sched, Some(sched_copy_trampoline), user_data) };
+    }
+}
+
 /// The foreign executor: dlopen'ed ggml + persistent bindings + the C sched.
 ///
 /// Lifetime discipline: the `DlHandle`s keep the loaded ggml mapped; the raw
@@ -367,6 +415,11 @@ pub struct ForeignExecutor {
     gpu_kv_bufs: Vec<*mut GgmlBackendBufferT>,
 
     sched: *mut GgmlBackendSchedT,
+
+    /// the copy callback installed on the C scheduler (see
+    /// [`ForeignExecutor::sched_set_copy_callback`]) — keeps the closure
+    /// alive as the C `user_data`
+    copy_cb: SchedCopyCbSlot,
 
     /// per-step stats for the log
     pub n_nodes_last: usize,
@@ -510,6 +563,7 @@ impl ForeignExecutor {
                 cpu_kv_bufs: Vec::new(),
                 gpu_kv_bufs: Vec::new(),
                 sched,
+                copy_cb: SchedCopyCbSlot::empty(),
                 n_nodes_last: 0,
                 n_uploaded_bytes: 0,
                 graph_ms_last: 0.0,
@@ -1046,6 +1100,14 @@ impl ForeignExecutor {
         }
     }
 
+    /// a snapshot of the resolved symbol table — `CLibSyms` is `Copy`, so a
+    /// foreign copy-callback closure can capture it and drive the raw C-ABI
+    /// helpers without borrowing the executor (the trampoline hands out no
+    /// executor reference, only the raw C arguments).
+    pub fn syms_copy(&self) -> crate::sysffi::CLibSyms {
+        self.syms
+    }
+
     pub fn n_backends(&self) -> usize {
         unsafe { (self.syms.ggml_backend_sched_get_n_backends)(self.sched) as usize }
     }
@@ -1076,6 +1138,94 @@ impl ForeignExecutor {
                 })
                 .collect()
         }
+    }
+
+    /// `ggml_backend_sched_set_copy_callback` on the foreign (C) scheduler
+    /// (ggml-backend.cpp:2140-2143 @c35b66744, 6753a033f) — the
+    /// ForeignExecutor twin of `ggml::backend_sched::backend_sched_set_copy_
+    /// callback` (the Rust scheduler of backend_sched.rs). The callback fires
+    /// when the C scheduler copies a host-buffer input weight into a split
+    /// (ggml-backend.cpp:1835-1836); returning false from the closure makes
+    /// it copy the whole weight. The symbol is optional at resolve time
+    /// (postdates the pinned build) — installation then fails with this
+    /// error and the GPU path runs without the callback.
+    pub fn sched_set_copy_callback(&mut self, cb: ForeignSchedCopyCallback) -> Result<(), String> {
+        let Some(&set) = self.syms.ggml_backend_sched_set_copy_callback.as_ref() else {
+            return Err(
+                "ggml_backend_sched_set_copy_callback is not exported by the loaded ggml \
+                 (needs 6753a033f / c35b66744)"
+                    .into(),
+            );
+        };
+        self.copy_cb.install(set, self.sched, cb);
+        Ok(())
+    }
+
+    // -- raw C-ABI helpers for a foreign copy callback (what
+    //    llama-context.cpp:2690-2735 does through the public backend API) --
+
+    /// `ggml_backend_synchronize(backend)` (ggml-backend.h:100).
+    pub fn backend_synchronize_raw(&self, backend: *mut GgmlBackendT) {
+        unsafe { (self.syms.ggml_backend_synchronize)(backend) };
+    }
+
+    /// `ggml_backend_tensor_get_async(backend, tensor, data, offset, size)`
+    /// (ggml-backend.h:89) — read a tensor's bytes back from its backend.
+    pub unsafe fn tensor_get_async_raw(
+        &self,
+        backend: *mut GgmlBackendT,
+        tensor: *const GgmlCTensor,
+        data: *mut u8,
+        offset: usize,
+        size: usize,
+    ) {
+        (self.syms.ggml_backend_tensor_get_async)(
+            backend,
+            tensor,
+            data as *mut c_void,
+            offset,
+            size,
+        );
+    }
+
+    /// `ggml_backend_tensor_set_async(backend, tensor, data, offset, size)`
+    /// (ggml-backend.h:88) — upload bytes into a tensor on its backend.
+    pub unsafe fn tensor_set_async_raw(
+        &self,
+        backend: *mut GgmlBackendT,
+        tensor: *mut GgmlCTensor,
+        data: *const u8,
+        offset: usize,
+        size: usize,
+    ) {
+        (self.syms.ggml_backend_tensor_set_async)(
+            backend,
+            tensor,
+            data as *const c_void,
+            offset,
+            size,
+        );
+    }
+
+    /// `ggml_graph_n_nodes(graph)` (ggml.h:2899).
+    pub fn graph_n_nodes_raw(&self, graph: *mut GgmlCgraph) -> usize {
+        unsafe { (self.syms.ggml_graph_n_nodes)(graph) as usize }
+    }
+
+    /// `ggml_graph_node(graph, i)` (ggml.h:2897).
+    pub fn graph_node_raw(&self, graph: *mut GgmlCgraph, i: i32) -> *mut GgmlCTensor {
+        unsafe { (self.syms.ggml_graph_node)(graph, i) }
+    }
+
+    /// reverse lookup of the persistent (weights + caches) Rust→C tensor
+    /// map: the Rust `TensorId` whose C twin is `ct`. The copy callback of
+    /// the foreign scheduler receives C pointers; the MoE cache keys its
+    /// layers by the Rust id.
+    pub fn persistent_id_of(&self, ct: *const GgmlCTensor) -> Option<TensorId> {
+        self.persistent
+            .iter()
+            .find(|(_, &p)| p as *const GgmlCTensor == ct)
+            .map(|(&id, _)| id)
     }
 }
 
@@ -1135,6 +1285,13 @@ mod tests {
     use crate::tensor::Context;
     use crate::types::GgmlType;
 
+    /// ForeignExecutor construction mutates the loaded ggml's global backend
+    /// registry (ggml_backend_load_all_from_path + dev init) and spins up its
+    /// OpenMP pool — two executors must never be constructed concurrently
+    /// (REGISTRY_TEST_LOCK precedent in backend.rs; the SIGSEGV showed up
+    /// once the copy-callback smoke joined the suite).
+    static EMISSION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The reference build used by the emission tests (CPU .so's of the
     /// pinned tree build). Skipped when absent so CI without the reference
     /// still passes.
@@ -1159,6 +1316,7 @@ mod tests {
     ///   3. structural: the emitted C graph has the same node count.
     #[test]
     fn foreign_cpu_backend_parity() {
+        let _guard = EMISSION_TEST_LOCK.lock().unwrap();
         let Some(dir) = ref_lib_dir() else {
             eprintln!("skipping: reference build not present");
             return;
@@ -1266,6 +1424,7 @@ mod tests {
     /// the decode loop's exact shape. Ground truth = the port CPU engine.
     #[test]
     fn foreign_cpu_kv_cache_persistence() {
+        let _guard = EMISSION_TEST_LOCK.lock().unwrap();
         let Some(dir) = ref_lib_dir() else {
             eprintln!("skipping: reference build not present");
             return;
@@ -1465,5 +1624,182 @@ mod tests {
             };
             f32::from_bits(bits)
         }
+    }
+
+    /// Foreign copy-callback FFI round-trip on a stub scheduler
+    /// (`ggml_backend_sched_set_copy_callback`, ggml-backend.cpp:2140-2143
+    /// @c35b66744 / 6753a033f) — the backend_dl_stub precedent: a stub .so
+    /// compiled on the fly records the registered callback + user_data and
+    /// replays them through a trigger symbol, proving the trampoline
+    /// (C ABI → Rust closure and back) without a GPU (this host has none —
+    /// no e2e run of the real scheduler's copy path is possible here; the
+    /// real-.so smoke below covers registration only). Stub source also kept
+    /// in parity/sched_copy_stub.c.
+    #[test]
+    fn foreign_sched_copy_callback_stub_roundtrip() {
+        let cc = std::env::var("CC").unwrap_or_else(|_| "cc".to_string());
+        if std::process::Command::new(&cc).arg("--version").output().is_err() {
+            eprintln!("skipping: no C compiler");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ggml_sched_cb_stub_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let c_path = dir.join("stub.c");
+        let so_path = dir.join("libggml-schedcb-stub.so");
+        std::fs::write(&c_path, include_str!("../../../parity/sched_copy_stub.c")).unwrap();
+        let out = std::process::Command::new(&cc)
+            .args(["-shared", "-fPIC"])
+            .arg("-o")
+            .arg(&so_path)
+            .arg(&c_path)
+            .output()
+            .expect("cc invocation");
+        assert!(out.status.success(), "stub build failed: {:?}", out);
+
+        let handle = crate::sysffi::dl_load_library(&so_path);
+        assert!(!handle.is_null(), "stub .so must load");
+
+        // resolve the two symbols the round-trip needs (the resolve macro's
+        // transmute discipline, applied by hand — the stub is not a full ggml)
+        let set: crate::sysffi::FnSchedSetCopyCallback = unsafe {
+            std::mem::transmute(handle.get_sym("ggml_backend_sched_set_copy_callback").expect("set symbol"))
+        };
+        let invoke: unsafe extern "C" fn(
+            *mut crate::sysffi::GgmlBackendT,
+            *const crate::sysffi::GgmlCTensor,
+            *mut crate::sysffi::GgmlCTensor,
+            *mut crate::sysffi::GgmlCgraph,
+        ) -> bool = unsafe {
+            std::mem::transmute(handle.get_sym("stub_sched_invoke_copy").expect("invoke symbol"))
+        };
+
+        // the slot logic under test (ForeignExecutor's is the same install)
+        let mut slot = SchedCopyCbSlot::empty();
+        let fake_sched = 0x1234_usize as *mut crate::sysffi::GgmlBackendSchedT;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_cb = seen.clone();
+        slot.install(
+            set,
+            fake_sched,
+            Box::new(move |backend, src, dst, graph| {
+                seen_cb.lock().unwrap().push((backend as usize, src as usize, dst as usize, graph as usize));
+                true
+            }),
+        );
+
+        // the stub recorded the trampoline + user_data; invoking replays them
+        let backend = 0xbeef_usize as *mut crate::sysffi::GgmlBackendT;
+        let src = 0x1111_usize as *const crate::sysffi::GgmlCTensor;
+        let dst = 0x2222_usize as *mut crate::sysffi::GgmlCTensor;
+        let graph = 0x3333_usize as *mut crate::sysffi::GgmlCgraph;
+        let ret = unsafe { invoke(backend, src, dst, graph) };
+        assert!(ret, "the closure's true must travel back through the C ABI");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(0xbeef, 0x1111, 0x2222, 0x3333)],
+            "all four C pointer arguments must reach the Rust closure unchanged"
+        );
+
+        // a false return travels back too
+        slot.install(
+            set,
+            fake_sched,
+            Box::new(move |_backend, _src, _dst, _graph| false),
+        );
+        let ret2 = unsafe { invoke(backend, src, dst, graph) };
+        assert!(!ret2, "the closure's false must travel back through the C ABI");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Real-.so registration smoke: the NEW reference build
+    /// (c35b66744) exports `ggml_backend_sched_set_copy_callback`, so a
+    /// CPU-only ForeignExecutor resolves it and the C scheduler accepts the
+    /// trampoline. The callback itself never fires on this host: a CPU-only
+    /// sched has no splits (copy_input only runs per split,
+    /// ggml-backend.cpp:1818-1856), and the split's host-weight inputs only
+    /// exist in mixed CPU/GPU schedules — no GPU here, honestly recorded.
+    ///
+    /// The registration runs in a **child process** (GGML_SCHED_CB_INNER):
+    /// mixing two ggml builds in one process is not viable — the pinned
+    /// emission tests above dlopen the pinned build first, and a subsequent
+    /// next-build executor then segfaults inside the next libggml-base's
+    /// `ggml_gallocr_new_n` (a NULL call two frames under
+    /// ggml_backend_sched_new; both builds share the SONAME
+    /// libggml-base.so.0, so glibc dedups the mapping and the two symbol
+    /// worlds cross). The child re-runs this very test on a fresh process,
+    /// where the next build is the only ggml loaded.
+    #[test]
+    fn foreign_sched_copy_callback_real_so() {
+        // inner pass: construct the executor over the NEW build and register
+        if std::env::var_os("GGML_SCHED_CB_INNER").is_some() {
+            let next = PathBuf::from("/home/jeffrey/llm/llama.cpp-next/build-rust-ref/bin");
+            if !next.join("libggml-base.so").exists() {
+                eprintln!("skipping: NEW reference build not present");
+                return;
+            }
+            let mut cfg = EmitConfig::new(&next);
+            cfg.n_threads = 2;
+            let mut exec = ForeignExecutor::new(&cfg).expect("next-build executor init");
+            assert!(
+                exec.syms.ggml_backend_sched_set_copy_callback.is_some(),
+                "the c35b66744 build must resolve the copy-callback symbol"
+            );
+            exec.sched_set_copy_callback(Box::new(|_backend, _src, _dst, _graph| {
+                panic!("CPU-only sched must not invoke the copy callback");
+            }))
+            .expect("registration on the real C scheduler must succeed");
+            return;
+        }
+
+        // outer pass: out-of-process symbol checks (nm — in-process dlopen is
+        // useless under the SONAME dedup described above), then spawn the
+        // inner registration in a fresh process
+        let next = PathBuf::from("/home/jeffrey/llm/llama.cpp-next/build-rust-ref/bin");
+        if !next.join("libggml-base.so").exists() {
+            eprintln!("skipping: NEW reference build not present");
+            return;
+        }
+        let nm_has = |dir: &Path| -> Option<bool> {
+            let out = std::process::Command::new("nm")
+                .args(["-D", "--defined-only"])
+                .arg(dir.join("libggml-base.so"))
+                .output()
+                .ok()?;
+            Some(
+                String::from_utf8_lossy(&out.stdout)
+                    .contains("ggml_backend_sched_set_copy_callback"),
+            )
+        };
+        assert_eq!(
+            nm_has(&next),
+            Some(true),
+            "the c35b66744 build must export the copy-callback symbol"
+        );
+        if let Some(pinned) = ref_lib_dir() {
+            assert_ne!(
+                nm_has(&pinned),
+                Some(true),
+                "the pinned build must not export the copy-callback symbol"
+            );
+        }
+
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(&exe)
+            .args([
+                "backend_emit::tests::foreign_sched_copy_callback_real_so",
+                "--exact",
+                "--test-threads",
+                "1",
+                "--nocapture",
+            ])
+            .env("GGML_SCHED_CB_INNER", "1")
+            .output()
+            .expect("spawn inner registration process");
+        assert!(
+            out.status.success(),
+            "inner registration process failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }

@@ -153,10 +153,20 @@ struct Args {
     /// it defaults to its own auto)
     n_gpu_layers_draft: i32,
     /// `--spec-draft-device, -devd, --device-draft` (arg.cpp:4212-4219,
-    /// `.set_spec().set_examples({SPECULATIVE, SERVER, CLI})`) — the draft's
+    /// `.set_spec().set_examples({SPECULATIVE, SERVER, CLI})`): the draft's
     /// device; "default: follows --device" (the help text) =
     /// `common_base_params_to_speculative`'s `result = params` inheritance
     device_draft: Option<String>,
+    /// `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` (arg.cpp:1700-1707,
+    /// env LLAMA_ARG_CTX_CHECKPOINTS) — max number of context checkpoints to
+    /// create per slot (common.h:637 default 32). 0 disables the checkpoint
+    /// machinery
+    n_ctx_checkpoints: i32,
+    /// `-cms, --checkpoint-min-step N` (arg.cpp:1708-1718, env
+    /// LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) — minimum spacing between
+    /// context checkpoints in tokens (common.h:639 default 8192, 0 = no
+    /// minimum; negative values are rejected like the C)
+    checkpoint_min_step: i32,
 }
 
 /// `parse_csv_row` (common/arg.cpp:1347-1389) — the port's copy (same as
@@ -256,6 +266,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             foreign_cpu: false,
             n_gpu_layers_draft: -1,
             device_draft: None,
+            // common.h:637 / :639 defaults
+            n_ctx_checkpoints: 32,
+            checkpoint_min_step: 8192,
         };
     let mut host_given = false;
     let mut i = 1;
@@ -357,6 +370,22 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--list-devices" => a.list_devices = true,
             "--ggml-libs" => a.ggml_libs = Some(value(&mut i)?),
             "--foreign-cpu" => a.foreign_cpu = true,
+            // ---- the context-checkpoint surface (arg.cpp:1700-1718; env
+            //      vars are not read — the port's arg parser takes flags
+            //      only, like every other flag here) ----
+            "-ctxcp" | "--ctx-checkpoints" | "--swa-checkpoints" => {
+                a.n_ctx_checkpoints = value(&mut i)?.parse().map_err(|_| "bad --ctx-checkpoints")?;
+            }
+            "-cms" | "--checkpoint-min-step" => {
+                // arg.cpp:1713-1716 — negative values are rejected
+                let v: i32 =
+                    value(&mut i)?.parse().map_err(|_| "bad --checkpoint-min-step")?;
+                if v < 0 {
+                    return Err("invalid value for --checkpoint-min-step: must be non-negative"
+                        .to_string());
+                }
+                a.checkpoint_min_step = v;
+            }
             "--slot-save-path" => {                let v = value(&mut i)?;
                 let dir = std::path::Path::new(&v);
                 if !dir.is_dir() {
@@ -2787,6 +2816,25 @@ fn load_engine(
     // `llama_encode` (`EncoderContext`); everything else through the decode
     // graph
     let mut spec = None;
+    // `cparams.n_rs_seq` of the decode arm, hoisted for the Engine's
+    // seq_rm capability facts below (the decode arm re-derives it locally)
+    let n_rs_seq_eng: u32 = if args
+        .speculative
+        .types
+        .iter()
+        .any(|t| {
+            matches!(
+                t,
+                llama::speculative::CommonSpeculativeType::DraftMtp
+                    | llama::speculative::CommonSpeculativeType::DraftEagle3
+                    | llama::speculative::CommonSpeculativeType::DraftDflash
+                    | llama::speculative::CommonSpeculativeType::DraftDspark
+            )
+        }) {
+        args.speculative.draft.n_max.max(0) as u32
+    } else {
+        0
+    };
     // set by the decode arm below when the foreign executor takes over (the
     // encoder arm refuses gpu_requested above, so it stays false there)
     let mut gpu_mode_ran = false;
@@ -2804,7 +2852,44 @@ fn load_engine(
             // reroutes to encode, llama-context.cpp:1729-1732)
             | llama::arch::LlmArch::GEMMA_EMBEDDING2
     );
-    let core = if is_encoder {
+    // the lfm2 d1-omni decision model (a657f7e98): `decision.block_count > 0`
+    // on the non-causal trunk makes lfm2.cpp:139 pick `graph_decision` and
+    // `create_memory` return nullptr (llama-model.cpp:2383-2386) — a
+    // null-memory graph whose output is the [3, T] score tensor
+    // (`res->t_embd`). The reference drives it on ctx_tgt through
+    // llama_decode's "no memory -> encode()" reroute
+    // (llama-context.cpp:1729-1732); the port's DecodeContext builds the
+    // hybrid-memory decode graph instead, so the model rides its own
+    // stateless decision core (engine.rs `D1OmniCore`, the
+    // tests/lfm2_decision_e2e.rs driver). (A causal lfm2 decision file —
+    // d1-3B — keeps the plain decode core: it has a vocab head and no
+    // decision blocks.)
+    let is_lfm2_decision = model.arch == llama::arch::LlmArch::LFM2
+        && !model.hparams.causal_attn
+        && model.hparams.n_layer_decision > 0;
+    let core = if is_lfm2_decision {
+        if !args.lora.is_empty() {
+            return Err("--lora is not wired for decision models".into());
+        }
+        if gpu_requested(&args) {
+            return Err(
+                "gpu mode is not wired for decision models in the port (the decision core has \
+                 no backend_emit emission path)"
+                    .into(),
+            );
+        }
+        let w = weights::lfm2_decision_weights(&model);
+        let p = weights::lfm2_decision_params(&model);
+        let n_embd_out = model.hparams.n_embd_out() as usize;
+        let gctx = model.ctx;
+        engine::Core::Decision(engine::D1OmniCore {
+            gctx,
+            w,
+            p,
+            n_embd_out,
+            n_threads: args.n_threads,
+        })
+    } else if is_encoder {
         if !args.lora.is_empty() {
             return Err("--lora is not wired for encoder models".into());
         }
@@ -3527,6 +3612,19 @@ fn load_engine(
             .collect(),
     );
 
+    // the checkpoint machinery facts: `n_swa = params_base.swa_full ? 0 :
+    // llama_model_n_swa(model_tgt)` (server-context.cpp:1337; the port has
+    // no --swa-full flag) and `common_context_can_seq_rm` resolved to
+    // FULL/RS (common.cpp:1553-1596 — a recurrent half refuses partial
+    // seq_rm without the rollback ring, n_rs_seq > 0 bounds either memory)
+    let model_n_swa = model.hparams.n_swa as i32;
+    let seq_rm_bounded = match &core {
+        engine::Core::Decode(d) => {
+            d.weights.recurrent_dims().is_some() || n_rs_seq_eng > 0
+        }
+        _ => false,
+    };
+
     let engine = Engine {
         core,
         vocab: vocab.clone(),
@@ -3540,6 +3638,10 @@ fn load_engine(
         model_path: args.model.clone(),
         ctx_shift: args.context_shift, // common/arg.cpp:1737-1741
         n_keep_default: args.n_keep,   // common.h:453 / server-schema.cpp:529
+        n_ctx_checkpoints: args.n_ctx_checkpoints, // common.h:637
+        checkpoint_min_step: args.checkpoint_min_step, // common.h:639
+        n_swa: model_n_swa,
+        seq_rm_bounded,
         shutdown: shutdown.clone(),
         spec,
         decision,
@@ -3775,6 +3877,41 @@ fn gen_chatcmplid() -> String {
 
 /// `POST /completion` / `POST /v1/completions` (server-context.cpp:4257-4560
 /// `handle_completions_impl`); `res_type` selects the response family.
+/// `common_chat_msg_delimiters_parse` (common/chat.cpp:126-139) +
+/// `delimiters.tokenize` + the USER-role half of
+/// `common_chat_msg_delimiters::split` (common/chat.cpp:143-165, reached
+/// through `server_tokens::find_message_spans`, server-common.cpp:791-797):
+/// scan the token stream for the delimiter token sequences (the first
+/// delimiter in list order wins at a position) and report where user
+/// messages start. No media chunks in the port, so the `skips` map is empty.
+fn message_user_starts(vocab: &Vocab, tokens: &[i32], data: &Json) -> Vec<usize> {
+    let Some(Json::Array(delims)) = data.at("message_delimiters") else {
+        return Vec::new();
+    };
+    let mut parsed: Vec<(bool, Vec<i32>)> = Vec::new(); // (is_user, tokens)
+    for d in delims {
+        let role = d.at("role").and_then(|v| v.get_str().ok()).unwrap_or("");
+        let delimiter = d.at("delimiter").and_then(|v| v.get_str().ok()).unwrap_or("");
+        // `common_tokenize(vocab, d.delimiter, false, true)` (chat.cpp:107-112)
+        parsed.push((role == "user", vocab.tokenize(delimiter, false, true)));
+    }
+    let mut out = Vec::new();
+    'pos: for i in 0..tokens.len() {
+        for (is_user, dt) in &parsed {
+            if i + dt.len() > tokens.len() || dt.is_empty() {
+                continue;
+            }
+            if tokens[i..i + dt.len()] == dt[..] {
+                if *is_user {
+                    out.push(i);
+                }
+                continue 'pos;
+            }
+        }
+    }
+    out
+}
+
 fn handle_completion(server: &Arc<engine::Server>, req: &Request, res_type: api::ResponseType) -> Response {
     let data = match Json::parse(&req.body_str()) {
         Ok(v) => v,
@@ -3915,6 +4052,9 @@ fn handle_completion(server: &Arc<engine::Server>, req: &Request, res_type: api:
         p.res_type = res_type;
         p.oaicompat_cmpl_id = completion_id.clone();
         p.oaicompat_model = server.model_meta.model_name.clone();
+        // `task.params.message_spans = task.tokens.find_message_spans(delims)`
+        // (server-context.cpp:4829) — the request's `message_delimiters`
+        p.message_user_starts = message_user_starts(&server.vocab, &tokens, &data);
         pending.push(Task {
             id: 0,
             index: index as i32,
@@ -4109,6 +4249,11 @@ fn handle_chat_completions(server: &Arc<engine::Server>, req: &Request) -> Respo
     params.res_type = api::ResponseType::OaiChat;
     params.oaicompat_cmpl_id = gen_chatcmplid();
     params.oaicompat_model = server.model_meta.model_name.clone();
+    // `task.params.message_spans` (server-context.cpp:4829) — the chat
+    // handler's `llama_params` carries the autoparser-derived
+    // `message_delimiters` (chat.rs, server-common.cpp:1454)
+    params.message_user_starts =
+        message_user_starts(&server.vocab, &tokens, &parsed.llama_params);
     let stream = params.stream;
     let task = Task {
         id: server.new_task_id(),

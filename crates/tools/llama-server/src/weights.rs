@@ -4431,3 +4431,107 @@ pub fn llama_embed_weights(m: &LlamaModel) -> graph_arch::LlamaModelWeights {
         layers,
     }
 }
+
+// ---------------------------------------------------------------------------
+// the lfm2 d1-omni decision model (88dcc460d + a657f7e98): the null-memory
+// `graph_decision` trunk + the [3, n_tokens] score head. The server's own
+// decision core (engine.rs `D1OmniCore`) drives it — the same assembly
+// tests/lfm2_decision_e2e.rs uses, generalized from the hparams.
+// ---------------------------------------------------------------------------
+
+/// `Lfm2DecisionModelWeights` from the loaded model — the trunk blocks
+/// [0, n_layer - n_layer_decision) and the head blocks after them
+/// (lfm2.cpp:52-86's split).
+pub fn lfm2_decision_weights(m: &LlamaModel) -> graph_arch::Lfm2DecisionModelWeights {
+    let hp = &m.hparams;
+    let n_layer = hp.n_layer() as usize;
+    let n_layer_decision = hp.n_layer_decision as usize;
+    let n_trunk = n_layer - n_layer_decision;
+
+    let trunk_layer = |l: &llama::model::LayerTensors| graph_arch::Lfm2LayerWeights {
+        attn_norm: l.attn_norm.unwrap(),
+        shortconv_conv: l.shortconv_conv,
+        shortconv_in_proj: l.shortconv_in_proj,
+        shortconv_out_proj: l.shortconv_out_proj,
+        wq: l.wq,
+        wk: l.wk,
+        wv: l.wv,
+        wo: l.wo,
+        attn_q_norm: l.attn_q_norm,
+        attn_k_norm: l.attn_k_norm,
+        wq_b: l.wq_b,
+        wk_b: l.wk_b,
+        wv_b: l.wv_b,
+        ffn_norm: l.ffn_norm.unwrap(),
+        ffn_gate: l.ffn_gate,
+        ffn_down: l.ffn_down,
+        ffn_up: l.ffn_up,
+        ffn_gate_inp: l.ffn_gate_inp,
+        ffn_gate_exps: l.ffn_gate_exps,
+        ffn_down_exps: l.ffn_down_exps,
+        ffn_up_exps: l.ffn_up_exps,
+        ffn_exp_probs_b: l.ffn_exp_probs_b,
+    };
+    let head_layer = |l: &llama::model::LayerTensors| graph_arch::Lfm2DecisionHeadLayerWeights {
+        attn_norm: l.attn_norm.unwrap(),
+        attn_norm_b: l.attn_norm_b.unwrap(),
+        wqkv: l.wqkv.unwrap(),
+        wqkv_b: l.wqkv_b.unwrap(),
+        wo: l.wo.unwrap(),
+        wo_b: l.wo_b.unwrap(),
+        ffn_norm: l.ffn_norm.unwrap(),
+        ffn_norm_b: l.ffn_norm_b.unwrap(),
+        ffn_up: l.ffn_up.unwrap(),
+        ffn_up_b: l.ffn_up_b.unwrap(),
+        ffn_down: l.ffn_down.unwrap(),
+        ffn_down_b: l.ffn_down_b.unwrap(),
+    };
+    graph_arch::Lfm2DecisionModelWeights {
+        tok_embd: m.tok_embd,
+        output_norm: m.output_norm,
+        type_embd: m.token_types.unwrap(),
+        cls_norm: m.cls_norm.unwrap(),
+        cls_norm_b: m.cls_norm_b.unwrap(),
+        cls: m.cls.unwrap(),
+        cls_b: m.cls_b.unwrap(),
+        cls_out: m.cls_out.unwrap(),
+        cls_out_b: m.cls_out_b.unwrap(),
+        trunk_layers: m.layers[..n_trunk].iter().map(trunk_layer).collect(),
+        head_layers: m.layers[n_trunk..].iter().map(head_layer).collect(),
+    }
+}
+
+/// `Lfm2DecisionParams` from the hparams — the trunk rope pair reads layer
+/// 0's geometry like the decode graph's own lfm2 wiring.
+pub fn lfm2_decision_params(m: &LlamaModel) -> graph_arch::Lfm2DecisionParams {
+    let hp = &m.hparams;
+    let n_layer = hp.n_layer() as usize;
+    let n_layer_decision = hp.n_layer_decision as usize;
+    let n_trunk = n_layer - n_layer_decision;
+    let rope = hp.rope_runtime();
+    graph_arch::Lfm2DecisionParams {
+        n_embd: hp.n_embd as i64,
+        is_recr: (0..n_trunk).map(|il| hp.is_recr(il)).collect(),
+        n_shortconv_l_cache: hp.n_shortconv_l_cache as i64,
+        norm_rms_eps: hp.f_norm_rms_eps,
+        n_head: (0..n_trunk).map(|il| hp.n_head(il) as i64).collect(),
+        n_head_kv: (0..n_trunk).map(|il| hp.n_head_kv(il) as i64).collect(),
+        n_embd_head: hp.n_embd_head_k(first_attn_layer(hp, n_trunk)) as i64,
+        rope: graph_arch::EurobertRope {
+            n_rot: hp.n_rot(first_attn_layer(hp, n_trunk)) as i32,
+            // lfm2.cpp:478-480 — the trunk attention ropes Q/K NEOX-style
+            rope_mode: ggml::ops::GGML_ROPE_TYPE_NEOX,
+            n_ctx_orig: hp.n_ctx_train as i32,
+            freq_base: hp.rope_freq_base_train,
+            freq_scale: hp.rope_freq_scale_train,
+            ext_factor: 0.0,
+            attn_factor: 1.0,
+            beta_fast: hp.yarn_beta_fast,
+            beta_slow: hp.yarn_beta_slow,
+        },
+        f_norm_eps: hp.f_norm_eps,
+        head_n_head: (n_trunk..n_layer).map(|il| hp.n_head(il) as i64).collect(),
+        head_n_head_kv: (n_trunk..n_layer).map(|il| hp.n_head_kv(il) as i64).collect(),
+        n_layer_decision,
+    }
+}

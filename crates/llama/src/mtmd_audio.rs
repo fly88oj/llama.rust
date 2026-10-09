@@ -1386,6 +1386,69 @@ impl ConformerPreproc {
 }
 
 // ---------------------------------------------------------------------------
+// mtmd_audio_preprocessor_d1omni (mtmd-audio.cpp:998-1032) — same as
+// conformer, the audio is cut to 30 s and padded to 0.5 s (d1-omni audio.py)
+// ---------------------------------------------------------------------------
+
+pub struct D1omniPreproc {
+    inner: ConformerPreproc,
+}
+
+impl D1omniPreproc {
+    pub fn new(hparams: AudioHparams) -> Self {
+        D1omniPreproc {
+            inner: ConformerPreproc::new(hparams),
+        }
+    }
+
+    /// the hparams this preprocessor was constructed with
+    pub fn hparams(&self) -> &AudioHparams {
+        self.inner.hparams()
+    }
+
+    pub fn initialize(&mut self) {
+        self.inner.initialize();
+    }
+
+    pub fn preprocess(&self, samples: &[f32], output: &mut Vec<AudioMel>) -> bool {
+        // mtmd-audio.cpp:1004-1007
+        if samples.is_empty() {
+            return false;
+        }
+        let hp = self.inner.hparams();
+        let n_max = (30 * hp.audio_sample_rate) as usize;
+        let n_min = (hp.audio_sample_rate / 2) as usize;
+
+        // cut to 30 s, then zero-pad up to 0.5 s
+        let mut buf: Vec<f32> = samples.iter().copied().take(n_max.min(samples.len())).collect();
+        if buf.len() < n_min {
+            buf.resize(n_min, 0.0);
+        }
+
+        if !self.inner.preprocess(&buf, output) {
+            return false;
+        }
+
+        // mtmd-audio.cpp:1015-1031 — the encoder reads one frame per hop, not
+        // the extra frame of the centre padding (NeMo: seq_len)
+        let n_frames = buf.len() / hp.audio_hop_len as usize;
+        for mel in output.iter_mut() {
+            if mel.n_len as usize <= n_frames {
+                continue;
+            }
+            let mut data = vec![0.0f32; mel.n_mel as usize * n_frames];
+            for j in 0..mel.n_mel as usize {
+                let src: &[f32] = &mel.data[j * mel.n_len as usize..(j + 1) * mel.n_len as usize];
+                data[j * n_frames..(j + 1) * n_frames].copy_from_slice(&src[..n_frames]);
+            }
+            mel.n_len = n_frames as i64;
+            mel.data = data;
+        }
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // mtmd_audio_preprocessor_granite_speech (mtmd-audio.cpp:996-1093)
 // ---------------------------------------------------------------------------
 

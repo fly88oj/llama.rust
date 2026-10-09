@@ -38,6 +38,10 @@ pub enum ProjectorType {
     /// Ling 3.0 VL — the qwen3vl tower with a norm-only merger and the
     /// projector MLP at the top level (models/ling3vl.cpp:5-86)
     Ling3Vl,
+    /// Cohere2 vision — the SigLIP tower over square llava-uhd tiles with a
+    /// swapped-swiglu two-layer projector (models/siglip.cpp:48-56,
+    /// mtmd-image.cpp:1145, clip-impl.h:513 "cohere2v", upstream 50a6c5cf7)
+    Cohere2V,
 
     /// audio-only whisper-encoder family (`clip.audio.projector_type` /
     /// `clip.projector_type` == "qwen2a", clip-impl.h:533)
@@ -57,6 +61,11 @@ pub enum ProjectorType {
     Gemma4UA,
     /// LFM2-audio conformer encoder (models/conformer.cpp:3, clip.cpp:1072)
     Lfm2A,
+    /// d1-omni audio — the lfm2a conformer plus a norm+down+up residual
+    /// block after the projector and the 30 s cut / 0.5 s pad audio
+    /// preprocessor (models/conformer.cpp:210-216, mtmd-audio.cpp:998,
+    /// clip-impl.h:492 "d1omni_a", upstream a657f7e98)
+    D1OmniA,
     /// Gemma4-audio conformer encoder — chunked local attention +
     /// ClippableLinear (models/gemma4a.cpp:11, clip.cpp:1074)
     Gemma4A,
@@ -90,6 +99,7 @@ impl ProjectorType {
             "qwen2.5vl_merger" => ProjectorType::Qwen25Vl,
             "qwen3vl_merger" => ProjectorType::Qwen3Vl,
             "ling3vl" => ProjectorType::Ling3Vl,
+            "cohere2v" => ProjectorType::Cohere2V,
             "qwen2a" => ProjectorType::Qwen2A,
             "ultravox" => ProjectorType::Ultravox,
             "voxtral" => ProjectorType::Voxtral,
@@ -99,6 +109,7 @@ impl ProjectorType {
             "qwen3a" => ProjectorType::Qwen3A,
             "gemma4ua" => ProjectorType::Gemma4UA,
             "lfm2a" => ProjectorType::Lfm2A,
+            "d1omni_a" => ProjectorType::D1OmniA,
             "gemma4a" => ProjectorType::Gemma4A,
             "granite_speech" => ProjectorType::GraniteSpeech,
             "parakeet" => ProjectorType::Parakeet,
@@ -117,6 +128,7 @@ impl ProjectorType {
             ProjectorType::Qwen25Vl => "qwen2.5vl_merger",
             ProjectorType::Qwen3Vl => "qwen3vl_merger",
             ProjectorType::Ling3Vl => "ling3vl",
+            ProjectorType::Cohere2V => "cohere2v",
             ProjectorType::Qwen2A => "qwen2a",
             ProjectorType::Ultravox => "ultravox",
             ProjectorType::Voxtral => "voxtral",
@@ -126,6 +138,7 @@ impl ProjectorType {
             ProjectorType::Qwen3A => "qwen3a",
             ProjectorType::Gemma4UA => "gemma4ua",
             ProjectorType::Lfm2A => "lfm2a",
+            ProjectorType::D1OmniA => "d1omni_a",
             ProjectorType::Gemma4A => "gemma4a",
             ProjectorType::GraniteSpeech => "granite_speech",
             ProjectorType::Parakeet => "parakeet",
@@ -374,6 +387,20 @@ pub struct ClipHparams {
     pub image_resize_pad: PadStyle,
     pub image_pad_color: [u8; 3],
 
+    // ---- llava-uhd slicing (clip-model.h:70-80) -----------------------------
+    /// `clip.vision.preproc_max_tiles` (KEY_PREPROC_MAX_TILES) — cohere2v's
+    /// square-tile grid cap
+    pub preproc_max_tiles: i32,
+    /// resize algo / padding / pad color for the refined (tiled) image
+    /// (clip-model.h:76-80; PAD_NONE for cohere2v — tiles stretch to the grid)
+    pub image_resize_algo_rf: ResizeAlgo,
+    pub image_pad_rf: PadStyle,
+    pub image_pad_color_rf: [u8; 3],
+    /// resize algo / padding / pad color for the overview (thumbnail) image
+    pub image_resize_algo_ov: ResizeAlgo,
+    pub image_pad_ov: PadStyle,
+    pub image_pad_color_ov: [u8; 3],
+
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
 
@@ -479,6 +506,14 @@ impl Default for ClipHparams {
             image_resize_algo: ResizeAlgo::Bicubic,
             image_resize_pad: PadStyle::Ceil,
             image_pad_color: [0, 0, 0],
+            // clip-model.h:73-80 defaults (PAD_CEIL refined / PAD_NONE overview)
+            preproc_max_tiles: 0,
+            image_resize_algo_rf: ResizeAlgo::Bicubic,
+            image_pad_rf: PadStyle::Ceil,
+            image_pad_color_rf: [0, 0, 0],
+            image_resize_algo_ov: ResizeAlgo::Bicubic,
+            image_pad_ov: PadStyle::None,
+            image_pad_color_ov: [0, 0, 0],
             image_mean: [0.0; 3],
             image_std: [1.0; 3],
             warmup_image_size: 0,
@@ -920,6 +955,14 @@ pub struct ClipModel {
     /// meralion's out_proj (clip.cpp:2845-2846)
     pub mm_3_w: Option<TensorId>,
     pub mm_3_b: Option<TensorId>,
+    /// d1omni_a's residual block after the projector — `mm.a.mlp.{4,5,6}`
+    /// norm/down/up (clip-model.h:626-629, clip.cpp:3440-3447)
+    pub mm_4_w: Option<TensorId>,
+    pub mm_4_b: Option<TensorId>,
+    pub mm_5_w: Option<TensorId>,
+    pub mm_5_b: Option<TensorId>,
+    pub mm_6_w: Option<TensorId>,
+    pub mm_6_b: Option<TensorId>,
     /// glma's BOI/EOI embeddings (clip.cpp:3183-3184; TN_TOK_BOI is literally
     /// "v.boi" — the loader does not swap the "v." prefix for audio)
     pub mm_boi: Option<TensorId>,
@@ -1126,6 +1169,19 @@ mod keys {
     pub const IMAGE_MEAN: &str = "clip.vision.image_mean";
     pub const IMAGE_STD: &str = "clip.vision.image_std";
     pub const SPATIAL_MERGE_SIZE: &str = "clip.vision.spatial_merge_size";
+    // ---- cohere2 / llava-uhd (clip-impl.h:53-62) -----------------------------
+    /// clip.vision.image_min_pixels — qwen2.5-vl optional limit (clip.cpp:1704)
+    pub const IMAGE_MIN_PIXELS: &str = "clip.vision.image_min_pixels";
+    /// clip.vision.image_max_pixels — qwen2.5-vl optional limit (clip.cpp:1707)
+    pub const IMAGE_MAX_PIXELS: &str = "clip.vision.image_max_pixels";
+    /// clip.vision.preproc_max_tiles — cohere2v grid cap (clip.cpp:1523)
+    pub const PREPROC_MAX_TILES: &str = "clip.vision.preproc_max_tiles";
+    /// clip.vision.image_resize_algo — the lfm2/d1omni_v optional override
+    /// (clip-impl.h:60, read at clip.cpp:1533-1543)
+    #[allow(dead_code)] // its reading arm is the lfm2 vision family — gap open
+    pub const IMAGE_RESIZE_ALGO: &str = "clip.vision.image_resize_algo";
+    /// clip.vision.projector.scale_factor — cohere2v n_merge (clip.cpp:1522)
+    pub const PROJ_SCALE_FACTOR: &str = "clip.vision.projector.scale_factor";
     pub const LAYER_NORM_EPS: &str = "clip.vision.attention.layer_norm_epsilon";
     pub const WIN_ATTN_PATTERN: &str = "clip.vision.attention.window_pattern";
     /// clip-impl.h:60 — `clip.%s.*` templates
@@ -1458,7 +1514,32 @@ fn load_hparams(
                 ));
             }
             hparams.set_limit_image_tokens(8, 4096);
+            // clip.cpp:1704-1713 — optional model-provided pixel limits; the
+            // custom (context-param) values take precedence
+            if hparams.custom_image_min_tokens <= 0 {
+                hparams.image_min_pixels = gu32(keys::IMAGE_MIN_PIXELS)
+                    .unwrap_or(hparams.image_min_pixels);
+            }
+            if hparams.custom_image_max_tokens <= 0 {
+                hparams.image_max_pixels = gu32(keys::IMAGE_MAX_PIXELS)
+                    .unwrap_or(hparams.image_max_pixels);
+            }
             hparams.set_warmup_n_tokens(46 * 46);
+        }
+        ProjectorType::Cohere2V => {
+            // clip.cpp:1520-1528 — tiles stretch the image to the grid, the
+            // refined image is never padded
+            hparams.image_pad_rf = PadStyle::None;
+            hparams.n_merge = gu32(keys::PROJ_SCALE_FACTOR)
+                .ok_or("Key not found: clip.vision.projector.scale_factor")?;
+            hparams.preproc_max_tiles = gu32(keys::PREPROC_MAX_TILES)
+                .ok_or("Key not found: clip.vision.preproc_max_tiles")?;
+            if hparams.preproc_max_tiles <= 0 || hparams.preproc_max_tiles > 256 {
+                return Err(format!(
+                    "load_hparams: preproc_max_tiles ({}) must be in range [1, 256]",
+                    hparams.preproc_max_tiles
+                ));
+            }
         }
         ProjectorType::Gemma4UA => {
             // clip.cpp:1968-1974: encoder-free — raw 16 kHz waveform chunked
@@ -1468,8 +1549,8 @@ fn load_hparams(
             hparams.eps = 1e-6;
             hparams.n_mel_bins = 640;
         }
-        ProjectorType::Lfm2A => {
-            // clip.cpp:1951-1959
+        ProjectorType::Lfm2A | ProjectorType::D1OmniA => {
+            // clip.cpp:1951-1959 (clip.cpp:1990: d1omni_a shares the arm)
             hparams.audio_chunk_len = 1; // in seconds
             hparams.audio_sample_rate = 16000;
             hparams.audio_n_fft = 512;
@@ -1676,6 +1757,19 @@ fn load_hparams(
     Ok((hparams, proj_type))
 }
 
+/// clip.cpp:1533-1543 — the `KEY_IMAGE_RESIZE_ALGO` string parse (the
+/// lfm2/d1omni_v hparams arm). The reading arm itself lands with the lfm2
+/// vision tower family (documented gap); the parse is ported and unit-tested
+/// so the key's contract is pinned.
+fn parse_resize_algo(resize_algo: &str) -> Result<ResizeAlgo, String> {
+    match resize_algo {
+        "bilinear" => Ok(ResizeAlgo::Bilinear),
+        "bicubic" => Ok(ResizeAlgo::Bicubic),
+        "lanczos" => Ok(ResizeAlgo::Lanczos),
+        _ => Err(format!("unsupported image resize algo: {resize_algo}")),
+    }
+}
+
 fn log_line(s: &str) {
     eprintln!("clip: {s}");
 }
@@ -1875,10 +1969,28 @@ fn load_tensors(loader: &mut Loader, model: &mut ClipModel) -> Result<(), String
         // the merger graph uses fused qkv; the whisper-enc graph uses separate
         // q/k/v (build_vit's else branch, clip.cpp:412-437) and the gen-audio
         // code_predictor likewise (qwen3tts-gen.cpp:148-150), so those layers
-        // legitimately have no attn_qkv.weight
-        if layer.qkv_w.is_none() && model.modality == ClipModality::Vision {
+        // legitimately have no attn_qkv.weight — the siglip tower (cohere2v)
+        // too: HF SigLIP keeps separate q/k/v projections and the converter
+        // does not fuse them (conversion fuse_qkv defaults off)
+        if layer.qkv_w.is_none()
+            && model.modality == ClipModality::Vision
+            && !matches!(model.proj_type, ProjectorType::Cohere2V)
+        {
             return Err(format!(
                 "blk.{il}: attn_qkv.weight missing (separate q/k/v not ported)"
+            ));
+        }
+        if model.proj_type == ProjectorType::Cohere2V
+            && (layer.q_w.is_none()
+                || layer.k_w.is_none()
+                || layer.v_w.is_none()
+                || layer.ln_1_w.is_none()
+                || layer.ln_2_w.is_none())
+        {
+            // the siglip tower runs build_vit's separate-qkv branch
+            // (clip.cpp:412-437): attn_{q,k,v} + ln1/ln2 are required
+            return Err(format!(
+                "blk.{il}: siglip tower needs separate attn_q/attn_k/attn_v + ln1/ln2"
             ));
         }
         model.layers.push(layer);
@@ -1970,6 +2082,14 @@ fn load_tensors(loader: &mut Loader, model: &mut ClipModel) -> Result<(), String
                 return Err("mm.0.weight / mm.2.weight missing".into());
             }
         }
+        // cohere2v (clip.cpp:2802-2809): the two-layer llava-style projector,
+        // TN_LLAVA_PROJ mm.{1,2}.{weight,bias} — all four required
+        ProjectorType::Cohere2V => {
+            model.mm_1_w = Some(loader.get_req(&tnames::mm(1, "weight"))?);
+            model.mm_1_b = Some(loader.get_req(&tnames::mm(1, "bias"))?);
+            model.mm_2_w = Some(loader.get_req(&tnames::mm(2, "weight"))?);
+            model.mm_2_b = Some(loader.get_req(&tnames::mm(2, "bias"))?);
+        }
         // ling3vl (clip.cpp:2509-2518): the merger is norm-only — the tower's
         // merger.norm plus the top-level mm.0/mm.2 projector MLP
         ProjectorType::Ling3Vl => {
@@ -1996,8 +2116,9 @@ fn load_tensors(loader: &mut Loader, model: &mut ClipModel) -> Result<(), String
             // clip.cpp:3343-3346 — TN_A_MM_INP_PROJ
             model.mm_input_proj_w = Some(loader.get_req("mm.a.input_projection.weight")?);
         }
-        ProjectorType::Lfm2A => {
+        ProjectorType::Lfm2A | ProjectorType::D1OmniA => {
             // clip.cpp:3360-3410: pre-encode conv stack + out projection
+            // (clip.cpp:3423: d1omni_a shares the arm)
             for i in [0usize, 2, 3, 5, 6] {
                 model.pre_conv_w[i] = Some(loader.get_req(&format!("a.conv1d.{i}.weight"))?);
                 model.pre_conv_b[i] = Some(loader.get_req(&format!("a.conv1d.{i}.bias"))?);
@@ -2011,6 +2132,16 @@ fn load_tensors(loader: &mut Loader, model: &mut ClipModel) -> Result<(), String
             model.mm_1_b = Some(loader.get_req(&tnames::mm_audio_mlp(1, "bias"))?);
             model.mm_3_w = Some(loader.get_req(&tnames::mm_audio_mlp(3, "weight"))?);
             model.mm_3_b = Some(loader.get_req(&tnames::mm_audio_mlp(3, "bias"))?);
+            // clip.cpp:3439-3447 — d1omni_a's residual block after the
+            // projector: norm, down, up
+            if proj == ProjectorType::D1OmniA {
+                model.mm_4_w = Some(loader.get_req(&tnames::mm_audio_mlp(4, "weight"))?);
+                model.mm_4_b = Some(loader.get_req(&tnames::mm_audio_mlp(4, "bias"))?);
+                model.mm_5_w = Some(loader.get_req(&tnames::mm_audio_mlp(5, "weight"))?);
+                model.mm_5_b = Some(loader.get_req(&tnames::mm_audio_mlp(5, "bias"))?);
+                model.mm_6_w = Some(loader.get_req(&tnames::mm_audio_mlp(6, "weight"))?);
+                model.mm_6_b = Some(loader.get_req(&tnames::mm_audio_mlp(6, "bias"))?);
+            }
             // per-layer conformer tensors (clip.cpp:3379-3406)
             for il in 0..n_layer {
                 let layer = &mut model.layers[il as usize];
@@ -2622,6 +2753,12 @@ pub fn clip_init_modality(
         mm_2_b: None,
         mm_3_w: None,
         mm_3_b: None,
+        mm_4_w: None,
+        mm_4_b: None,
+        mm_5_w: None,
+        mm_5_b: None,
+        mm_6_w: None,
+        mm_6_b: None,
         mm_boi: None,
         mm_eoi: None,
         conv2d_w: [None, None, None],
@@ -2733,6 +2870,15 @@ pub fn clip_init_modality(
         log_line(&format!("audio_n_fft:       {}", model.hparams.audio_n_fft));
     } else if modality == ClipModality::GenAudio {
         log_line("modality:          gen-audio (experimental)");
+    } else if proj_type == ProjectorType::Cohere2V {
+        // requirements of the siglip graph (models/siglip.cpp:5-11): one
+        // patch conv and the square learned position grid
+        if model.patch_embeddings_0.is_none() || model.position_embeddings.is_none() {
+            return Err(format!(
+                "{} requires v.patch_embd.weight and v.position_embd.weight",
+                proj_type.name()
+            ));
+        }
     } else {
         // requirements of the one graph this port builds (models/qwen3vl.cpp:4-6)
         if model.patch_embeddings_0.is_none()
@@ -2829,6 +2975,10 @@ impl ClipContext {
             ProjectorType::Qwen3A => {
                 return self.ctx.ne(self.model.mm_2_w.unwrap())[1] as i32;
             }
+            // clip.cpp:6113-6114 — cohere2v's mm.2 output width
+            ProjectorType::Cohere2V => {
+                return self.ctx.ne(self.model.mm_2_w.unwrap())[1] as i32;
+            }
             // clip.cpp:5972 (gemma4v/uv/a/ua share the arm)
             ProjectorType::Gemma4UA | ProjectorType::Gemma4A => {
                 return self.ctx.ne(self.model.mm_input_proj_w.unwrap())[1] as i32;
@@ -2837,6 +2987,11 @@ impl ClipContext {
             // position-embedding width (d_model)
             ProjectorType::Lfm2A => {
                 return self.ctx.ne(self.model.position_embeddings.unwrap())[0] as i32;
+            }
+            // clip.cpp:6124-6125 — d1omni_a reports the out_proj width
+            // (position embeddings are optional for it, a657f7e98)
+            ProjectorType::D1OmniA => {
+                return self.ctx.ne(self.model.mm_3_w.unwrap())[1] as i32;
             }
             // clip.cpp:6008
             ProjectorType::GraniteSpeech => {
@@ -2918,6 +3073,12 @@ impl ClipContext {
             let y_patch = img.ny / (patch * 2);
             n_patches = x_patch * y_patch;
         }
+        // clip.cpp:4281-4287 (gemma3/idefics3/cohere2v/...): both X and Y are
+        // downscaled by the pixel-shuffle scale factor
+        if self.model.proj_type == ProjectorType::Cohere2V {
+            let scale_factor = hp.n_merge;
+            n_patches /= scale_factor * scale_factor;
+        }
         // clip.cpp:4261-4263 (qwen3a): chunk_size=100 frames -> 3x stride-2
         // conv2d -> 13 tokens per chunk
         if self.model.proj_type == ProjectorType::Qwen3A {
@@ -2931,7 +3092,11 @@ impl ClipContext {
             n_patches = img.nx;
         }
         // clip.cpp:4322-4324 (lfm2a): three stride-2 convolutions
-        if self.model.proj_type == ProjectorType::Lfm2A {
+        // (clip.cpp:4424: d1omni_a shares the arm)
+        if matches!(
+            self.model.proj_type,
+            ProjectorType::Lfm2A | ProjectorType::D1OmniA
+        ) {
             n_patches = ((((img.nx + 1) / 2) + 1) / 2 + 1) / 2;
         }
         // clip.cpp:4321-4329 (gemma4a): two stride-2 conv2d, p=1, k=3
@@ -3129,6 +3294,12 @@ impl ClipContext {
             return Err("cannot encode a placeholder image".into());
         }
 
+        // the siglip tower (cohere2v) takes its own graph: separate-qkv ViT +
+        // pixel shuffle + swapped-swiglu projector (clip.cpp:940)
+        if self.model.proj_type == ProjectorType::Cohere2V {
+            return self.image_batch_encode_siglip(imgs);
+        }
+
         self.out_embd.clear();
         let expected = self.n_output_tokens(&imgs.entries[0]) * self.n_mmproj_embd();
         let ClipContext {
@@ -3168,6 +3339,73 @@ impl ClipContext {
             p.copy_from_slice(&nodes.positions_data)
         })
         .expect("positions is an arena tensor");
+
+        ggml::compute::graph_compute(ctx, &mut graph, *n_threads);
+
+        if let Ok(path) = std::env::var("MTMD_DEBUG_NODES") {
+            let _ = debug_dump_nodes(ctx, &graph, &path);
+        }
+
+        // clip.cpp:5790 — the last graph node is the embedding tensor
+        let out = *graph.nodes.last().expect("non-empty graph");
+        let n_elems = ctx.ne(out).iter().product::<i64>() as usize;
+        let out_ty = ctx.ty(out);
+        if out_ty != GgmlType::F32 {
+            return Err(format!("expected F32 embeddings, got {out_ty:?}"));
+        }
+        if n_elems as i32 != expected {
+            return Err(format!(
+                "expected output {expected} elements, got {n_elems}"
+            ));
+        }
+        out_embd.resize(n_elems, 0.0);
+        out_embd.copy_from_slice(ctx.f32s(out).expect("arena tensor"));
+        let debug = self.debug_output_embeddings;
+        let result = std::mem::take(out_embd);
+
+        if debug {
+            dump_debug_embeddings(ctx, out);
+        }
+        Ok(result)
+    }
+
+    /// the cohere2v encode path: `clip_encode` over the siglip graph
+    /// (clip.cpp:4538-4579 pixel upload, :5790 output copy). The tiles arrive
+    /// one chunk at a time (mtmd.cpp:1478+), so this is always a single entry.
+    fn image_batch_encode_siglip(&mut self, imgs: &ClipImageF32Batch) -> Result<Vec<f32>, String> {
+        self.out_embd.clear();
+        let expected =
+            self.n_output_tokens(&imgs.entries[0]) * self.n_mmproj_embd();
+        let ClipContext {
+            ctx,
+            model,
+            watermark,
+            flash_attn_type,
+            n_threads,
+            out_embd,
+            ..
+        } = self;
+
+        ctx.reset_graph_to(*watermark);
+        let (mut graph, nodes) = build_siglip_graph(ctx, model, &imgs.entries[0], *flash_attn_type)?;
+
+        // set inputs (clip.cpp:4538-4579): the raw image, channel-major
+        let img = &imgs.entries[0];
+        let (nx, ny) = (img.nx as usize, img.ny as usize);
+        let n = nx * ny;
+        let mut inp_raw = vec![0.0f32; 3 * n];
+        for y in 0..ny {
+            for x in 0..nx {
+                let src = 3 * (y * nx + x);
+                let dst = y * nx + x;
+                inp_raw[dst] = img.buf[src];
+                inp_raw[n + dst] = img.buf[src + 1];
+                inp_raw[2 * n + dst] = img.buf[src + 2];
+            }
+        }
+        ctx.arena_resize_tensor(nodes.inp_raw);
+        ctx.with_f32_mut(nodes.inp_raw, |p| p.copy_from_slice(&inp_raw))
+            .expect("inp_raw is an arena tensor");
 
         ggml::compute::graph_compute(ctx, &mut graph, *n_threads);
 
@@ -3474,10 +3712,174 @@ fn build_graph(
     ))
 }
 
+// ======================================================================
+// siglip vision tower — models/siglip.cpp:3 `clip_graph_siglip::build`
+// (the cohere2v slice; gemma3/idefics3/lfm2/janus/phi4 tails stay in the
+// documented projector gap — only the COHERE2V projector is loadable here)
+// ======================================================================
+
+/// input handle of the siglip graph — no M-RoPE positions, just the pixels
+pub struct SiglipGraphNodes {
+    pub inp_raw: TensorId,
+    pub out: TensorId,
+}
+
+/// clip.cpp:572 `clip_graph::build_inp` — the conv2d patch embedding, brought
+/// to `[n_embd, n_patches, n_batch]`. `n_batch` is 1 here: the port encodes
+/// each llava-uhd tile as its own chunk (mtmd.cpp:1478 does the same), so the
+/// batch dim never carries multiple tiles.
+fn build_siglip_inp(
+    cx: &mut Context,
+    model: &ClipModel,
+    img: &ClipImageF32,
+    n_patches: i64,
+    n_embd: i64,
+) -> (TensorId, TensorId) {
+    let hp = &model.hparams;
+    // clip.cpp:584 `build_inp_raw`: [nx, ny, 3, n_batch], a graph input
+    let inp_raw = cx.new_tensor_4d(GgmlType::F32, img.nx as i64, img.ny as i64, 3, 1);
+    cx.set_name(inp_raw, "inp_raw");
+    // clip.cpp:574 — one conv, stride == patch, no pad
+    let mut inp = cx.conv_2d(
+        model.patch_embeddings_0.unwrap(),
+        inp_raw,
+        hp.patch_size,
+        hp.patch_size,
+        0,
+        0,
+        1,
+        1,
+    );
+    // [n_patches, n_embd, n_batch] -> transpose -> [n_embd, n_patches, B]
+    inp = cx.reshape_3d(inp, n_patches, n_embd, 1);
+    let t = cx.transpose(inp);
+    inp = cx.cont(t);
+    if let Some(b) = model.patch_bias {
+        inp = cx.add(inp, b);
+    }
+    (inp_raw, inp)
+}
+
+/// clip.cpp:901 `clip_graph::build_patch_merge_permute` — the pixel shuffle
+/// that folds a `scale_factor`-by-`scale_factor` neighborhood of patches into
+/// one merged token (aka pixel_unshuffle / patch merger).
+fn build_patch_merge_permute(
+    cx: &mut Context,
+    cur: TensorId,
+    scale_factor: i64,
+    patch_size: i32,
+    img_nx: i32,
+    img_ny: i32,
+) -> TensorId {
+    assert!(scale_factor > 1);
+    let n_embd = cx.ne(cur)[0];
+    // clip.cpp:904-905 — the patch grid of the image being encoded
+    let mut width = (img_nx / patch_size) as i64;
+    let mut height = (img_ny / patch_size) as i64;
+
+    // clip.cpp:908-917 — pad the grid up to a multiple of the scale factor
+    let pad_width = clip_align(width as i32, scale_factor as i32) as i64 - width;
+    let pad_height = clip_align(height as i32, scale_factor as i32) as i64 - height;
+    let mut cur = cx.reshape_3d(cur, n_embd, width, height);
+    if pad_width != 0 || pad_height != 0 {
+        cur = cx.pad(cur, 0, pad_width as i32, pad_height as i32, 0);
+        width += pad_width;
+        height += pad_height;
+    }
+
+    // clip.cpp:919-923 — unshuffle h
+    cur = cx.reshape_3d(cur, n_embd * scale_factor, width / scale_factor, height);
+    cur = cx.permute(cur, 0, 2, 1, 3);
+
+    // clip.cpp:925-927 — unshuffle w
+    cur = cx.cont_3d(
+        cur,
+        n_embd * scale_factor * scale_factor,
+        height / scale_factor,
+        width / scale_factor,
+    );
+    cur = cx.permute(cur, 0, 2, 1, 3);
+
+    // clip.cpp:929 — flatten the grid into the token dim
+    cx.cont_2d(cur, cx.ne(cur)[0], cx.ne(cur)[1] * cx.ne(cur)[2])
+}
+
+/// models/siglip.cpp:3 `clip_graph_siglip::build` for `cohere2v`: the ViT
+/// (`build_vit`, shared with the audio family as `build_vit_audio_opts`)
+/// followed by the idefics3-style square pixel shuffle and the two-layer
+/// swapped-swiglu projector.
+fn build_siglip_graph(
+    cx: &mut Context,
+    model: &ClipModel,
+    img: &ClipImageF32,
+    flash_attn: ClipFlashAttn,
+) -> Result<(Graph, SiglipGraphNodes), String> {
+    let hp = &model.hparams;
+    let n_embd = hp.n_embd as i64;
+    let n_head = hp.n_head as i64;
+    let n_head_kv = hp.n_head_kv as i64;
+    let d_head = if hp.n_embd_head > 0 {
+        hp.n_embd_head as i64
+    } else {
+        n_embd / n_head
+    };
+    let kq_scale = 1.0f32 / (d_head as f32).sqrt();
+    let n_patches =
+        ((img.nx / hp.patch_size) as i64) * ((img.ny / hp.patch_size) as i64);
+
+    let mut g = Graph::new(4096);
+
+    let (inp_raw, inp) = build_siglip_inp(cx, model, img, n_patches, n_embd);
+
+    // siglip.cpp:6-10 — cohere2v does NOT resize the position grid: the tiles
+    // are exactly image_size x image_size, so the learned square grid fits
+    let learned_pos_embd = model.position_embeddings;
+
+    // siglip.cpp:11-16 `build_vit`: plain LayerNorm, the model's FFN op
+    // (use_gelu -> GELU for cohere2), learned positions, no add_pos hook
+    let cur = build_vit_audio_opts(
+        cx,
+        model,
+        inp,
+        n_patches,
+        NormType::Normal,
+        hp.ffn_op,
+        learned_pos_embd,
+        n_embd,
+        n_head,
+        n_head_kv,
+        d_head,
+        kq_scale,
+        flash_attn,
+        &BuildVitAudioOpts::default(),
+    )
+    .0;
+
+    // siglip.cpp:48-56 (COHERE2V) — tiles are square, so the pixel shuffle is
+    // the same as Idefics3, then linear_1 / swiglu(gate)*x / linear_2
+    let cur = build_patch_merge_permute(
+        cx,
+        cur,
+        hp.n_merge as i64,
+        hp.patch_size,
+        img.nx,
+        img.ny,
+    );
+    let cur = cx.mul_mat(model.mm_1_w.unwrap(), cur);
+    let cur = cx.add(cur, model.mm_1_b.unwrap());
+    // linear_1 output is [x, gate], HF computes silu(gate) * x
+    let cur = swiglu_swapped(cx, cur);
+    let cur = cx.mul_mat(model.mm_2_w.unwrap(), cur);
+    let cur = cx.add(cur, model.mm_2_b.unwrap());
+
+    g.build_forward(cx, cur);
+    let out = *g.nodes.last().expect("non-empty graph");
+    Ok((g, SiglipGraphNodes { inp_raw, out }))
+}
+
 /// clip.cpp:312 `clip_graph::resize_position_embeddings` — bilinear resize of
 /// the learned 2D grid to the image's patch grid.
-fn resize_position_embeddings(
-    cx: &mut Context,
+fn resize_position_embeddings(    cx: &mut Context,
     pos_embd: TensorId,
     n_embd: i64,
     width: i64,
@@ -4313,15 +4715,17 @@ fn build_conformer_graph(
     img: &ClipImageF32,
 ) -> Result<(Graph, AudioGraphNodes), String> {
     let hp = &model.hparams;
-    // conformer.cpp:4-7
+    // conformer.cpp:4-7 (relaxed by a657f7e98 for d1omni_a files that ship no
+    // learned position embeddings — the tensor is only asserted, never used)
     let n_frames = img.nx as i64;
     let n_pos = n_frames / 2;
     let n_pos_embd = (((((n_frames + 1) / 2) + 1) / 2 + 1) / 2) * 2 - 1;
-    let pos_embd_w = model.position_embeddings.expect("checked at load");
-    assert!(
-        cx.ne(pos_embd_w)[1] >= n_pos,
-        "position_embeddings too small"
-    );
+    if let Some(pe) = model.position_embeddings {
+        assert!(
+            cx.ne(pe)[1] >= n_pos,
+            "position_embeddings too small"
+        );
+    }
 
     // d_model is hardcoded 512 in the reference graph (conformer.cpp:9)
     let d_model: i64 = 512;
@@ -4535,7 +4939,10 @@ fn build_conformer_graph(
                 };
                 let d = xn0 / 2;
                 let gate_v = cx.view_2d(x, d, xn1, xnb1, d as usize * xnb0);
-                let gate = cx.sigmoid(gate_v);
+                // a657f7e98 (conformer.cpp:167): cont the strided view before
+                // the sigmoid so the op sees a contiguous tensor on CUDA
+                let gate_c = cx.cont(gate_v);
+                let gate = cx.sigmoid(gate_c);
                 let signal = cx.view_2d(x, d, xn1, xnb1, 0);
                 x = cx.mul(signal, gate);
                 let t = cx.transpose(x);
@@ -4613,6 +5020,22 @@ fn build_conformer_graph(
         model.mm_3_b,
         FfnOp::GeluErf,
     );
+
+    // d1omni_a: residual block after the projector (conformer.cpp:210-216) —
+    // LayerNorm(1e-5) then a GELU-ERF down/up pair, added back to `cur`
+    if let Some(mm_4_w) = model.mm_4_w {
+        let x = build_norm(cx, cur, Some(mm_4_w), model.mm_4_b, NormType::Normal, 1e-5);
+        let x = build_ffn_plain(
+            cx,
+            x,
+            model.mm_5_w.unwrap(),
+            model.mm_5_b,
+            model.mm_6_w.unwrap(),
+            model.mm_6_b,
+            FfnOp::GeluErf,
+        );
+        cur = cx.add(cur, x);
+    }
 
     // the pos_emb input payload (clip.cpp:5635-5651 set_inputs)
     let n_tok = ((((img.nx + 1) / 2) + 1) / 2 + 1) / 2;
@@ -9195,7 +9618,7 @@ fn build_whisper_graph(
 // ======================================================================
 
 /// mtmd-image.h:30 `mtmd_image_preprocessor` — the base class is flattened into
-/// an enum: the port only implements the two families the merger uses.
+/// an enum: the port implements the families its loaders select.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImagePreprocessorKind {
     /// mtmd-image.h:121 — resize to a multiple of patch*n_merge keeping the
@@ -9203,6 +9626,53 @@ pub enum ImagePreprocessorKind {
     DynSize,
     /// mtmd-image.h:113 — stretch to image_size x image_size (fixed-size models)
     FixedSize,
+    /// mtmd-image.h:194 `mtmd_image_preprocessor_cohere2v` — stretch the image
+    /// to a square-tile grid, add a thumbnail when there is more than 1 tile
+    Cohere2Tiles,
+}
+
+/// mtmd-image.h:11 `mtmd_image_preproc_out` — the preprocessor result the
+/// tokenizer assembles chunks from (entries + overview + the llava-uhd grid).
+#[derive(Default)]
+pub struct ImagePreprocOut {
+    pub entries: Vec<ClipImageF32>,
+    /// the overview (downscaled) image; `None` == `!has_overview()`
+    pub overview: Option<ClipImageF32>,
+    pub grid_x: i32,
+    pub grid_y: i32,
+}
+
+impl ImagePreprocOut {
+    pub fn has_overview(&self) -> bool {
+        self.overview.as_ref().is_some_and(|o| o.nx > 0 || o.ny > 0)
+    }
+}
+
+/// mtmd-image.h:64 `mtmd_image_preprocessor_llava_uhd::slice_coordinates`
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SliceCoordinates {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+/// mtmd-image.h:70 `mtmd_image_preprocessor_llava_uhd::slice_instructions`
+/// (the pinpoints/minicpm grid search of the base class stays unported —
+/// cohere2v owns its `get_slice_instructions`, mtmd-image.cpp:1166)
+#[derive(Default)]
+struct SliceInstructions {
+    overview_size: (i32, i32),
+    refined_size: (i32, i32),
+    grid_size: (i32, i32),
+    slices: Vec<SliceCoordinates>,
+}
+
+/// mtmd-image.cpp:612 `slice_output`
+#[derive(Default)]
+struct SliceOutput {
+    overview: ClipImageU8,
+    slices: Vec<ClipImageU8>,
 }
 
 impl ClipContext {
@@ -9215,6 +9685,8 @@ impl ClipContext {
             | ProjectorType::Ling3Vl => {
                 ImagePreprocessorKind::DynSize
             }
+            // mtmd.cpp:801-810 — cohere2v picks the square-tile slicer
+            ProjectorType::Cohere2V => ImagePreprocessorKind::Cohere2Tiles,
             // audio-only projectors (incl. the tts generators): no image
             // preprocessor is ever selected
             ProjectorType::Qwen3TtsGen | ProjectorType::PocketTtsGen => {
@@ -9230,6 +9702,7 @@ impl ClipContext {
             | ProjectorType::Qwen3A
             | ProjectorType::Gemma4UA
             | ProjectorType::Lfm2A
+            | ProjectorType::D1OmniA
             | ProjectorType::Gemma4A
             | ProjectorType::GraniteSpeech
             | ProjectorType::Parakeet
@@ -9243,42 +9716,192 @@ impl ClipContext {
     /// mtmd-image.cpp:772 `mtmd_image_preprocessor_dyn_size::preprocess` /
     /// :756 `..._fixed_size::preprocess`. Returns the normalised image entries.
     pub fn image_preprocess(&self, img: &ClipImageU8) -> Result<Vec<ClipImageF32>, String> {
+        let out = self.image_preprocess_full(img)?;
+        Ok(out.entries)
+    }
+
+    /// the preprocessor entry of mtmd.cpp:1373-1390 — one `preprocess` call
+    /// per bitmap, producing the entries / overview / grid the tokenizer
+    /// assembles image chunks from.
+    pub fn image_preprocess_full(&self, img: &ClipImageU8) -> Result<ImagePreprocOut, String> {
         let hp = &self.model.hparams;
-        let mut resized = ClipImageU8::default();
         match self.image_preprocessor() {
-            ImagePreprocessorKind::DynSize => {
-                assert!(hp.image_min_pixels > 0 && hp.image_max_pixels > 0);
-                let target = img_tool::calc_size_preserved_ratio(
-                    (img.nx, img.ny),
-                    hp.patch_size as i64 * hp.n_merge as i64,
-                    hp.image_min_pixels as i64,
-                    hp.image_max_pixels as i64,
-                    0,
-                );
-                img_tool::resize(
-                    img,
-                    &mut resized,
-                    target,
-                    hp.image_resize_algo,
-                    hp.image_resize_pad,
-                    hp.image_pad_color,
-                );
+            ImagePreprocessorKind::Cohere2Tiles => {
+                // mtmd-image.cpp:1145-1163
+                // `mtmd_image_preprocessor_cohere2v::preprocess`
+                let inst = self.get_slice_instructions_cohere2v((img.nx, img.ny));
+                let sliced = self.slice_image(img, &inst);
+
+                let mut output = ImagePreprocOut::default();
+                // mtmd_image_preproc_out::append_overview (mtmd-image.cpp:22)
+                let mut ov = ClipImageF32::from_u8(&sliced.overview);
+                ov.normalize(&hp.image_mean, &hp.image_std);
+                if sliced.slices.is_empty() {
+                    // no tiles: the overview alone is the entry list
+                    output.overview = Some(ov);
+                    return Ok(output);
+                }
+                // slices first, then thumbnail (ov_img_first == false,
+                // mtmd.cpp:808)
+                for s in &sliced.slices {
+                    let mut e = ClipImageF32::from_u8(s);
+                    e.normalize(&hp.image_mean, &hp.image_std);
+                    output.entries.push(e);
+                }
+                output.overview = Some(ov);
+                output.grid_x = inst.grid_size.0;
+                output.grid_y = inst.grid_size.1;
+                Ok(output)
             }
-            ImagePreprocessorKind::FixedSize => {
-                let sz = hp.image_size;
-                img_tool::resize(
-                    img,
-                    &mut resized,
-                    (sz, sz),
-                    hp.image_resize_algo,
-                    hp.image_resize_pad,
-                    hp.image_pad_color,
-                );
+            kind => {
+                let mut resized = ClipImageU8::default();
+                match kind {
+                    ImagePreprocessorKind::DynSize => {
+                        assert!(hp.image_min_pixels > 0 && hp.image_max_pixels > 0);
+                        let target = img_tool::calc_size_preserved_ratio(
+                            (img.nx, img.ny),
+                            hp.patch_size as i64 * hp.n_merge as i64,
+                            hp.image_min_pixels as i64,
+                            hp.image_max_pixels as i64,
+                            0,
+                        );
+                        img_tool::resize(
+                            img,
+                            &mut resized,
+                            target,
+                            hp.image_resize_algo,
+                            hp.image_resize_pad,
+                            hp.image_pad_color,
+                        );
+                    }
+                    ImagePreprocessorKind::FixedSize => {
+                        let sz = hp.image_size;
+                        img_tool::resize(
+                            img,
+                            &mut resized,
+                            (sz, sz),
+                            hp.image_resize_algo,
+                            hp.image_resize_pad,
+                            hp.image_pad_color,
+                        );
+                    }
+                    ImagePreprocessorKind::Cohere2Tiles => unreachable!(),
+                }
+                let mut out = ClipImageF32::from_u8(&resized);
+                out.normalize(&hp.image_mean, &hp.image_std);
+                Ok(ImagePreprocOut {
+                    entries: vec![out],
+                    overview: None,
+                    grid_x: 0,
+                    grid_y: 0,
+                })
             }
         }
-        let mut out = ClipImageF32::from_u8(&resized);
-        out.normalize(&hp.image_mean, &hp.image_std);
-        Ok(vec![out])
+    }
+
+    /// mtmd-image.cpp:1166
+    /// `mtmd_image_preprocessor_cohere2v::get_slice_instructions` — pick the
+    /// grid with the least upscale; if all grids need downscale, pick the one
+    /// with the least downscale. Grids are visited by tile count, then by
+    /// width, same order as HF for ties.
+    fn get_slice_instructions_cohere2v(&self, original_size: (i32, i32)) -> SliceInstructions {
+        let hp = &self.model.hparams;
+        let tile = hp.image_size;
+
+        let mut best_down = -1.0f64;
+        let mut best_up = f64::MAX;
+        let mut grid_down = (1, 1);
+        let mut grid_up = (0, 0);
+        for n in 1..=hp.preproc_max_tiles {
+            for w in 1..=n {
+                if n % w != 0 {
+                    continue;
+                }
+                let g = (w, n / w);
+                let scale = f64::min(
+                    (g.0 as f64 * tile as f64) / original_size.0 as f64,
+                    (g.1 as f64 * tile as f64) / original_size.1 as f64,
+                );
+                if scale < 1.0 {
+                    if scale > best_down {
+                        best_down = scale;
+                        grid_down = g;
+                    }
+                } else if scale < best_up {
+                    best_up = scale;
+                    grid_up = g;
+                }
+            }
+        }
+        let grid = if grid_up.0 > 0 { grid_up } else { grid_down };
+
+        let mut inst = SliceInstructions {
+            overview_size: (tile, tile),
+            refined_size: (tile * grid.0, tile * grid.1),
+            grid_size: grid,
+            slices: Vec::new(),
+        };
+        if grid.0 * grid.1 > 1 {
+            for y in 0..grid.1 {
+                for x in 0..grid.0 {
+                    inst.slices.push(SliceCoordinates {
+                        x: x * tile,
+                        y: y * tile,
+                        w: tile,
+                        h: tile,
+                    });
+                }
+            }
+        }
+        inst
+    }
+
+    /// mtmd-image.cpp:613 `mtmd_image_preprocessor_llava_uhd::slice_image` —
+    /// the overview resize, the refined (grid-sized) resize and the crops.
+    fn slice_image(&self, img: &ClipImageU8, inst: &SliceInstructions) -> SliceOutput {
+        let hp = &self.model.hparams;
+        let mut output = SliceOutput::default();
+
+        // resize to overview size (algo/pad/color *_ov, mtmd-image.cpp:619)
+        img_tool::resize(
+            img,
+            &mut output.overview,
+            inst.overview_size,
+            hp.image_resize_algo_ov,
+            hp.image_pad_ov,
+            hp.image_pad_color_ov,
+        );
+
+        if inst.slices.is_empty() {
+            // no slices, just return the overview image
+            return output;
+        }
+
+        // resize to refined size (algo/pad/color *_rf, mtmd-image.cpp:630)
+        let mut refined_img = ClipImageU8::default();
+        img_tool::resize(
+            img,
+            &mut refined_img,
+            inst.refined_size,
+            hp.image_resize_algo_rf,
+            hp.image_pad_rf,
+            hp.image_pad_color_rf,
+        );
+
+        // create slices
+        for slice in &inst.slices {
+            let mut img_slice = ClipImageU8::default();
+            img_tool::crop(
+                &refined_img,
+                &mut img_slice,
+                slice.x,
+                slice.y,
+                slice.w,
+                slice.h,
+            );
+            output.slices.push(img_slice);
+        }
+        output
     }
 }
 
@@ -9417,6 +10040,30 @@ pub mod img_tool {
         for y in 0..img.ny {
             for x in 0..img.nx {
                 img.set_pixel(x, y, color);
+            }
+        }
+    }
+
+    /// mtmd-image.cpp:127 `img_tool::crop` — the pixel-copy window the
+    /// llava-uhd slicer cuts tiles with
+    pub fn crop(
+        image: &ClipImageU8,
+        dst: &mut ClipImageU8,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) {
+        assert!(x >= 0 && y >= 0 && w > 0 && h > 0);
+        assert!(x + w <= image.nx && y + h <= image.ny);
+        dst.set_size(w, h, image.is_placeholder());
+        if image.is_placeholder() {
+            // no-op for placeholder image, just set the size and return
+            return;
+        }
+        for i in 0..h {
+            for j in 0..w {
+                dst.set_pixel(j, i, image.get_pixel(x + j, y + i));
             }
         }
     }
@@ -9899,6 +10546,10 @@ pub fn debug_pattern_cb(size: i32) -> ClipImageF32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sc(x: i32, y: i32, w: i32, h: i32) -> SliceCoordinates {
+        SliceCoordinates { x, y, w, h }
+    }
     use ggml::gguf_write::GgufWriter;
     use ggml::Value;
 
@@ -10457,6 +11108,392 @@ mod tests {
         assert_eq!(cx.n_output_tokens(&entries[0]), 196);
         assert_eq!(cx.n_output_tokens_x(&entries[0]), 14);
         assert_eq!(cx.n_output_tokens_y(&entries[0]), 14);
+    }
+
+    // ------------------------------------------------------------------
+    // synthetic cohere2v mmproj — the siglip tower (separate q/k/v ViT with
+    // learned positions) + the swapped-swiglu two-layer projector
+    // (upstream 50a6c5cf7, conversion/command_r.py Cohere2VisionModel)
+    // ------------------------------------------------------------------
+
+    /// The tensor/metadata layout a converted `Cohere2VisionModel` carries:
+    /// separate attn_{q,k,v} (HF SigLIP, no conversion qkv fusion), pre/post
+    /// layernorms, patch bias, TN_LLAVA_PROJ mm.{1,2} with biases, and the
+    /// cohere2v kv (scale_factor + preproc_max_tiles + use_gelu).
+    fn write_synth_mmproj_cohere2v(path: &str) {
+        const IMAGE_SIZE: i64 = 64; // the tile edge
+        const PATCH: i64 = 8;
+        const N_EMBD: i64 = 16;
+        const N_FF: i64 = 32;
+        const N_HEAD: i64 = 2;
+        const N_MERGE: i64 = 2;
+        const MAX_TILES: i64 = 4;
+        const D1: i64 = 24; // the hidden width between linear_1 / linear_2
+        // == n_mmproj_embd (mm.2 out); must equal the parity text model's
+        // n_embd (qwen2.5-0.5b: 896) — mtmd_init_from_file checks the match
+        const PROJ: i64 = 896;
+        const N_POS: i64 = (IMAGE_SIZE / PATCH) * (IMAGE_SIZE / PATCH);
+
+        let mut w = GgufWriter::new(32);
+        w.set_kv("general.architecture", Value::String("clip".into()));
+        w.set_kv(
+            "general.name",
+            Value::String("llama-rust-synth-cohere2v".into()),
+        );
+        w.set_kv("general.file_type", Value::U32(0));
+        w.set_kv("clip.has_vision_encoder", Value::Bool(true));
+        w.set_kv("clip.projector_type", Value::String("cohere2v".into()));
+        // command_r.py set_gguf_parameters: add_vision_use_gelu(True)
+        w.set_kv("clip.use_gelu", Value::Bool(true));
+        w.set_kv("clip.vision.image_size", Value::U32(IMAGE_SIZE as u32));
+        w.set_kv("clip.vision.patch_size", Value::U32(PATCH as u32));
+        w.set_kv("clip.vision.embedding_length", Value::U32(N_EMBD as u32));
+        w.set_kv("clip.vision.feed_forward_length", Value::U32(N_FF as u32));
+        w.set_kv("clip.vision.block_count", Value::U32(1));
+        w.set_kv(
+            "clip.vision.attention.head_count",
+            Value::U32(N_HEAD as u32),
+        );
+        w.set_kv("clip.vision.projection_dim", Value::U32(PROJ as u32));
+        w.set_kv(
+            "clip.vision.attention.layer_norm_epsilon",
+            Value::F32(1e-6),
+        );
+        // command_r.py: add_vision_projector_scale_factor(downsample_factor)
+        w.set_kv(
+            "clip.vision.projector.scale_factor",
+            Value::U32(N_MERGE as u32),
+        );
+        // command_r.py: add_vision_preproc_max_tiles(max_patches)
+        w.set_kv(
+            "clip.vision.preproc_max_tiles",
+            Value::U32(MAX_TILES as u32),
+        );
+        w.set_kv(
+            "clip.vision.image_mean",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+        w.set_kv(
+            "clip.vision.image_std",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+
+        let mut names: Vec<(String, [i64; 4])> = Vec::new();
+        let mut push =
+            |w: &mut GgufWriter, names: &mut Vec<(String, [i64; 4])>, n: String, ne: [i64; 4]| {
+                w.add_tensor(&n, GgmlType::F32, ne);
+                names.push((n, ne));
+            };
+        push(
+            &mut w,
+            &mut names,
+            "v.patch_embd.weight".into(),
+            [PATCH, PATCH, 3, N_EMBD],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.patch_embd.bias".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.position_embd.weight".into(),
+            [N_EMBD, N_POS, 1, 1],
+        );
+        push(&mut w, &mut names, "v.pre_ln.weight".into(), [N_EMBD, 1, 1, 1]);
+        push(&mut w, &mut names, "v.pre_ln.bias".into(), [N_EMBD, 1, 1, 1]);
+        push(
+            &mut w,
+            &mut names,
+            "v.post_ln.weight".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(&mut w, &mut names, "v.post_ln.bias".into(), [N_EMBD, 1, 1, 1]);
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.ln1.weight".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(&mut w, &mut names, "v.blk.0.ln1.bias".into(), [N_EMBD, 1, 1, 1]);
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_q.weight".into(),
+            [N_EMBD, N_EMBD, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_q.bias".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_k.weight".into(),
+            [N_EMBD, N_EMBD, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_k.bias".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_v.weight".into(),
+            [N_EMBD, N_EMBD, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_v.bias".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_out.weight".into(),
+            [N_EMBD, N_EMBD, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.attn_out.bias".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.ln2.weight".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(&mut w, &mut names, "v.blk.0.ln2.bias".into(), [N_EMBD, 1, 1, 1]);
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.ffn_up.weight".into(),
+            [N_EMBD, N_FF, 1, 1],
+        );
+        push(&mut w, &mut names, "v.blk.0.ffn_up.bias".into(), [N_FF, 1, 1, 1]);
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.ffn_down.weight".into(),
+            [N_FF, N_EMBD, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.blk.0.ffn_down.bias".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        // TN_LLAVA_PROJ mm.{1,2}.{weight,bias}; linear_1 outputs [x, gate]
+        push(
+            &mut w,
+            &mut names,
+            "mm.1.weight".into(),
+            [N_EMBD * N_MERGE * N_MERGE, 2 * D1, 1, 1],
+        );
+        push(&mut w, &mut names, "mm.1.bias".into(), [2 * D1, 1, 1, 1]);
+        push(&mut w, &mut names, "mm.2.weight".into(), [D1, PROJ, 1, 1]);
+        push(&mut w, &mut names, "mm.2.bias".into(), [PROJ, 1, 1, 1]);
+
+        // deterministic weights in [-0.1, 0.1): no NaN/Inf risk in the chain
+        let payloads: Vec<Vec<u8>> = names
+            .iter()
+            .enumerate()
+            .map(|(ti, (_, ne))| {
+                let n: i64 = ne.iter().product();
+                let mut bytes = Vec::with_capacity(n as usize * 4);
+                for i in 0..n {
+                    let v = (((ti * 7919 + i as usize * 104729) % 2001) as f32 / 10000.0) - 0.1;
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                bytes
+            })
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        let f = std::fs::File::create(path).expect("create synth cohere2v mmproj");
+        let mut bw = std::io::BufWriter::new(f);
+        w.write(&mut bw, &refs).expect("write synth cohere2v mmproj");
+    }
+
+    /// The cohere2v pipeline at toy scale: kv parsing, the tensor table, the
+    /// llava-uhd square-tile slicing, the siglip ViT and the projector.
+    #[test]
+    fn synth_cohere2v_load_preprocess_encode() {
+        let dir = std::env::temp_dir().join("llama-rust-mtmd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth-mmproj-cohere2v.gguf");
+        let path_s = path.to_str().unwrap().to_string();
+        write_synth_mmproj_cohere2v(&path_s);
+
+        let mut cx =
+            clip_init_from_file(&path_s, &ClipContextParams::default()).expect("load synth");
+        assert_eq!(cx.model.proj_type, ProjectorType::Cohere2V);
+        assert_eq!(cx.n_mmproj_embd(), 896);
+        let hp = cx.hparams().clone();
+        assert_eq!(
+            (hp.image_size, hp.patch_size, hp.n_embd, hp.n_layer, hp.n_merge),
+            (64, 8, 16, 1, 2)
+        );
+        assert_eq!(hp.preproc_max_tiles, 4);
+        // clip.cpp:1521 — the refined image is never padded
+        assert_eq!(hp.image_pad_rf, PadStyle::None);
+
+        // slicing geometry (mtmd-image.cpp:1166): a 150x100 image with tile 64
+        // and max 4 tiles picks the (2,2) grid (least downscale), stretches
+        // the image to 128x128 and adds a 64x64 thumbnail
+        let img = synth_image(150, 100);
+        let pre = cx.image_preprocess_full(&img).expect("preprocess");
+        assert_eq!(pre.grid_x, 2);
+        assert_eq!(pre.grid_y, 2);
+        assert_eq!(pre.entries.len(), 4);
+        for e in &pre.entries {
+            assert_eq!((e.nx, e.ny), (64, 64));
+            assert_eq!(cx.n_output_tokens(e), 16); // (64/8)^2 / 2^2
+        }
+        let ov = pre.overview.as_ref().expect("overview");
+        assert_eq!((ov.nx, ov.ny), (64, 64));
+        assert_eq!(cx.n_output_tokens(ov), 16);
+
+        // a small image takes the overview-only path (grid 1x1 -> no slices)
+        let small = synth_image(50, 40);
+        let pre2 = cx.image_preprocess_full(&small).expect("preprocess small");
+        assert_eq!(pre2.entries.len(), 0);
+        assert!(pre2.has_overview());
+        assert_eq!(pre2.grid_x, 0);
+        assert_eq!(pre2.grid_y, 0);
+        let ov2 = pre2.overview.as_ref().unwrap();
+        assert_eq!((ov2.nx, ov2.ny), (64, 64));
+
+        // encode one tile: [n_mmproj_embd=20, 16 tokens]
+        let batch = ClipImageF32Batch {
+            entries: vec![pre.entries[0].clone()],
+            is_audio: false,
+        };
+        let embd = cx.image_batch_encode(&batch).expect("encode");
+        assert_eq!(embd.len(), 896 * 16);
+        assert!(embd.iter().all(|v| v.is_finite()));
+        assert!(embd.iter().any(|v| *v != 0.0));
+
+        // repeated encodes reuse the same graph/arena: bit-identical output
+        let embd2 = cx.image_batch_encode(&batch).expect("encode again");
+        assert_eq!(embd, embd2, "repeated encode must be bit-identical");
+
+        // the FA-off path builds the soft_max_ext attention instead
+        let mut cx_off = clip_init_from_file(
+            &path_s,
+            &ClipContextParams {
+                flash_attn_type: ClipFlashAttn::Disabled,
+                ..Default::default()
+            },
+        )
+        .expect("reload fa-off");
+        let embd_off = cx_off.image_batch_encode(&batch).expect("encode fa off");
+        assert_eq!(embd_off.len(), 896 * 16);
+
+        let _ = TEXT_JACKRONG;
+    }
+
+    /// clip.cpp:1533-1543 — KEY_IMAGE_RESIZE_ALGO parse contract
+    #[test]
+    fn resize_algo_parse() {
+        assert_eq!(parse_resize_algo("bilinear").unwrap(), ResizeAlgo::Bilinear);
+        assert_eq!(parse_resize_algo("bicubic").unwrap(), ResizeAlgo::Bicubic);
+        assert_eq!(parse_resize_algo("lanczos").unwrap(), ResizeAlgo::Lanczos);
+        assert!(parse_resize_algo("nearest").is_err());
+    }
+
+    /// cohere2v grid selection (mtmd-image.cpp:1166) against hand-computed
+    /// HF behavior: least upscale wins, then least downscale.
+    #[test]
+    fn cohere2v_slice_instructions() {
+        let dir = std::env::temp_dir().join("llama-rust-mtmd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth-mmproj-cohere2v.gguf");
+        let path_s = path.to_str().unwrap().to_string();
+        write_synth_mmproj_cohere2v(&path_s);
+        let cx = clip_init_from_file(&path_s, &ClipContextParams::default()).unwrap();
+
+        // 150x100, tile 64, max 4: all grids downscale; best is (2,2) with
+        // scale min(128/150, 128/100) = 0.8533
+        let inst = cx.get_slice_instructions_cohere2v((150, 100));
+        assert_eq!(inst.grid_size, (2, 2));
+        assert_eq!(inst.refined_size, (128, 128));
+        assert_eq!(inst.overview_size, (64, 64));
+        assert_eq!(inst.slices.len(), 4);
+        assert_eq!(inst.slices[1], sc(64, 0, 64, 64));
+
+        // 700x500, tile 64, max 4: (4,1) upscales least? min(256/700, 64/500)
+        // = 0.128 <1; (2,2): min(128/700,128/500)=0.1829; (3,1) is not a
+        // divisor of any n<=4 except n=3: (1,3) min(64/700,192/500)=0.0914,
+        // (3,1) min(192/700,64/500)=0.128. Best downscale: (2,2) 0.1829.
+        let inst = cx.get_slice_instructions_cohere2v((700, 500));
+        assert_eq!(inst.grid_size, (2, 2));
+        assert_eq!(inst.slices.len(), 4);
+
+        // 40x30 (smaller than the tile): grid (1,1), no slices
+        let inst = cx.get_slice_instructions_cohere2v((40, 30));
+        assert_eq!(inst.grid_size, (1, 1));
+        assert!(inst.slices.is_empty());
+        assert_eq!(inst.refined_size, (64, 64));
+
+        // a wide image: 100x150 with max 4 — (1,3) would need n=3: scale
+        // min(64/100, 192/150) = 0.64; (2,2): min(0.8533...) wait 128/100=1.28,
+        // 128/150=0.8533 -> 0.8533 (best); so (2,2)
+        let inst = cx.get_slice_instructions_cohere2v((100, 150));
+        assert_eq!(inst.grid_size, (2, 2));
+    }
+
+    /// Encoder parity against the reference: `llama-mtmd-debug -p encode
+    /// --image cb -n 64` with `MTMD_DEBUG_EMBEDDINGS=<path>` on the same
+    /// synthetic mmproj dumps the reference's embeddings of the raw `cb`
+    /// bitmap. Run via parity/cohere2v_parity.sh (see PARITY.md).
+    #[test]
+    #[ignore = "needs the synthetic mmproj + a reference dump"]
+    fn clip_cb_parity_dump_cohere2v() {
+        let size = std::env::var("MTMD_CB_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64);
+        let fa = match std::env::var("MTMD_FA").as_deref() {
+            Ok("off") => ClipFlashAttn::Disabled,
+            Ok("on") => ClipFlashAttn::Enabled,
+            _ => ClipFlashAttn::Auto,
+        };
+        let mmproj = std::env::var("MTMD_COHERE2V_MMPROJ").unwrap_or_else(|_| {
+            let dir = std::env::temp_dir().join("llama-rust-mtmd");
+            dir.join("synth-mmproj-cohere2v.gguf")
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+        write_synth_mmproj_cohere2v(&mmproj);
+        let params = ClipContextParams {
+            flash_attn_type: fa,
+            ..Default::default()
+        };
+        let mut cx = clip_init_from_file(&mmproj, &params).expect("load synth cohere2v");
+        let img = debug_pattern_cb(size);
+        let batch = ClipImageF32Batch {
+            entries: vec![img],
+            is_audio: false,
+        };
+        let embd = cx.image_batch_encode(&batch).expect("encode");
+        let n_tokens = cx.n_output_tokens(&batch.entries[0]);
+        let out = std::env::var("MTMD_CB_OUT")
+            .unwrap_or_else(|_| format!("/tmp/rust_cb_cohere2v_{size}.bin"));
+        write_embedding_dump(&out, &embd, n_tokens, cx.n_mmproj_embd()).unwrap();
+        eprintln!(
+            "wrote {out} ({n_tokens} tokens x {} embd)",
+            cx.n_mmproj_embd()
+        );
     }
 
     /// Encoder parity against the reference: `llama-mtmd-debug -p encode

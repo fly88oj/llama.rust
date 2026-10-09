@@ -41,6 +41,7 @@ pub mod wkv;
 
 pub use gguf::{Gguf, GgufError, GgufType, TensorInfo, Value};
 pub use graph::Graph;
+pub use ops::GgmlPrec;
 pub use tensor::{Context, GgmlOp, Storage, TensorId, TensorMeta};
 pub use types::{GgmlType, MAX_DIMS, MAX_NAME, MAX_OP_PARAMS, MAX_SRC};
 

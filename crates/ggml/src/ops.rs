@@ -123,6 +123,21 @@ pub const GGML_SCALE_FLAG_ANTIALIAS: u32 = 0x200;
 /// (llama-impl.h:70) always sets it.
 pub const GGML_HINT_SRC0_IS_HADAMARD: i32 = 1;
 
+/// ggml.h:436-451 enum ggml_prec — [TAG_GGML_PREC]. The minimum required
+/// accumulator (or src) precision a backend implementation may use; encoded
+/// as an i32 in the op_params slots laid out in ggml-impl.h:163-173.
+/// `Undefined` doubles as the deprecated `GGML_PREC_DEFAULT` (both 0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum GgmlPrec {
+    Undefined = 0,
+    F32 = 10,
+    Bf16 = 15,
+    F16 = 20,
+    Q8 = 30,
+    Q4 = 40,
+}
+
 /// ggml.h rope types
 pub const GGML_ROPE_TYPE_NORMAL: i32 = 0;
 pub const GGML_ROPE_TYPE_NEOX: i32 = 2;
@@ -1314,6 +1329,33 @@ impl Context {
     pub fn mul_mat_set_hint_hadamard(&mut self, r: TensorId) {
         assert_eq!(self.op(r), GgmlOp::MulMat, "mul_mat_set_hint_hadamard: not a MUL_MAT");
         self.set_op_params_i32(r, &[0, GGML_HINT_SRC0_IS_HADAMARD]);
+    }
+
+    /// ggml_prec_set_acc (ggml.c:3291-3315) — [TAG_GGML_PREC]: set the
+    /// minimum required accumulator type for the implementing kernel.
+    /// Encoding: MUL_MAT / MUL_MAT_ID → op_params[0]; FLASH_ATTN_EXT →
+    /// op_params[3] (after the scale/max_bias/logit_softcap f32s, exactly the
+    /// slot the deprecated `ggml_flash_attn_ext_set_prec` wrote, ggml.c:5551;
+    /// the deprecated `ggml_mul_mat_set_prec`, ggml.c:3367, likewise wrote
+    /// slot 0). Any other op returns false with no write.
+    ///
+    /// CPU behavior note (batch 42b): the CPU kernels never read the acc slot
+    /// (ggml-cpu/ops.cpp has no op_params[0] consumer for MUL_MAT/FLASH_ATTN_
+    /// EXT) — the hint only steers CUDA/Metal W4A4 kernels (e.g. NVFP4's
+    /// BF16 accumulator, llama-graph.cpp:1562). The port encodes the slot
+    /// bit-for-bit so ForeignExecutor/GPU paths and op-dump parity see the
+    /// same bytes; single-thread CPU numerics are unchanged by construction.
+    pub fn prec_set_acc(&mut self, a: TensorId, prec: GgmlPrec) -> bool {
+        match self.op(a) {
+            GgmlOp::MulMat | GgmlOp::MulMatId => {
+                self.set_op_params_i32_at(a, 0, prec as i32);
+            }
+            GgmlOp::FlashAttnExt => {
+                self.set_op_params_i32_at(a, 3, prec as i32);
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// verify against ggml_mul_mat_id (ggml.c:3354) — MoE expert matmul: `as` is a stack of
@@ -3010,6 +3052,57 @@ mod tests {
         }
         assert_eq!(ggml_expf(-200.0), 0.0);
         assert!(ggml_expf(200.0).is_infinite());
+    }
+
+    /// ggml_prec_set_acc (ggml.c:3291-3315) — [TAG_GGML_PREC] encoding pinned
+    /// against the reference .so (parity/prec_acc_probe.c dumps the same
+    /// slots from build-rust-ref's libggml @ c35b66744; output saved in
+    /// parity/prec_acc_ref.txt): MUL_MAT/MUL_MAT_ID take the acc in
+    /// op_params[0], FLASH_ATTN_EXT in op_params[3] behind the three f32s,
+    /// every other op is rejected. GGML_PREC_* values per ggml.h:444-450.
+    #[test]
+    fn prec_set_acc_encoding() {
+        let mut ctx = Context::new();
+        let w = ctx.new_tensor_2d(GgmlType::F32, 16, 8);
+        let x = ctx.new_tensor_2d(GgmlType::F32, 16, 3);
+
+        // MUL_MAT: slot 0, other slots untouched (hint rides slot 1)
+        let mm = ctx.mul_mat(w, x);
+        ctx.mul_mat_set_hint_hadamard(mm);
+        assert!(ctx.prec_set_acc(mm, GgmlPrec::Bf16));
+        assert_eq!(ctx.op_params(mm)[0], 15); // GGML_PREC_BF16
+        assert_eq!(ctx.op_params(mm)[1], GGML_HINT_SRC0_IS_HADAMARD);
+
+        // MUL_MAT_ID: slot 0 as well
+        let we = ctx.new_tensor_3d(GgmlType::F32, 16, 8, 4);
+        let x3 = ctx.new_tensor_3d(GgmlType::F32, 16, 2, 2);
+        let ids = ctx.new_tensor_2d(GgmlType::I32, 2, 2);
+        let mmid = ctx.mul_mat_id(we, x3, ids);
+        assert!(ctx.prec_set_acc(mmid, GgmlPrec::F32));
+        assert_eq!(ctx.op_params(mmid)[0], 10); // GGML_PREC_F32
+
+        // FLASH_ATTN_EXT: slot 3 behind scale/max_bias/logit_softcap
+        let q = ctx.new_tensor_4d(GgmlType::F32, 16, 3, 2, 1);
+        let k = ctx.new_tensor_4d(GgmlType::F32, 16, 5, 2, 1);
+        let v = ctx.new_tensor_4d(GgmlType::F32, 16, 5, 2, 1);
+        let fa = ctx.flash_attn_ext(q, k, v, None, 0.125f32, 0.0, 0.0);
+        assert!(ctx.prec_set_acc(fa, GgmlPrec::Bf16));
+        assert_eq!(f32::from_bits(ctx.op_params(fa)[0] as u32), 0.125);
+        assert_eq!(ctx.op_params(fa)[3], 15); // GGML_PREC_BF16
+
+        // any other op: rejected, no write
+        let y = ctx.new_tensor_2d(GgmlType::F32, 16, 3);
+        let s = ctx.add(x, y);
+        assert!(!ctx.prec_set_acc(s, GgmlPrec::Bf16));
+        assert_eq!(ctx.op_params(s)[0], 0);
+
+        // enum discriminants pinned to ggml.h:444-450
+        assert_eq!(GgmlPrec::Undefined as i32, 0);
+        assert_eq!(GgmlPrec::F32 as i32, 10);
+        assert_eq!(GgmlPrec::Bf16 as i32, 15);
+        assert_eq!(GgmlPrec::F16 as i32, 20);
+        assert_eq!(GgmlPrec::Q8 as i32, 30);
+        assert_eq!(GgmlPrec::Q4 as i32, 40);
     }
 
     #[test]
