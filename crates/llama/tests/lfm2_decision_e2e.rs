@@ -387,6 +387,7 @@ impl D1Driver {
             kq_mask_head: head_mask,
             conv_left,
             conv_right,
+            mixed: None,
             out_ids: None,
         };
         let result =

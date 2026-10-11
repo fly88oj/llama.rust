@@ -5970,6 +5970,9 @@ impl DecodeContext {
                     kq_mask_head,
                     conv_left,
                     conv_right,
+                    // the decode driver's step is token-only (the decision
+                    // media rows ride the engine's D1OmniCore, not decode)
+                    mixed: None,
                     // the decode driver's out_ids gather narrows the last head
                     // block's rows (lfm2.cpp:542-546) — decode's single output
                     // row makes the scores [3, 1]

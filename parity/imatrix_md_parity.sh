@@ -14,15 +14,26 @@
 # weights, and the two runs must produce the SAME imatrix — the semantics
 # the reference itself proves (ref md == ref nextn, byte-identical).
 #
-# Honest scope note: a direct rust-vs-ref byte compare of the imatrix is NOT
-# achievable on this fixture — the port's qwen35 trunk forward carries a
-# pre-existing ~1-ulp activation divergence vs the reference (the plain,
-# nextn-free run diverges identically: blk.1.ffn_gate/up skew + the layer
-# aggregate; the GDN block blk.0 matches bit-exactly; the 27B token-anchor
-# IDENTICAL runs never exposed it). The `-md`-specific behavior is therefore
-# verified as: (a) both sides' md==nextn self-consistency, byte-identical;
-# (b) the --show-statistics stdout agrees structurally byte-for-byte and
-# numerically to the last printed digit (≤2e-4 absolute on every cell).
+# Honest scope note (updated 2026-10-11): the "pre-existing ~1-ulp qwen35
+# trunk divergence" of the previous revision is CLOSED — its root cause was
+# the imatrix tool's FlashAttn::Auto treated as OFF while the reference
+# resolves AUTO→ON through its CPU support probe (llama-context.cpp:566-569),
+# i.e. the reference ran FLASH_ATTN_EXT and the port the non-FA path
+# (max|d| 2.6 at blk.1 attn_gated-1, diluted into the FFN stats tail). With
+# crates/tools/imatrix's Auto⇒on fix the --show-statistics stdout is now
+# 0 numeric cells different (validated against the reference artifacts; the
+# raw multi-chunk GGUF still carries a single-cell 1-ulp in one in_sum2
+# tail, below print resolution, with bit-identical collected src1 rows on
+# both engines — characterized in the parity ledger, not the forward).
+#
+# Reference-side flake (aa94f2086): the `-md` lane's reference run
+# intermittently (observed 4/5 fresh attempts) aborts at
+# llama-graph.cpp:155 `GGML_ASSERT(ubatch->embd_state ...)` inside the
+# nextn collector decode — evidence: parity/imatrix_md/ref-md-abort-*.err.
+# When it aborts, this script's grep still passes (the startup banner
+# appears in .err before the crash) and the comparisons fall back to the
+# last successful reference artifacts (Oct 10 01:09, FA-on behavior — the
+# same numerics). Re-run until the reference completes to refresh them.
 # llama-rust-data-home: root of the local model/reference corpus (default: $HOME)
 DATA_HOME="${LLAMA_RUST_DATA_HOME:-$HOME}"
 set -uo pipefail

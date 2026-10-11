@@ -19,6 +19,7 @@ use crate::ops::{
     OP_FLAG_GET_ROWS_BACK,
     OP_FLAG_NORM_IS_RMS, OP_FLAG_NORM_IS_L2, GGML_ROPE_TYPE_IMROPE, GGML_ROPE_TYPE_MROPE, GGML_ROPE_TYPE_NEOX,
     GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_VISION, GGML_SCALE_FLAG_ALIGN_CORNERS,
+    GGML_SCALE_FLAG_ANTIALIAS,
     GGML_SCALE_MODE_BICUBIC, GGML_SCALE_MODE_BILINEAR, GGML_SCALE_MODE_NEAREST,
     GGML_SORT_ORDER_ASC, GGML_UNARY_OP_EXP, GGML_UNARY_OP_GELU, GGML_UNARY_OP_GELU_ERF,
     GGML_UNARY_OP_ROUND, GGML_UNARY_OP_XIELU,
@@ -2374,6 +2375,36 @@ impl<'a> Cpu<'a> {
                         let x = self.rd_f32s(s0, i1 * nb01 + k * 4, 1)[0];
                         let g = self.rd_f32s(s1, i1 * nb11 + k * 4, 1)[0];
                         self.wr_f32s(dst, i1 * nb1 + k * 4, 1)[0] = ggml_vec_gelu_f32(x) * g;
+                    }
+                }
+            };
+            self.par_rows(nr, nth, team, run);
+            return;
+        }
+
+        // ggml_geglu_erf_split with both halves passed (ggml.c:3092 →
+        // ggml_compute_forward_geglu_erf_f32, ops.cpp): y =
+        // 0.5f*xi*(1.0f + erff(xi*SQRT_2_INV)) * g (ggml_vec_geglu_erf_f32,
+        // vec.h:1501-1507 — a plain scalar libm loop, the exact erf gelu).
+        // ModernBERT encoders (6184e92c5: LLM_FFN_GEGLU_ERF, modern-bert.cpp
+        // :148-154 with the gate folded into ffn_up).
+        if op == crate::ops::GGML_GLU_OP_GEGLU_ERF {
+            assert!(s1.is_some(), "glu: geglu_erf requires src1 (the split halves)");
+            let s1 = s1.unwrap();
+            let t1 = self.t(s1);
+            assert_eq!(t1.ty, GgmlType::F32, "geglu_erf: src1 must be F32");
+            assert_eq!(t1.nb[0] as usize, 4, "geglu_erf: src1 must be contiguous_1");
+            assert_eq!(t0.ne[0], t1.ne[0], "geglu_erf: shape mismatch");
+            let nc = t0.ne[0] as usize;
+            let nb11 = t1.nb[1] as usize;
+            let run = |ir0: usize, ir1: usize| {
+                for i1 in ir0..ir1 {
+                    for k in 0..nc {
+                        let x = self.rd_f32s(s0, i1 * nb01 + k * 4, 1)[0];
+                        let g = self.rd_f32s(s1, i1 * nb11 + k * 4, 1)[0];
+                        // ((0.5f*xi)*(1.0f+erff))*g — the C's left-assoc order,
+                        // no fusable contraction (see ggml_vec_gelu_erf_f32)
+                        self.wr_f32s(dst, i1 * nb1 + k * 4, 1)[0] = ggml_vec_gelu_erf_f32(x) * g;
                     }
                 }
             };
@@ -4779,6 +4810,54 @@ impl<'a> Cpu<'a> {
                         let x = ((i0 as f32 + pixel_offset) / sf0 - pixel_offset) as f32;
                         let v = if mode == GGML_SCALE_MODE_NEAREST {
                             src_at((i0 as f32 / sf0) as usize, (i1 as f32 / sf1) as usize, i02, i03)
+                        } else if mode == GGML_SCALE_MODE_BILINEAR
+                            && mode_flags & GGML_SCALE_FLAG_ANTIALIAS != 0
+                        {
+                            // F.interpolate(..., mode="bilinear", antialias=True)
+                            // — the triangle-filter kernel of ops.cpp:8252-8349:
+                            // support = max(1, 1/sf), window [i-support+0.5,
+                            // i+support+0.5), weights triangle((s-i+0.5)*invscale)
+                            // normalized. Note the source coordinate is
+                            // (i + pixel_offset)/sf WITHOUT the -pixel_offset
+                            // the plain bilinear branch subtracts (ops.cpp:8270
+                            // vs :8300), while the window bounds add it
+                            let triangle = |x: f32| (1.0 - x.abs()).max(0.0);
+                            let support1 = (1.0f32 / sf1).max(1.0);
+                            let invscale1 = 1.0 / support1;
+                            let support0 = (1.0f32 / sf0).max(1.0);
+                            let invscale0 = 1.0 / support0;
+                            let y = (i1 as f32 + pixel_offset) / sf1;
+                            let x = (i0 as f32 + pixel_offset) / sf0;
+                            // std::max<int64_t>/<min<int64_t> truncate the
+                            // float bound (ops.cpp:8278-8281)
+                            let x_min = ((x - support0 + pixel_offset) as i64).max(0) as usize;
+                            let x_max = ((x + support0 + pixel_offset) as i64).min(ne00 as i64) as usize;
+                            let y_min = ((y - support1 + pixel_offset) as i64).max(0) as usize;
+                            let y_max = ((y + support1 + pixel_offset) as i64).min(ne01 as i64) as usize;
+                            let mut val = 0.0f32;
+                            let mut total_weight = 0.0f32;
+                            for sy in y_min..y_max {
+                                let weight_y = triangle((sy as f32 - y + pixel_offset) * invscale1);
+                                for sx in x_min..x_max {
+                                    let weight_x = triangle((sx as f32 - x + pixel_offset) * invscale0);
+                                    let weight = weight_x * weight_y;
+                                    if weight <= 0.0 {
+                                        continue;
+                                    }
+                                    let pixel = src_at(sx, sy, i02, i03);
+                                    // GCC -ffp-contract=fast fuses the C's
+                                    // `val += pixel * weight` into an FMA
+                                    // (ops.cpp:8327-8328) — the rope-rotate
+                                    // precedent: mul_add reproduces the
+                                    // single-rounding accumulation
+                                    val = pixel.mul_add(weight, val);
+                                    total_weight += weight;
+                                }
+                            }
+                            if total_weight > 0.0 {
+                                val /= total_weight;
+                            }
+                            val
                         } else if mode == GGML_SCALE_MODE_BILINEAR {
                             let y0f = y.floor();
                             let x0f = x.floor();
@@ -8479,6 +8558,107 @@ mod tests {
                 *r
             );
         }
+    }
+
+    // ==================================================================
+    // geglu_erf (GGML_GLU_OP_GEGLU_ERF) bit-exact parity vs the reference
+    // build (parity/ref_geglu_erf_dump.c → parity/geglu_erf_ref.bin,
+    // generated @aa94f2086 for 6184e92c5's ModernBERT exact-GELU FFN)
+    // ==================================================================
+
+    /// One section of parity/geglu_erf_ref.bin: n f32 x + n f32 g + n f32 out.
+    fn read_geglu_erf_dump() -> Vec<(u32, Vec<f32>, Vec<f32>, Vec<f32>)> {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/geglu_erf_ref.bin");
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|_| panic!("missing {path}: build via parity/ref_geglu_erf_dump.c"));
+        let mut c = &bytes[..];
+        let mut out = Vec::new();
+        loop {
+            let magic = u32::from_le_bytes(c[..4].try_into().unwrap());
+            c = &c[4..];
+            if magic == 0xFFFF_FFFF {
+                break;
+            }
+            assert_eq!(magic, 0x4652_4747, "section magic 'GGRF'");
+            let kind = u32::from_le_bytes(c[..4].try_into().unwrap());
+            c = &c[4..];
+            let n = u32::from_le_bytes(c[..4].try_into().unwrap()) as usize;
+            c = &c[4..];
+            let (io, rest) = c.split_at(n * 12);
+            c = rest;
+            let f = |b: &[u8]| -> Vec<f32> {
+                b.chunks_exact(4).map(|w| f32::from_le_bytes(w.try_into().unwrap())).collect()
+            };
+            out.push((kind, f(&io[..n * 4]), f(&io[n * 4..n * 8]), f(&io[n * 8..])));
+        }
+        out
+    }
+
+    /// Build ggml_geglu_erf_split(a, b) through the real graph path (like the
+    /// C dumper) and return the output values.
+    fn run_geglu_erf_graph(x: &[f32], g: &[f32]) -> Vec<f32> {
+        let mut ctx = Context::new();
+        let a = ctx.new_tensor_1d(GgmlType::F32, x.len() as i64);
+        let b = ctx.new_tensor_1d(GgmlType::F32, g.len() as i64);
+        ctx.arena_resize_tensor(a);
+        ctx.arena_resize_tensor(b);
+        ctx.with_f32_mut(a, |p| p.copy_from_slice(x)).unwrap();
+        ctx.with_f32_mut(b, |p| p.copy_from_slice(g)).unwrap();
+        let r = ctx.geglu_erf_split(a, b);
+        let mut gr = Graph::new(8);
+        gr.build_forward(&ctx, r);
+        graph_compute(&mut ctx, &mut gr, 3);
+        ctx.f32s(r).unwrap().to_vec()
+    }
+
+    /// geglu_erf: the GLU op with GGML_GLU_OP_GEGLU_ERF must match the
+    /// reference bit-for-bit at every length (incl. non-16-multiples), on the
+    /// specials battery (±inf/NaN/denormals/FLT_MAX on x, on g, and on both
+    /// — the inf*0 product paths), and the kind-0 outputs must pair 1:1 with
+    /// the raw `0.5f*x*(1+erff(x*SQRT_2_INV))*g` loop (kind 3).
+    #[test]
+    fn geglu_erf_bit_exact_vs_reference() {
+        let secs = read_geglu_erf_dump();
+        let mut n_op = 0usize;
+        let mut n_raw = 0usize;
+        let mut pending: Option<(Vec<f32>, Vec<f32>)> = None;
+        for (kind, x, g, output) in &secs {
+            match kind {
+                0 => {
+                    let mine = run_geglu_erf_graph(x, g);
+                    assert_eq!(mine.len(), output.len());
+                    for (i, (m, r)) in mine.iter().zip(output.iter()).enumerate() {
+                        assert_eq!(
+                            m.to_bits(),
+                            r.to_bits(),
+                            "geglu_erf mismatch at n={} idx={} x={:e} g={:e} (rust {:e} vs ref {:e})",
+                            x.len(), i, x[i], g[i], m, r
+                        );
+                    }
+                    n_op += x.len();
+                    pending = Some((x.clone(), output.clone()));
+                }
+                3 => {
+                    // the raw 0.5f*xi*(1.0f+erff(xi*SQRT_2_INV))*g[i] loop —
+                    // its inputs must repeat the op section's and its
+                    // outputs must equal the op outputs 1:1 (no SIMD/libmvec
+                    // erf in the reference)
+                    let (x_op, out_op) = pending.take().expect("kind 3 follows kind 0");
+                    assert_eq!(x_op.len(), x.len(), "kind 3 input length");
+                    for (i, (a, b)) in x_op.iter().zip(x.iter()).enumerate() {
+                        assert_eq!(a.to_bits(), b.to_bits(), "kind3 input idx={i}");
+                    }
+                    for (i, (a, b)) in out_op.iter().zip(output.iter()).enumerate() {
+                        assert_eq!(a.to_bits(), b.to_bits(), "kind3 output idx={i}");
+                    }
+                    n_raw += x.len();
+                }
+                other => panic!("unexpected kind {other}"),
+            }
+        }
+        // 12 LCG lengths (7590) + 3 specials passes (50 each)
+        assert_eq!(n_op, 7590 + 150, "full length sweep + specials battery");
+        assert_eq!(n_raw, 1024, "raw formula cross-check count");
     }
 
     // ==================================================================

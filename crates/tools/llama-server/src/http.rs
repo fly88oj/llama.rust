@@ -283,15 +283,29 @@ pub fn serve_routes(
             Ok(stream) => {
                 let routes = routes.clone();
                 let ready = ready.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = handle_conn(stream, &routes, &ready) {
-                        if e.kind() != std::io::ErrorKind::BrokenPipe
-                            && e.kind() != std::io::ErrorKind::ConnectionReset
-                        {
-                            eprintln!("llama-server: connection error: {e}");
+                // The reference parses/dumps/copies deeply nested JSON
+                // iteratively (the vendor deep-nesting patch, 10a60cf30), so
+                // it answers any nesting depth off its normal stack. The
+                // port's Json parse/dump are iterative too, but the derived
+                // Clone/Drop of an already-parsed deep value still recurse —
+                // the default 2 MiB per-connection stack aborts the process
+                // on ~50k-deep unknown fields ("copy remaining properties"
+                // clones them). A large fixed headroom keeps the process
+                // alive for any depth a request body can realistically
+                // carry; the full fix (iterative Clone/Drop on Json) is
+                // ledgered.
+                std::thread::Builder::new()
+                    .stack_size(256 * 1024 * 1024)
+                    .spawn(move || {
+                        if let Err(e) = handle_conn(stream, &routes, &ready) {
+                            if e.kind() != std::io::ErrorKind::BrokenPipe
+                                && e.kind() != std::io::ErrorKind::ConnectionReset
+                            {
+                                eprintln!("llama-server: connection error: {e}");
+                            }
                         }
-                    }
-                });
+                    })
+                    .expect("spawn connection thread");
             }
             Err(e) => eprintln!("llama-server: accept error: {e}"),
         }

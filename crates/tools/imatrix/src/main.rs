@@ -43,13 +43,23 @@ use llama::vocab::Vocab;
 enum FlashAttn {
     Off,
     On,
-    /// parsed like the reference, treated as off (no CPU FA probe)
+    /// `LLAMA_FLASH_ATTN_TYPE_AUTO` (the tool's default) — the reference
+    /// resolves it through a backend support probe (llama-context.cpp:566-569
+    /// `resolve(llm_fused_op_flash_attn_probe, ...)`), which succeeds on this
+    /// CPU build, so AUTO ⇒ **enabled** and the reference imatrix runs
+    /// FLASH_ATTN_EXT. Treating AUTO as off made the trunk run the non-FA
+    /// path — a different attention kernel with different rounding (observed
+    /// max|d| 2.6 at `attn_gated-1`), diluting through residual+norm into the
+    /// blk.1 FFN stats tail that imatrix_md_parity.sh carried as the
+    /// "pre-existing ~1-ulp qwen35 trunk divergence" (root-caused and closed
+    /// 2026-10-11; the port's CPU FA kernel is exactly the supported case the
+    /// probe models — qwen35_e2e verifies the FA lane against the reference).
     Auto,
 }
 
 impl FlashAttn {
     fn on(self) -> bool {
-        matches!(self, FlashAttn::On)
+        matches!(self, FlashAttn::On | FlashAttn::Auto)
     }
 }
 
@@ -839,6 +849,21 @@ fn mtp_head_own_lm_head(m: &llama::model::LlamaModel) -> bool {
         .unwrap_or(false)
 }
 
+
+/// `cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256)` — llama-context.cpp:293 pads
+/// EVERY llama_context's context size up to a multiple of 256. The imatrix
+/// lane's `-c 64` context therefore runs a 256-row cache (the reference's
+/// `n_ctx_seq (256) > n_ctx_train (64)` warning) while the CHUNKING keeps the
+/// unpadded 64 (compute_imatrix reads params.n_ctx, not cparams.n_ctx). The
+/// port's `DecodeContext` takes n_ctx verbatim, so this driver pads here; when
+/// context.rs gains the general pad this shim becomes redundant (remove then).
+/// Numerically the padded rows are mask-covered on both engines (verified
+/// inert on the qwen35 trunk lane 2026-10-11) — this pad is behavioral
+/// faithfulness, kept for the shape-level mirror.
+fn pad_ctx_256(n_ctx: u32) -> u32 {
+    n_ctx.div_ceil(256) * 256
+}
+
 fn compute_imatrix(
     dctx: &mut DecodeContext,
     vocab: &Vocab,
@@ -1348,11 +1373,13 @@ fn main() -> ExitCode {
     // `--nextn` arm's own_lm_head probe, imatrix.cpp:2020)
     let trunk_own_lm_head = mtp_head_own_lm_head(&model);
     let weights = build_weights(&model, attn);
+    // llama-context.cpp:293 — see pad_ctx_256 (the reference's imatrix
+    // context over `-c 64` runs a 256-row cache)
     let mut dctx = DecodeContext::new_with(
         model.ctx,
         weights,
         attn,
-        n_kv as u32,
+        pad_ctx_256(n_kv as u32),
         n_threads,
         n_batch as usize,
     );
@@ -1506,7 +1533,7 @@ fn main() -> ExitCode {
                 &mut model_mtp,
                 n_threads,
                 n_batch as usize,
-                n_kv as u32,
+                pad_ctx_256(n_kv as u32), // llama-context.cpp:293 — the MTP context pads too
                 args.flash_attn.on(),
                 use_draft,
             ) {

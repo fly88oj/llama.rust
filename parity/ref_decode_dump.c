@@ -20,6 +20,14 @@
 // run:
 //   ./parity/ref_decode_dump <model.gguf> <out.bin> [--text <prompt>]
 //                            [--threads N] [--fa on|off]
+//                            [--ctx N] [--slice a:b] [--bos-head]
+// --ctx N       cparams.n_ctx (default 512; note llama_context pads
+//               n_ctx_seq to a multiple of 256 — the imatrix lane runs 64,
+//               i.e. an effective 256-row cache)
+// --slice a:b   feed only tokens[a..b) of the tokenized --text (the imatrix
+//               chunk replay: chunk i = tokens[i*64 .. i*64+64))
+// --bos-head    replace the slice's first token with BOS (imatrix.cpp:1519
+//               "add BOS token for the first batch of each chunk")
 //
 // File format (little-endian; consumed by parity/decode_dump_cmp.py and the
 // Rust mirror in crates/llama/tests/qwen3_prefill_dump.rs):
@@ -136,6 +144,9 @@ int main(int argc, char ** argv) {
     int  n_decode_tail = 0;
     int  decode_ids[512];
     int  decode_ids_count = 0;
+    int  n_ctx_user = 512;
+    int  slice_a = -1, slice_b = -1;
+    int  bos_head = 0;
 
     for (int i = 3; i < argc; i++) {
         if (!strcmp(argv[i], "--text") && i + 1 < argc) {
@@ -159,6 +170,16 @@ int main(int argc, char ** argv) {
                 fa_on = 1;
             } else {
                 fa_on = 0;
+            }
+        } else if (!strcmp(argv[i], "--ctx") && i + 1 < argc) {
+            n_ctx_user = atoi(argv[++i]);
+        } else if (!strcmp(argv[i], "--bos-head")) {
+            bos_head = 1;
+        } else if (!strcmp(argv[i], "--slice") && i + 1 < argc) {
+            const char * p = argv[++i];
+            slice_a = (int) strtol(p, (char **) &p, 10);
+            if (*p == ':') {
+                slice_b = (int) strtol(p + 1, (char **) &p, 10);
             }
         } else {
             fprintf(stderr, "unknown argument %s\n", argv[i]);
@@ -194,10 +215,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // --slice a:b + --bos-head (the imatrix chunk replay)
+    if (slice_a >= 0) {
+        if (slice_b <= slice_a || slice_b > nt) {
+            fprintf(stderr, "slice %d:%d out of range (nt=%d)\n", slice_a, slice_b, nt);
+            return 1;
+        }
+        memmove(toks, toks + slice_a, sizeof(llama_token) * (size_t) (slice_b - slice_a));
+        nt = slice_b - slice_a;
+        if (bos_head) {
+            toks[0] = llama_vocab_bos(vocab);
+        }
+        fprintf(stderr, "slice applied: %d tokens, head id %d\n", nt, toks[0]);
+    }
+
     // the server's context (parity/embd_rows_probe.sh): -c 512 -t 8, batch
     // defaults (n_batch 2048 >= n_ubatch 512 >= 8 tokens -> one ubatch)
     struct llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx            = 512;
+    cparams.n_ctx            = n_ctx_user;
     cparams.n_batch          = 2048;
     cparams.n_ubatch         = 2048;
     cparams.n_seq_max        = 1;

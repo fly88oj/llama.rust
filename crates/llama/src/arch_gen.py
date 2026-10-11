@@ -388,7 +388,6 @@ pub fn llm_arch_supports_sm_tensor(arch: LlmArch) -> bool {
             | LlmArch::KIMI_K3
             | LlmArch::GLM5_NEXT
             | LlmArch::QWEN3TTS
-            | LlmArch::K2_HORIZON
     )
 }
 

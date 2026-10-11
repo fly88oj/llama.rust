@@ -595,11 +595,22 @@ fn write_trunk(path: &str, n_embd: i64, n_head: i64, n_head_kv: i64, n_ff: i64, 
             ],
         );
         datas.push(bytes);
+        // a11f57ba9 removed the tok_embd-tied fallback (the old
+        // TENSOR_DUPLICATED alias at dflash.cpp:166-171) — an explicit
+        // output.weight carrying the SAME bytes keeps the fixture's math
+        // identical to the old tied behavior
+        if name == "token_embd.weight" {
+            w.add_tensor(
+                "output.weight",
+                GgmlType::F32,
+                [ne[0], *ne.get(1).unwrap_or(&1), *ne.get(2).unwrap_or(&1), *ne.get(3).unwrap_or(&1)],
+            );
+            let tied = datas.last().unwrap().clone();
+            datas.push(tied);
+        }
     };
-
     // the standalone embeddings (llama_model_get_tok_embd's source,
-    // mtmd-helper-gen.cpp:352-360); the output head falls back to it
-    // (dflash.cpp:166-171 TENSOR_DUPLICATED)
+    // mtmd-helper-gen.cpp:352-360) — triggers the tied output.weight twin
     add(&mut w, "token_embd.weight", vec![n_embd, N_VOCAB], Role::Proj);
     // feature fusion (dflash.cpp:161-163) — n_embd_inp_enc == n_embd here
     add(&mut w, "fc.weight", vec![n_embd, n_embd], Role::Proj);

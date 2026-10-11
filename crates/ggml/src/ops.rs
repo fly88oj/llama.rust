@@ -20,7 +20,7 @@
 //!     since MAX_SRC grew to 4 for flash_attn_ext).
 
 use crate::tensor::{Context, GgmlOp, Storage, TensorId, TensorMeta};
-use crate::types::{GgmlType, MAX_DIMS};
+use crate::types::{GgmlType, MAX_DIMS, MAX_SRC};
 use half::f16;
 
 /// op_params[1] flag distinguishing rms_norm from plain norm while tensor.rs's
@@ -136,6 +136,24 @@ pub enum GgmlPrec {
     F16 = 20,
     Q8 = 30,
     Q4 = 40,
+}
+
+impl GgmlPrec {
+    /// Reverse of the discriminants above — the loader stores the raw u8
+    /// (`general.tensor_extra.prec_a4` → `PrecPolicy::prec_src1`), and
+    /// `llama_prec_policy::apply` (llama-model.cpp:1259) hands it back to
+    /// `ggml_prec_set_src`; an out-of-enum value (corrupt GGUF) is None.
+    pub fn from_u8(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Self::Undefined,
+            10 => Self::F32,
+            15 => Self::Bf16,
+            20 => Self::F16,
+            30 => Self::Q8,
+            40 => Self::Q4,
+            _ => return None,
+        })
+    }
 }
 
 /// ggml.h rope types
@@ -1358,6 +1376,43 @@ impl Context {
         true
     }
 
+    /// ggml_prec_set_src (ggml.c:3317-3341) — [TAG_GGML_PREC]: set the
+    /// smallest numeric rank the implementation may internally convert
+    /// src[idx] to (ggml.h:1455-1472: Q8 → Q8_0/Q8_1/Q8_K..., Q4 → Q4_K/
+    /// NVFP4/MXFP4...). Encoding: only MUL_MAT / MUL_MAT_ID are encodable
+    /// (the default branch rejects everything else — FLASH_ATTN_EXT has no
+    /// src slot), and only `idx == 1` is legal (:3328-3330 `if (idx != 1)
+    /// return false`); the value lands in op_params slot `2 + idx` = 3,
+    /// leaving slot 0 (acc), 1 (hint) and 2 (src0 prec) untouched — the
+    /// layout documented at ggml-impl.h:163-173.
+    ///
+    /// Consumers upstream (aa94f2086): `llama_prec_policy::apply`
+    /// (llama-model.cpp:1249-1260) through `build_lora_mm` /
+    /// `build_lora_mm_id` (llama-graph.cpp:1553-1555, 1597-1599) — the
+    /// model-driven W4A4 quantize-src1 hint — and the MISTRAL4
+    /// `build_ffn_moe` down-projection (llama-graph.cpp:2366-2368,
+    /// "src1 can exceed F16 range" → GGML_PREC_F32). Like `prec_set_acc`,
+    /// the CPU kernels never read the slot (a GPU-backend hint), so the port
+    /// encodes it bit-for-bit for op-dump parity; single-thread CPU
+    /// numerics are unchanged by construction.
+    pub fn prec_set_src(&mut self, a: TensorId, prec: GgmlPrec, idx: i32) -> bool {
+        assert!(
+            (0..MAX_SRC as i32).contains(&idx),
+            "prec_set_src: idx out of range"
+        );
+
+        match self.op(a) {
+            GgmlOp::MulMat | GgmlOp::MulMatId => {
+                if idx != 1 {
+                    return false;
+                }
+                self.set_op_params_i32_at(a, (2 + idx) as usize, prec as i32);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// verify against ggml_mul_mat_id (ggml.c:3354) — MoE expert matmul: `as` is a stack of
     /// n_expert matrices {ne00, ne01, ne02}, `b` the activations {ne00, ne11,
     /// n_tokens} and `ids` the per-(slot, token) expert indices {n_ids, n_tokens}
@@ -2572,6 +2627,27 @@ impl Context {
         self.init_op(r, GgmlOp::Glu, [Some(a), Some(b), None])
     }
 
+    /// verify against ggml_geglu_erf_split (ggml.c:3092 → ggml_glu_impl with
+    /// b != NULL, GGML_GLU_OP_GEGLU_ERF): result = gelu_erf(a) * b
+    /// (ggml-cpu/ops.cpp `ggml_compute_forward_geglu_erf_f32` with src1 →
+    /// `ggml_vec_geglu_erf_f32`, the exact erf gelu). Used by the ModernBERT
+    /// encoder FFN (6184e92c5: `LLM_FFN_GEGLU_ERF` with the gate folded into
+    /// ffn_up, modern-bert.cpp:148-154).
+    pub fn geglu_erf_split(&mut self, a: TensorId, b: TensorId) -> TensorId {
+        let (ane, bne) = (self.tensors[a.0 as usize].ne, self.tensors[b.0 as usize].ne);
+        assert_eq!(ane, bne, "ggml_geglu_erf_split: shape mismatch");
+        let ty = self.tensors[a.0 as usize].ty;
+        assert_eq!(
+            ty, self.tensors[b.0 as usize].ty,
+            "ggml_geglu_erf_split: type mismatch"
+        );
+        assert_eq!(ty, GgmlType::F32, "ggml_geglu_erf_split: F32 only");
+        let r = self.new_tensor(ty, ane);
+        let params = [GGML_GLU_OP_GEGLU_ERF, 0];
+        self.set_op_params_i32(r, &params);
+        self.init_op(r, GgmlOp::Glu, [Some(a), Some(b), None])
+    }
+
     /// verify against ggml_reglu_split (ggml.c:3019 → ggml_glu_impl with b != NULL):
     /// result = relu(a) * b — `(x > 0) ? x * g : 0` (ops.cpp:2892
     /// `ggml_compute_forward_reglu_f32` → vec.h:1401 ggml_vec_reglu_f32, a
@@ -3054,6 +3130,68 @@ mod tests {
         assert!(ggml_expf(200.0).is_infinite());
     }
 
+    /// fp32→fp16 conversion bit-exact vs the reference .so
+    /// (parity/ref_fp16cvt_probe.c → parity/fp16cvt_probe.bin).
+    ///
+    /// The probe battery (456,709 values: all 65536 f16 round-trips, the
+    /// RNE midpoints ±1 f32 ulp between adjacent f16 values in the normal
+    /// and denormal ranges and their negatives, NaN/Inf/overflow specials,
+    /// 8192 LCG sweeps) was run through the OLD reference .so
+    /// (libggml-cpu.so.0.25.3 = c35b66744) and the NEW reference .so
+    /// (libggml-cpu.so.0.26.0 = aa94f2086) — 2bbca8f20's vectorization is
+    /// __VXE__/__VXE2__ (s390x) only and leaves the x86 __F16C__ path
+    /// untouched; the probe reported 0 old-vs-new diffs (re-checked here).
+    ///
+    /// The port's scalar `ggml_compute_fp32_to_fp16` mirrors the *scalar*
+    /// GGML_FP32_TO_FP16 macro (ggml-impl.h:417-439), not the bulk
+    /// `ggml_cpu_fp32_to_fp16`'s F16C chunks: on NaN inputs the two C paths
+    /// genuinely differ (the bit-trick collapses every NaN to 0x7E00/0xFE00;
+    /// `_mm*_cvtps_ph` preserves the payload — 4090 of the battery values),
+    /// so the comparison target is the probe's scalar-twin column. Non-NaN
+    /// values agree across all three columns.
+    #[test]
+    fn fp32_to_fp16_bit_exact_vs_reference() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../parity/fp16cvt_probe.bin");
+        let bytes = std::fs::read(path)
+            .unwrap_or_else(|_| panic!("missing {path}: build via parity/ref_fp16cvt_probe.c"));
+        assert_eq!(u32::from_le_bytes(bytes[0..4].try_into().unwrap()), 0x4336_3146, "magic 'F16C'");
+        let n = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        assert_eq!(bytes.len(), 8 + n * 10, "8-byte header + n*(4+2+2+2)");
+        let bat: Vec<f32> = bytes[8..8 + n * 4]
+            .chunks_exact(4)
+            .map(|w| f32::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        let col = |start: usize| -> Vec<u16> {
+            bytes[start..start + n * 2]
+                .chunks_exact(2)
+                .map(|w| u16::from_le_bytes(w.try_into().unwrap()))
+                .collect()
+        };
+        let old_out = col(8 + n * 4);
+        let new_out = col(8 + n * 6);
+        let scalar_out = col(8 + n * 8);
+
+        let mut mismatch_old = 0usize;
+        let mut mismatch_port = 0usize;
+        for i in 0..n {
+            let mine = ggml_compute_fp32_to_fp16(bat[i]);
+            if old_out[i] != new_out[i] {
+                mismatch_old += 1;
+            }
+            if mine != scalar_out[i] {
+                if mismatch_port < 10 {
+                    panic!(
+                        "fp32→fp16 mismatch at idx={i}: f32 {:08x} port {:04x} vs scalar-macro twin {:04x}",
+                        bat[i].to_bits(), mine, scalar_out[i]
+                    );
+                }
+                mismatch_port += 1;
+            }
+        }
+        assert_eq!(mismatch_old, 0, "old(c35b66744) vs new(aa94f2086) .so columns");
+        assert_eq!(mismatch_port, 0, "port vs the scalar GGML_FP32_TO_FP16 twin");
+    }
+
     /// ggml_prec_set_acc (ggml.c:3291-3315) — [TAG_GGML_PREC] encoding pinned
     /// against the reference .so (parity/prec_acc_probe.c dumps the same
     /// slots from build-rust-ref's libggml @ c35b66744; output saved in
@@ -3103,6 +3241,63 @@ mod tests {
         assert_eq!(GgmlPrec::F16 as i32, 20);
         assert_eq!(GgmlPrec::Q8 as i32, 30);
         assert_eq!(GgmlPrec::Q4 as i32, 40);
+    }
+
+    /// ggml_prec_set_src (ggml.c:3317-3341) — [TAG_GGML_PREC] encoding
+    /// pinned against the reference .so (parity/prec_src_probe.c dumps the
+    /// same slots from build-rust-ref's libggml @ aa94f2086; output saved
+    /// in parity/prec_src_ref.txt): MUL_MAT/MUL_MAT_ID take the src1 prec
+    /// in op_params[3] (= 2 + idx, the only legal idx being 1), leaving the
+    /// acc/hint/src0 slots untouched; idx != 1, FLASH_ATTN_EXT and every
+    /// other op are rejected with no write.
+    #[test]
+    fn prec_set_src_encoding() {
+        let mut ctx = Context::new();
+        let w = ctx.new_tensor_2d(GgmlType::F32, 16, 8);
+        let x = ctx.new_tensor_2d(GgmlType::F32, 16, 3);
+
+        // MUL_MAT: hint slot 1 + acc slot 0 first, then src1 prec slot 3
+        let mm = ctx.mul_mat(w, x);
+        ctx.mul_mat_set_hint_hadamard(mm);
+        assert!(ctx.prec_set_acc(mm, GgmlPrec::Bf16));
+        assert!(ctx.prec_set_src(mm, GgmlPrec::Q8, 1));
+        assert_eq!(ctx.op_params(mm)[0], 15); // GGML_PREC_BF16 (acc, kept)
+        assert_eq!(ctx.op_params(mm)[1], GGML_HINT_SRC0_IS_HADAMARD); // hint, kept
+        assert_eq!(ctx.op_params(mm)[2], 0); // src0 prec, untouched
+        assert_eq!(ctx.op_params(mm)[3], 30); // GGML_PREC_Q8 (2 + 1)
+
+        // rewrite of the same slot: the mistral4 ffn_moe_down hint
+        // (llama-graph.cpp:2366-2368)
+        assert!(ctx.prec_set_src(mm, GgmlPrec::F32, 1));
+        assert_eq!(ctx.op_params(mm)[3], 10); // GGML_PREC_F32
+
+        // MUL_MAT_ID: same slot 3 encoding
+        let we = ctx.new_tensor_3d(GgmlType::F32, 16, 8, 4);
+        let x3 = ctx.new_tensor_3d(GgmlType::F32, 16, 2, 2);
+        let ids = ctx.new_tensor_2d(GgmlType::I32, 2, 2);
+        let mmid = ctx.mul_mat_id(we, x3, ids);
+        assert!(ctx.prec_set_src(mmid, GgmlPrec::Q4, 1));
+        assert_eq!(ctx.op_params(mmid)[3], 40); // GGML_PREC_Q4
+
+        // idx != 1 on MUL_MAT: rejected without a write (ggml.c:3328-3330)
+        assert!(!ctx.prec_set_src(mm, GgmlPrec::Q4, 0));
+        assert!(!ctx.prec_set_src(mm, GgmlPrec::Q4, 2));
+        assert_eq!(ctx.op_params(mm)[3], 10); // slot 3 still the F32 write
+
+        // FLASH_ATTN_EXT: default branch rejects (no src prec slot)
+        let q = ctx.new_tensor_4d(GgmlType::F32, 16, 3, 2, 1);
+        let k = ctx.new_tensor_4d(GgmlType::F32, 16, 5, 2, 1);
+        let v = ctx.new_tensor_4d(GgmlType::F32, 16, 5, 2, 1);
+        let fa = ctx.flash_attn_ext(q, k, v, None, 0.125f32, 0.0, 0.0);
+        assert!(!ctx.prec_set_src(fa, GgmlPrec::Q8, 1));
+        assert_eq!(f32::from_bits(ctx.op_params(fa)[0] as u32), 0.125);
+        assert_eq!(ctx.op_params(fa)[3], 0); // its slot 3 is the acc slot, untouched
+
+        // any other op: rejected, no write
+        let y = ctx.new_tensor_2d(GgmlType::F32, 16, 3);
+        let s = ctx.add(x, y);
+        assert!(!ctx.prec_set_src(s, GgmlPrec::Q8, 1));
+        assert_eq!(ctx.op_params(s)[0], 0);
     }
 
     #[test]

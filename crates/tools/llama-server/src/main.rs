@@ -12,7 +12,7 @@
 //! model carries rank pooling) and `GET /slots`.
 //!
 //! Not ported (documented in the parity ledger): the Responses/Anthropic/transcription
-//! APIs, `/infill`, `/apply-template`, `/metrics`, the built-in web UI,
+//! APIs, `/infill`, `/metrics`, the built-in web UI,
 //! multimodal input, KV shifting and the idle-slot sleep/purge logic. The
 //! `/slots` state endpoint (`POST /slots/{id}?action=save|restore|erase`,
 //! server-context.cpp:5285-5390) is wired over the port's sequence-state API
@@ -51,7 +51,7 @@ use llama::speculative::{
 };
 use llama::vocab::Vocab;
 
-use api::{TaskParams, ERROR_TYPE_INVALID_REQUEST, ERROR_TYPE_SERVER};
+use api::{TaskParams, ERROR_TYPE_INVALID_REQUEST, ERROR_TYPE_NOT_SUPPORTED, ERROR_TYPE_SERVER};
 use engine::{Engine, Server, Slot, SlotState, Task, TaskKind};
 use http::{Body, HttpServer, Request, Response, StreamEvent};
 use server_tools::register_gcp_compat;
@@ -65,6 +65,10 @@ struct Args {
     model: String,
     host: String,
     port: u16,
+    /// `--mmproj FILE` (common/arg.cpp:1278-1285, `params.mmproj.path`) — the
+    /// multimodal projector; the port wires it for the decision media path
+    /// (the d1-omni audio lane of /v1/systemone)
+    mmproj: Option<String>,
     n_ctx: u32,
     /// `--parallel` (`-np`), -1 = auto (4, server.cpp:157-160)
     n_parallel: i32,
@@ -93,6 +97,10 @@ struct Args {
     /// `--slot-save-path`", server-context.cpp:4773-4777). Must be an existing
     /// directory, and gets the trailing separator appended like the C.
     slot_save_path: String,
+    /// whether `--slot-save-path` was given on the command line — the
+    /// LLAMA_ARG_SLOT_SAVE_PATH env fallback (aa94f2086) only applies when
+    /// the flag was absent (the flag wins, arg.cpp set_env semantics)
+    slot_save_path_from_flag: bool,
     /// `params.speculative` (common.h:370-401) — the `-md`/`--spec-*` surface
     /// of common/arg.cpp:4135-4253 (also honoured by the server example set)
     speculative: CommonParamsSpeculative,
@@ -232,9 +240,11 @@ fn feature_disabled_handler() -> Arc<dyn Fn(&Request) -> Response + Send + Sync>
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut a = Args {
+        mmproj: None,
         model: String::new(),
         host: "127.0.0.1".into(),
-        port: 8080,
+        // `int32_t port = 9931` (common.h:628, b42b7e6d3 — was 8080)
+        port: 9931,
         n_ctx: 4096,
         n_parallel: -1,
         n_predict: -1,
@@ -248,6 +258,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             n_keep: 0,            // common.h:453
             pooling: llama::hparams::LlamaPoolingType::UNSPECIFIED,
             slot_save_path: String::new(), // arg.cpp:3612 default (unset)
+            slot_save_path_from_flag: false,
             speculative: CommonParamsSpeculative::default(),
             tools: Vec::new(),           // arg.cpp:3415 default (no tools)
             tools_runtime: String::new(), // arg.cpp:3425 default (host)
@@ -280,6 +291,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         };
         match arg.as_str() {
             "-m" | "--model" => a.model = value(&mut i)?,
+            "--mmproj" => a.mmproj = Some(value(&mut i)?),
             "--host" => {
                 a.host = value(&mut i)?;
                 host_given = true;
@@ -398,6 +410,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 } else {
                     format!("{v}{}", std::path::MAIN_SEPARATOR)
                 };
+                a.slot_save_path_from_flag = true;
             }
             // `--embeddings` (`-fe`, common/arg.cpp) — the embedding endpoints
             "-fe" | "--embeddings" => a.embeddings = true,
@@ -619,6 +632,26 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "llama-server: warning: binding {0} exposes the server beyond loopback",
             a.host
         );
+    }
+    // `set_env("LLAMA_ARG_SLOT_SAVE_PATH")` (arg.cpp:3646, aa94f2086): the
+    // env var supplies --slot-save-path when the flag was absent (the flag
+    // wins) — same validation and trailing-separator rule
+    if !a.slot_save_path_from_flag && a.slot_save_path.is_empty() {
+        if let Ok(v) = std::env::var("LLAMA_ARG_SLOT_SAVE_PATH") {
+            if !v.is_empty() {
+                let dir = std::path::Path::new(&v);
+                if !dir.is_dir() {
+                    return Err(format!(
+                        "invalid value for --slot-save-path: '{v}' is not a directory"
+                    ));
+                }
+                a.slot_save_path = if v.ends_with(std::path::MAIN_SEPARATOR) {
+                    v
+                } else {
+                    format!("{v}{}", std::path::MAIN_SEPARATOR)
+                };
+            }
+        }
     }
     Ok(a)
 }
@@ -2535,6 +2568,9 @@ fn main() {
         ),
         next_task_id: std::sync::atomic::AtomicI64::new(0),
         embeddings: args.embeddings,
+        // `decision.type != COMMON_DECISION_TYPE_NONE` — the /v1/systemone
+        // pre-parse guard (server-context.cpp:5757-5762)
+        is_decision_model: engine.decision.is_some(),
         pooling: engine.pooling,
         // `params_base.chat_params` (server-common.h:83-110) — the inputs of
         // `common_chat_templates_init`; the handler thread rebuilds the
@@ -3625,8 +3661,41 @@ fn load_engine(
         _ => false,
     };
 
+    // `ctx_server.mctx` (server-context.cpp:1150-1180): the mtmd context of
+    // `--mmproj`, `mparams.media_marker = get_media_marker()` (:1158) — the
+    // same per-instance marker the engine's chat params and the decision
+    // prompts use. The port wires it for the decision media path only (the
+    // d1-omni audio lane); the chat multimodal surface stays unwired, so a
+    // non-decision model refuses the flag instead of silently ignoring it.
+    let media_marker = format!("<__media_{}__>", random_string(32));
+    let (mctx, mmproj_has_vision) = match args.mmproj.as_deref() {
+        None => (None, false),
+        Some(path) => {
+            if decision.is_none() {
+                return Err("--mmproj is only wired for decision models in the port".into());
+            }
+            let mmproj_has_vision = ggml::Gguf::open(path)
+                .ok()
+                .and_then(|g| g.get_bool("clip.has_vision_encoder"))
+                .unwrap_or(false);
+            let mctx = llama::mtmd::MtmdContext::init_from_file(
+                path,
+                Some((&vocab, model.hparams.n_embd as i32, llama::mtmd::MtmdPosType::Normal)),
+                &llama::mtmd::MtmdContextParams {
+                    n_threads: args.n_threads,
+                    media_marker: media_marker.clone(),
+                    ..Default::default()
+                },
+            )
+            .map_err(|e| format!("failed to load mmproj '{path}': {e}"))?;
+            (Some(mctx), mmproj_has_vision)
+        }
+    };
+
     let engine = Engine {
         core,
+        mctx,
+        mmproj_has_vision,
         vocab: vocab.clone(),
         n_vocab,
         slots,
@@ -3647,7 +3716,7 @@ fn load_engine(
         decision,
         pooling: resolved_pooling,
         ftype,
-        media_marker: format!("<__media_{}__>", random_string(32)),
+        media_marker,
         chat_template,
         chat_template_caps,
         chat_template_tool_use,
@@ -3678,7 +3747,7 @@ fn load_engine(
         n_params: model_n_params,
         size: model_size,
         ftype: engine.ftype.clone(),
-        has_mtmd: false,
+        has_mtmd: engine.mctx.is_some(),
         // `server_model_output_modalities(common_get_decision_type(model))`
         // (server-context.cpp:4548, 4d60b4d08)
         model_output_modalities: server_decision::server_model_output_modalities(
@@ -3831,6 +3900,16 @@ fn register_routes(routes_table: &mut HttpServer, server: &Arc<engine::Server>) 
         routes_table.add("GET", path, Arc::new(move |_req: &Request| handle_models(&server)));
     }
 
+    // POST /apply-template (server.cpp:292, server-context.cpp:5585-5598)
+    {
+        let server = server.clone();
+        routes_table.add(
+            "POST",
+            "/apply-template",
+            Arc::new(move |req: &Request| handle_apply_template(&server, req)),
+        );
+    }
+
     // GET /slots (server.cpp:290, server-context.cpp:4729-4800) — the status
     // snapshot the engine publishes after each pass — and POST /slots/:id_slot
     // (save / restore / erase, server.cpp:291 + server-context.cpp:4771-4800)
@@ -3916,12 +3995,12 @@ fn handle_completion(server: &Arc<engine::Server>, req: &Request, res_type: api:
     let data = match Json::parse(&req.body_str()) {
         Ok(v) => v,
         Err(e) => {
-            // the reference reports the nlohmann exception as a server error
-            // (server.cpp:60-79)
+            // JSON parse errors are invalid requests (ex_wrapper's
+            // common_json_error catch, server.cpp:65-68) — 400, not 500
             return Response::error(api::json_error(
                 &json_parse_error_message(&e, &req.body_str()),
-                api::ERROR_TYPE_SERVER.0,
-                api::ERROR_TYPE_SERVER.1,
+                ERROR_TYPE_INVALID_REQUEST.0,
+                ERROR_TYPE_INVALID_REQUEST.1,
             ));
         }
     };
@@ -4052,9 +4131,9 @@ fn handle_completion(server: &Arc<engine::Server>, req: &Request, res_type: api:
         p.res_type = res_type;
         p.oaicompat_cmpl_id = completion_id.clone();
         p.oaicompat_model = server.model_meta.model_name.clone();
-        // `task.params.message_spans = task.tokens.find_message_spans(delims)`
-        // (server-context.cpp:4829) — the request's `message_delimiters`
-        p.message_user_starts = message_user_starts(&server.vocab, &tokens, &data);
+        // `task.apply_chat_session(chat_session)` with the default {} session
+        // (server-context.cpp:4825, 8b5436102) — a no-op without a template,
+        // so the /completion path sets no message spans here
         pending.push(Task {
             id: 0,
             index: index as i32,
@@ -4064,6 +4143,7 @@ fn handle_completion(server: &Arc<engine::Server>, req: &Request, res_type: api:
             prompt_text: prompt_text_of(index),
             slot_action: None,
             decision_body: Json::Null,
+            chat_session: None,
             tx,
         });
     }
@@ -4174,8 +4254,8 @@ fn handle_chat_completions(server: &Arc<engine::Server>, req: &Request) -> Respo
         Err(e) => {
             return Response::error(api::json_error(
                 &json_parse_error_message(&e, &req.body_str()),
-                api::ERROR_TYPE_SERVER.0,
-                api::ERROR_TYPE_SERVER.1,
+                ERROR_TYPE_INVALID_REQUEST.0,
+                ERROR_TYPE_INVALID_REQUEST.1,
             ));
         }
     };
@@ -4196,14 +4276,17 @@ fn handle_chat_completions(server: &Arc<engine::Server>, req: &Request) -> Respo
         templates: &templates,
         enable_thinking: server.enable_thinking,
         reasoning_format: llama::chat_tools::ReasoningFormat::Deepseek,
+        // `opt.reasoning_budget` — the port has no --reasoning-budget CLI yet
+        // (server-context.cpp:1619); only per-request values apply
+        reasoning_budget: -1,
+        reasoning_budget_message: String::new(),
     };
-    let parsed = match chat::oaicompat_chat_params_parse(&body, &opts) {
+    let parsed = match chat::oaicompat_chat_params_parse(Some(&server.vocab), &body, &opts) {
         Ok(p) => p,
         Err(e) => return Response::error(e.to_response_json()),
     };
-    // the chat metadata rides on the task params (server-schema.cpp:295-320:
-    // chat_format / grammar / grammar_lazy / grammar_triggers /
-    // preserved_tokens / generation_prompt / chat_parser)
+    // the llama_params body flows through the completion schema; the chat
+    // metadata itself is applied from the session below (8b5436102)
     let mut params = {
         let mut base = TaskParams::default();
         base.n_predict = server.n_predict_default;
@@ -4223,12 +4306,6 @@ fn handle_chat_completions(server: &Arc<engine::Server>, req: &Request) -> Respo
             }
         }
     };
-    params.chat_format = parsed.chat_format.to_string();
-    params.generation_prompt = parsed.generation_prompt;
-    params.grammar_prefill = parsed.grammar_needs_prefill;
-    // the serialized autoparser arena (`chat_parser_params.parser`)
-    params.chat_parser = parsed.parser;
-
     // one task on the rendered prompt — tokenized with special-token parsing
     // (the chat prompt carries the template's `<|im_…|>` markers)
     let prompt = parsed
@@ -4249,13 +4326,8 @@ fn handle_chat_completions(server: &Arc<engine::Server>, req: &Request) -> Respo
     params.res_type = api::ResponseType::OaiChat;
     params.oaicompat_cmpl_id = gen_chatcmplid();
     params.oaicompat_model = server.model_meta.model_name.clone();
-    // `task.params.message_spans` (server-context.cpp:4829) — the chat
-    // handler's `llama_params` carries the autoparser-derived
-    // `message_delimiters` (chat.rs, server-common.cpp:1454)
-    params.message_user_starts =
-        message_user_starts(&server.vocab, &tokens, &parsed.llama_params);
     let stream = params.stream;
-    let task = Task {
+    let mut task = Task {
         id: server.new_task_id(),
         index: 0,
         kind: TaskKind::Completion,
@@ -4263,9 +4335,14 @@ fn handle_chat_completions(server: &Arc<engine::Server>, req: &Request) -> Respo
         params,
         prompt_text: prompt,
         slot_action: None,
-            decision_body: Json::Null,
+        decision_body: Json::Null,
+        chat_session: None,
         tx,
     };
+    // `task.apply_chat_session(chat_session)` (server-context.cpp:4825,
+    // 8b5436102) — the sampling side, the chat format, the additional stops
+    // and the message spans all come off the session now
+    task.apply_chat_session(&parsed.session);
     server.queue.submit(task);
 
     if stream {
@@ -4350,9 +4427,18 @@ fn json_type_name(v: &Json) -> &'static str {
 /// `POST /v1/systemone` (server-context.cpp:5446-5534): parse + task assembly
 /// happen engine-side (the decision context owns the model's fitted
 /// temperatures); this handler submits the body and relays the single result
-/// frame. The "not a decision model" 501 comes back through the same frame
-/// path (`format_error_response(..., ERROR_TYPE_NOT_SUPPORTED)`).
+/// frame. The "not a decision model" 501 is checked here BEFORE the body
+/// parse (`decision.type == COMMON_DECISION_TYPE_NONE` guards
+/// `json::parse(req.body)`, server-context.cpp:5757-5762) — a malformed body
+/// on a non-decision model answers 501, not the parse error.
 fn handle_systemone(server: &Arc<engine::Server>, req: &Request) -> Response {
+    if !server.is_decision_model {
+        return Response::error(api::json_error(
+            "This model is not a decision model",
+            ERROR_TYPE_NOT_SUPPORTED.0,
+            ERROR_TYPE_NOT_SUPPORTED.1,
+        ));
+    }
     let body = match Json::parse(&req.body_str()) {
         Ok(v) => v,
         Err(e) => {
@@ -4372,6 +4458,7 @@ fn handle_systemone(server: &Arc<engine::Server>, req: &Request) -> Response {
         tokens: Vec::new(),
         params: TaskParams::default(),
         prompt_text: String::new(),
+        chat_session: None,
         slot_action: None,
         decision_body: body,
         tx,
@@ -4396,6 +4483,56 @@ fn handle_systemone(server: &Arc<engine::Server>, req: &Request) -> Response {
         api::ERROR_TYPE_SERVER.0,
         api::ERROR_TYPE_SERVER.1,
     ))
+}
+
+/// `POST /apply-template` (server-context.cpp:5585-5598): render the body's
+/// chat template and return the prompt the generation flow would submit —
+/// `oaicompat_chat_params_parse` with a dummy session (`files`/`session` are
+/// unused there), `res->ok({{"prompt", data.at("prompt")}})`. Body parse
+/// errors are the ex_wrapper's `common_json_error` → 400
+/// (server.cpp:65-68); `oaicompat_chat_params_parse` throws
+/// `std::invalid_argument` → 400.
+fn handle_apply_template(server: &Arc<engine::Server>, req: &Request) -> Response {
+    let body = match Json::parse(&req.body_str()) {
+        Ok(v) => v,
+        Err(e) => {
+            return Response::error(api::json_error(
+                &json_parse_error_message(&e, &req.body_str()),
+                ERROR_TYPE_INVALID_REQUEST.0,
+                ERROR_TYPE_INVALID_REQUEST.1,
+            ))
+        }
+    };
+    // the same per-thread template rebuild as /v1/chat/completions
+    // (`common_chat_templates_init` inputs, chat.cpp:757-855)
+    let templates = match llama::chat_tools::ChatTemplates::init(&server.chat_templates_init) {
+        Ok(t) => t,
+        Err(e) => {
+            return Response::error(api::json_error(
+                &format!("chat template parsing error: {e}"),
+                api::ERROR_TYPE_SERVER.0,
+                api::ERROR_TYPE_SERVER.1,
+            ))
+        }
+    };
+    let opts = chat::ChatOptions {
+        templates: &templates,
+        enable_thinking: server.enable_thinking,
+        reasoning_format: llama::chat_tools::ReasoningFormat::Deepseek,
+        reasoning_budget: -1,
+        reasoning_budget_message: String::new(),
+    };
+    let parsed = match chat::oaicompat_chat_params_parse(Some(&server.vocab), &body, &opts) {
+        Ok(p) => p,
+        Err(e) => return Response::error(e.to_response_json()),
+    };
+    let prompt = parsed
+        .llama_params
+        .at("prompt")
+        .and_then(|v| v.get_str().ok())
+        .unwrap_or("")
+        .to_string();
+    Response::ok(Json::Object(vec![("prompt".into(), Json::String(prompt))]).dump())
 }
 
 /// `POST /embedding(s)` / `POST /v1/embeddings`
@@ -4423,8 +4560,8 @@ fn handle_embeddings(server: &Arc<engine::Server>, req: &Request, mut res_type: 
         Err(e) => {
             return Response::error(api::json_error(
                 &json_parse_error_message(&e, &req.body_str()),
-                api::ERROR_TYPE_SERVER.0,
-                api::ERROR_TYPE_SERVER.1,
+                ERROR_TYPE_INVALID_REQUEST.0,
+                ERROR_TYPE_INVALID_REQUEST.1,
             ))
         }
     };
@@ -4642,6 +4779,7 @@ fn handle_embeddings(server: &Arc<engine::Server>, req: &Request, mut res_type: 
             prompt_text: input.clone(),
             slot_action: None,
             decision_body: Json::Null,
+            chat_session: None,
             tx,
         });
     }
@@ -4866,8 +5004,8 @@ fn handle_tokenize(server: &Arc<Server>, req: &Request) -> Response {
         Err(e) => {
             return Response::error(api::json_error(
                 &json_parse_error_message(&e, &req.body_str()),
-                api::ERROR_TYPE_SERVER.0,
-                api::ERROR_TYPE_SERVER.1,
+                ERROR_TYPE_INVALID_REQUEST.0,
+                ERROR_TYPE_INVALID_REQUEST.1,
             ))
         }
     };
@@ -4925,8 +5063,8 @@ fn handle_detokenize(server: &Arc<Server>, req: &Request) -> Response {
         Err(e) => {
             return Response::error(api::json_error(
                 &json_parse_error_message(&e, &req.body_str()),
-                api::ERROR_TYPE_SERVER.0,
-                api::ERROR_TYPE_SERVER.1,
+                ERROR_TYPE_INVALID_REQUEST.0,
+                ERROR_TYPE_INVALID_REQUEST.1,
             ))
         }
     };
@@ -4975,8 +5113,11 @@ fn handle_post_slots(server: &Arc<Server>, req: &Request) -> Response {
         ));
     }
     // erase takes no body; save/restore read "filename"
-    // (`request_data.at("filename")` — a missing key or a malformed body is
-    // the nlohmann exception path → the 500 wrapper of server.cpp:58-69)
+    // (`request_data.at("filename")` + `get<std::string>()`,
+    // server-context.cpp:5290-5291). `common_json::at()` on a missing key
+    // and a wrong-typed `get` both throw `common_json_error`
+    // (common/json.cpp:20-27) — ex_wrapper maps them to 400
+    // invalid_request (server.cpp:65-68), NOT the 500 wrapper
     let mut filename = String::new();
     let mut filepath = String::new();
     if action != "erase" {
@@ -4985,18 +5126,32 @@ fn handle_post_slots(server: &Arc<Server>, req: &Request) -> Response {
             Err(e) => {
                 return Response::error(api::json_error(
                     &json_parse_error_message(&e, &req.body_str()),
-                    api::ERROR_TYPE_SERVER.0,
-                    api::ERROR_TYPE_SERVER.1,
+                    ERROR_TYPE_INVALID_REQUEST.0,
+                    ERROR_TYPE_INVALID_REQUEST.1,
                 ))
             }
         };
-        match data.at("filename").map(|v| v.get_str().ok()) {
-            Some(Some(f)) => filename = f.to_string(),
-            _ => {
+        match data.at("filename") {
+            Some(Json::String(f)) => filename = f.to_string(),
+            // `at()` on a missing key → out_of_range.403
+            None => {
                 return Response::error(api::json_error(
                     "[json.exception.out_of_range.403] key 'filename' not found",
-                    api::ERROR_TYPE_SERVER.0,
-                    api::ERROR_TYPE_SERVER.1,
+                    ERROR_TYPE_INVALID_REQUEST.0,
+                    ERROR_TYPE_INVALID_REQUEST.1,
+                ))
+            }
+            // `get<std::string>()` on a non-string → type_error.302
+            // ("type must be string, but is number" — nlohmann names the
+            // actual value type)
+            Some(v) => {
+                return Response::error(api::json_error(
+                    &format!(
+                        "[json.exception.type_error.302] type must be string, but is {}",
+                        json_type_name(v)
+                    ),
+                    ERROR_TYPE_INVALID_REQUEST.0,
+                    ERROR_TYPE_INVALID_REQUEST.1,
                 ))
             }
         }
@@ -5026,6 +5181,7 @@ fn handle_post_slots(server: &Arc<Server>, req: &Request) -> Response {
         prompt_text: String::new(),
         slot_action: Some(engine::SlotAction { id_slot, filename, filepath }),
         decision_body: Json::Null,
+        chat_session: None,
         tx,
     };
     server.queue.submit(task);
@@ -5097,13 +5253,14 @@ mod tests {
     }
 
     /// `--host`/`--port` handling: loopback by default (server-http.cpp:120-150),
-    /// an explicit host is honoured, `--port` defaults to 8080, `--parallel`
+    /// an explicit host is honoured, `--port` defaults to 9931 (b42b7e6d3),
+    /// `--parallel`
     /// defaults to auto (-1) and a missing model is an error.
     #[test]
     fn arg_host_port_and_defaults() {
         let a = args(&["-m", "m.gguf"]).expect("minimal args");
         assert_eq!(a.host, "127.0.0.1");
-        assert_eq!(a.port, 8080);
+        assert_eq!(a.port, 9931);
         assert_eq!(a.n_parallel, -1, "-np auto (server.cpp:157-160)");
         assert_eq!(a.n_ctx, 4096);
         assert_eq!(a.n_predict, -1);

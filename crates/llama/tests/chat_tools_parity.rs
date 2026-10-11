@@ -615,12 +615,11 @@ fn chat_tools_parity_prompts_and_parsers() {
         );
 
         // canonical parser dump from the root — allocation ids inside the
-        // serialized arena follow the C++ evaluation order, so the graph dump
+        // arena follow the C++ evaluation order, so the graph dump
         // (deterministic DFS from root) is the structural byte-for-byte check
+        // (8b5436102: the parser is the arena itself, no serialization)
         let exp_dump = json_string(exp, "parser_dump");
-        let mut arena = PegArena::default();
-        arena.load(&got.parser).expect("parser reload");
-        let got_dump = ref_dump(&arena, arena.root());
+        let got_dump = ref_dump(&got.parser, got.parser.root());
         check(
             "parser dump",
             got_dump == exp_dump,
@@ -649,10 +648,10 @@ fn chat_tools_parity_prompts_and_parsers() {
         // parse side
         if let Some(parse_input) = case.input.at("parse_input").and_then(|v| v.get_str().ok()) {
             let is_partial = matches!(case.input.at("parse_partial"), Some(Json::Bool(true)));
-            let mut params = ChatParserParams::from_chat_params(&got)
-                .unwrap_or_else(|e| panic!("{}: load parser: {e}", case.name));
-            params.generation_prompt = ChatInput::from_plain(got.generation_prompt.clone());
-            let msg = match chat_parse(&ChatInput::from(parse_input), is_partial, &params) {
+            let params = ChatParserParams::from_chat_params(&got);
+            // the arena goes to chat_peg_parse separately (the from-params
+            // ctor does not carry it — chat.h:325-331, 8b5436102)
+            let msg = match chat_peg_parse(&got.parser, &ChatInput::from(parse_input), is_partial, &params) {
                 Ok(m) => m,
                 Err(e) => {
                     failures.push(format!("{}: chat_parse failed: {e}", case.name));
@@ -919,11 +918,10 @@ fn parser_serialization_roundtrip() {
         p.p.sequence(&[tc, end])
     })
     .unwrap();
-    let mut reloaded = PegArena::default();
-    reloaded.load(&arena.save()).unwrap();
-
+    // 8b5436102 removed the arena JSON serialization (save/load), so this now
+    // parses straight off the built arena
     let mut params = ChatParserParams::default();
-    params.parser = reloaded;
+    params.parser = arena;
     let msg = chat_parse(&ChatInput::from(r#"[{"name": "f", "arguments": {"x": 7}}]"#), false, &params).unwrap();
     assert_eq!(msg.tool_calls[0].name, "f");
     assert_eq!(msg.tool_calls[0].arguments, r#"{"x": 7}"#);
@@ -1071,10 +1069,10 @@ fn ref_server_tool_call_parse() {
     ).unwrap();
 
     // the parser the port generates for this template+tools parses the raw
-    // server output into the same tool_calls the reference reported
-    let mut pparams = ChatParserParams::from_chat_params(&params).unwrap();
-    pparams.generation_prompt = ChatInput::from_plain(params.generation_prompt.clone());
-    let msg = chat_parse(&ChatInput::from(raw_text.as_str()), false, &pparams).unwrap();
+    // server output into the same tool_calls the reference reported (the
+    // arena goes to chat_peg_parse separately — chat.h:325-331, 8b5436102)
+    let pparams = ChatParserParams::from_chat_params(&params);
+    let msg = chat_peg_parse(&params.parser, &ChatInput::from(raw_text.as_str()), false, &pparams).unwrap();
 
     let ref_name = ref_calls
         .at_idx(0)
@@ -1134,11 +1132,151 @@ fn debug_single_case() {
             .clone()
     };
     let got = apply_case(&all, &case).expect("apply");
-    let mut arena = PegArena::default();
-    arena.load(&got.parser).unwrap();
     eprintln!(
         "=== PORT parser dump ===\n{}",
-        ref_dump(&arena, arena.root())
+        ref_dump(&got.parser, got.parser.root())
     );
     eprintln!("=== PORT grammar ===\n{}", got.grammar);
+}
+
+/// `test_chat_session` (tests/test-chat.cpp:7783-7848, 8b5436102) — the
+/// session renders the prompt once and parses the output fed to it in small
+/// chunks; a copy does not see what is fed to the original; a continued
+/// message starts from the prefill unless it is echoed.
+#[test]
+fn chat_session_lifecycle() {
+    let src = std::fs::read_to_string(format!("{}/Qwen3.5-4B.jinja", fixture_dir()))
+        .expect("parity/Qwen3.5-4B.jinja (copy from models/templates/)");
+    let tmpls = ChatTemplates::init(&ChatTemplatesInit {
+        chat_template_override: src,
+        chat_template_tool_use: String::new(),
+        bos_token: String::new(),
+        eos_token: String::new(),
+        add_bos: false,
+        add_eos: false,
+    })
+    .unwrap();
+
+    let message_user = ChatMsg {
+        role: "user".into(),
+        content: "Hey there!".into(),
+        ..ChatMsg::default()
+    };
+    let special_function_tool = ChatTool {
+        name: "special_function".into(),
+        description: "I'm special".into(),
+        parameters: r#"{
+        "type": "object",
+        "properties": {
+            "arg1": {
+                "type": "integer",
+                "description": "The arg."
+            }
+        },
+        "required": ["arg1"]
+    }"#
+        .into(),
+    };
+
+    let inputs = TemplatesInputs {
+        messages: vec![message_user.clone()],
+        tools: vec![special_function_tool],
+        reasoning_format: ReasoningFormat::Auto,
+        add_generation_prompt: true,
+        ..TemplatesInputs::default()
+    };
+
+    let output = "I'm\nthinking\n</think>\n\n\
+<tool_call>\n\
+<function=special_function>\n\
+<parameter=arg1>\n1\n</parameter>\n\
+</function>\n\
+</tool_call>";
+
+    // the session renders the prompt and parses the output fed to it in small chunks
+    {
+        let mut session = ChatSession::new(&tmpls, None, &inputs, &ChatSessionParams::default())
+            .unwrap();
+        assert!(session.prompt().contains("\"name\": \"special_function\""));
+        assert!(session
+            .prompt()
+            .contains("<|im_start|>user\nHey there!<|im_end|>\n<|im_start|>assistant\n<think>\n"));
+        assert!(!session.grammar().is_empty());
+        assert_eq!(session.generation_prompt(), "<|im_start|>assistant\n<think>\n");
+
+        let thinking = "I'm\nthinking\n</think>\n\n";
+        let mut fed = 0usize;
+        while fed < thinking.len() {
+            let hi = (fed + 3).min(thinking.len());
+            session.feed(&ChatInput::from(&thinking[fed..hi])).unwrap();
+            fed = hi;
+        }
+        assert_eq!(session.msg().content, "");
+        assert_eq!(session.msg().reasoning_content, "I'm\nthinking\n");
+
+        while fed < output.len() {
+            let hi = (fed + 3).min(output.len());
+            session.feed(&ChatInput::from(&output[fed..hi])).unwrap();
+            fed = hi;
+        }
+        let msg = session.finish_empty().unwrap();
+        assert_eq!(msg.content, "");
+        assert_eq!(msg.reasoning_content, "I'm\nthinking\n");
+        assert_eq!(msg.tool_calls.len(), 1);
+        assert_eq!(msg.tool_calls[0].name, "special_function");
+        assert_eq!(msg.tool_calls[0].arguments, "{\"arg1\":1}");
+    }
+
+    // a copy does not see what is fed to the original
+    {
+        let mut a =
+            ChatSession::new(&tmpls, None, &inputs, &ChatSessionParams::default()).unwrap();
+        let mut b = a.clone();
+        a.feed(&ChatInput::from(output)).unwrap();
+        assert!(b.msg().empty());
+        b.feed(&ChatInput::from("I'm\nthinking\n</think>\n\nHello")).unwrap();
+        assert_eq!(b.msg().content, "Hello");
+        assert_eq!(a.finish_empty().unwrap().tool_calls[0].name, "special_function");
+    }
+
+    // a continued message starts from the prefill, unless it is echoed
+    {
+        let cont = TemplatesInputs {
+            messages: vec![
+                message_user,
+                ChatMsg {
+                    role: "assistant".into(),
+                    content: "Hello, ".into(),
+                    // `simple_assist_msg("Hello, ", "I'm thinking")` — no
+                    // trailing newline; the template's `\n</think>` end tag
+                    // supplies the separator
+                    reasoning_content: "I'm thinking".into(),
+                    ..ChatMsg::default()
+                },
+            ],
+            add_generation_prompt: false,
+            continue_final_message: ChatContinuation::Content,
+            reasoning_format: ReasoningFormat::Auto,
+            ..TemplatesInputs::default()
+        };
+
+        let mut session =
+            ChatSession::new(&tmpls, None, &cont, &ChatSessionParams::default()).unwrap();
+        assert_eq!(
+            session.generation_prompt(),
+            "<|im_start|>assistant\n<think>\nI'm thinking\n</think>\n\nHello, "
+        );
+        assert_eq!(session.msg().content, "Hello, ");
+        // `simple_assist_msg("Hello, ", "I'm thinking\n")` (test-chat.cpp:7843)
+        // — the parse keeps the newline before </think> in the reasoning
+        assert_eq!(session.msg().reasoning_content, "I'm thinking\n");
+        session.feed(&ChatInput::from("world!")).unwrap();
+        // the C++ only pins the content after the feed
+        // (assert_equals(std::string("Hello, world!"), session.msg().content))
+        assert_eq!(session.msg().content, "Hello, world!");
+
+        let echo = ChatSessionParams { echo: true, ..ChatSessionParams::default() };
+        let echoed = ChatSession::new(&tmpls, None, &cont, &echo).unwrap();
+        assert!(echoed.msg().empty());
+    }
 }

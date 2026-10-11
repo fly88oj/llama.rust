@@ -2464,13 +2464,14 @@ fn load_arch_hparams(gguf: &Gguf, arch: LlmArch, h: &mut LlamaHparams) -> Result
             h.f_norm_eps = get_key_f32(gguf, &k(LlmKv::ATTENTION_LAYERNORM_EPS), true)?.unwrap();
 
             // Some ModernBert derivatives (e.g. IBM Granite Embedding 97m R2)
-            // use SiLU/SwiGLU in the FFN instead of the default GELU/GeGLU
-            // (modern-bert.cpp:15-21): llm_ffn_op_type_from_string over the
-            // LLM_FFN_OP_TYPES_FROM_STRING table (llama-model.cpp:1042-1050)
-            // with GEGLU as the fallback
-            h.llm_ffn_op = LlmFfnOpType::GEGLU;
+            // use SiLU/SwiGLU in the FFN instead of the default GELU/GeGLU-ERF
+            // (modern-bert.cpp:15-21, 6184e92c5): llm_ffn_op_type_from_string
+            // over the LLM_FFN_OP_TYPES_FROM_STRING table (llama-model.cpp:1068-
+            // 1086) with GEGLU_ERF as the fallback — the ModernBERT encoders use
+            // the *exact* (erf) GELU
+            h.llm_ffn_op = LlmFfnOpType::GEGLU_ERF;
             if let Some(act) = get_key_string(gguf, &k(LlmKv::HIDDEN_ACT), false)? {
-                h.llm_ffn_op = llm_ffn_op_type_from_string(&act, LlmFfnOpType::GEGLU);
+                h.llm_ffn_op = llm_ffn_op_type_from_string(&act, LlmFfnOpType::GEGLU_ERF);
             }
 
             // GGUFs without a classifier pooling type use mean
@@ -2513,13 +2514,21 @@ fn load_arch_hparams(gguf: &Gguf, arch: LlmArch, h: &mut LlamaHparams) -> Result
     Ok(())
 }
 
-/// `llm_ffn_op_type_from_string` (llama-model.cpp:1052-1058) over the
-/// `LLM_FFN_OP_TYPES_FROM_STRING` table (:1042-1050) — unrecognized values
-/// fall back to the caller's fallback (GeGLU for the ModernBert-style archs).
+/// `llm_ffn_op_type_from_string` (llama-model.cpp:1091-1097) over the
+/// `LLM_FFN_OP_TYPES_FROM_STRING` table (:1068-1086, 6184e92c5) — unrecognized
+/// values fall back to the caller's fallback (GeGLU-ERF for the ModernBert-style
+/// archs). "gelu"/"gelu_python" are the exact (erf) variant per the transformers
+/// naming; the *_tanh/*_new/*_fast aliases stay on the tanh GeGLU.
 fn llm_ffn_op_type_from_string(name: &str, fallback: LlmFfnOpType) -> LlmFfnOpType {
     use LlmFfnOpType as Op;
     match name {
-        "gelu" => Op::GEGLU,
+        "gelu" => Op::GEGLU_ERF,
+        "gelu_python" => Op::GEGLU_ERF,
+        "gelu_pytorch_tanh" => Op::GEGLU,
+        "gelu_new" => Op::GEGLU,
+        "gelu_fast" => Op::GEGLU,
+        "gelu_accurate" => Op::GEGLU,
+        "gelu_python_tanh" => Op::GEGLU,
         "geglu" => Op::GEGLU,
         "silu" => Op::SWIGLU,
         "swish" => Op::SWIGLU,

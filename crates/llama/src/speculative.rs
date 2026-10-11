@@ -813,6 +813,20 @@ pub trait CommonSpeculativeImpl {
     fn ctx_dft(&mut self) -> Option<&mut DecodeContext> {
         None
     }
+
+    /// `virtual bool get_state(...)` (speculative.cpp:213-215) — (optional)
+    /// serialize per-seq internal state (e.g. eagle3's deferred boundary);
+    /// `false` = nothing stashed (`data` left alone).
+    fn get_state(&self, seq_id: i32, data: &mut Vec<u8>) -> bool {
+        let _ = (seq_id, data);
+        false
+    }
+
+    /// `virtual void set_state(...)` (speculative.cpp:215) — the restore
+    /// twin; a no-op unless the impl stashes state.
+    fn set_state(&mut self, seq_id: i32, data: &[u8]) {
+        let _ = (seq_id, data);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1657,21 +1671,35 @@ impl CommonSpeculativeImpl for CommonSpeculativeImplDraftMtp {
     }
 
     /// `bool process(const llama_batch & batch_in)` (speculative.cpp:1484-
-    /// 1600): decode the batch on the draft context — every token paired
+    /// 1604): decode the batch on the draft context — every token paired
     /// with the target's h row of the *previous* position — then stash the
     /// target's h rows of the batch (verify_h) and the last one (pending_h).
-    /// The gemma4 shared mode skips the catch-up decode entirely (:1519
+    /// The gemma4 shared mode skips the catch-up decode entirely (:1523
     /// `if (!is_mem_shared)` wraps the whole decode block — the KV lives in
     /// the target) and only harvests the h rows.
+    ///
+    /// (781dbc5ac) the h rows now ride upstream's new **state** channel
+    /// (`common_batch::set_embd_state`, :1601/:1686/:1779-1789 — llama-batch
+    /// gained `embd_state` next to `embd`, and `llm_graph_input_embd_h` reads
+    /// h from it). The port's single `LlamaBatch::embd`/`ubatch.embd` channel
+    /// was already state-only (the MTP graph consumes it as the hidden state,
+    /// never as a token embedding), so the rename is a no-op here.
     fn process(&mut self, batch_in: &LlamaBatch, ctx_tgt: &DecodeContext) -> bool {
         let n_tokens = batch_in.token.len();
-        if n_tokens == 0 {
+        // (781dbc5ac, speculative.cpp:1544-1546) the gate became "neither
+        // tokens nor embeddings" — upstream vision batches (embd rows) now
+        // ride the catch-up decode. The port keeps the embd skip one stage
+        // longer: a port batch is token-indexed, and its single embd channel
+        // is the *state* channel — the parallel input-embedding channel that
+        // upstream's `batch.add_embd(t.embd, ...)` rows (:1587-1590) feed
+        // lives in llama-batch.cpp/llama-graph.cpp (the rest of 781dbc5ac,
+        // context phase). Until that lands, an embd-carrying batch through
+        /// here would look its placeholder ids up in the draft's tok_embd.
+        if n_tokens == 0 && batch_in.embd.is_none() {
             return true;
         }
-
-        // TODO of the C kept: vision batches (embd input) are skipped
-        // (:1489-1492)
         if batch_in.embd.is_some() {
+            // port-only gate — see above [contract: context phase embd channel]
             return true;
         }
 
@@ -1704,6 +1732,11 @@ impl CommonSpeculativeImpl for CommonSpeculativeImplDraftMtp {
             self.batch.clear();
 
             for k in 0..n_tokens {
+                // (781dbc5ac, :1587-1590) upstream adds `t.id != LLAMA_TOKEN_
+                // NULL ? batch.add(t.id, ...) : batch.add_embd(t.embd, ...)`
+                // — every row a token row in the port (vision rows are kept
+                // out by the embd gate above until the input-embd channel
+                // lands)
                 self.batch
                     .add(batch_in.token[k], pos[k], &[seq_ids[k][0]], false);
             }
@@ -1726,6 +1759,9 @@ impl CommonSpeculativeImpl for CommonSpeculativeImplDraftMtp {
                 embd[beg as usize * n_embd..(beg as usize + 1) * n_embd]
                     .copy_from_slice(&self.pending_h[seq_id]);
             }
+            // (781dbc5ac) upstream attaches these rows per-index through
+            // `batch.set_embd_state(idx, ...)` (:1596) — the port's single
+            // embd channel plays that state role
             self.batch.embd = Some(embd);
 
             // the per-head loop (:1552-1571) runs once — chain_heads false —
@@ -1744,7 +1780,7 @@ impl CommonSpeculativeImpl for CommonSpeculativeImplDraftMtp {
             self.stats.n_forward += 1;
         }
 
-        // harvest the target's h rows of this batch (:1581-1597): verify_h
+        // harvest the target's h rows of this batch (:1631-1647): verify_h
         // rows 0..n_rows-1 in batch order, pending_h = the last row
         for seq_id in 0..self.i_batch_end.len() {
             let (beg, end) = (self.i_batch_beg[seq_id], self.i_batch_end[seq_id]);
@@ -2075,6 +2111,14 @@ pub struct CommonSpeculativeImplDraftEagle3 {
     features_buf: Vec<f32>,
     g_embd_buf: Vec<f32>,
 
+    /// `need_boundary_stash()`'s fact (speculative.cpp:938-942), captured at
+    /// construction: `llama_model_is_recurrent(model_tgt) ||
+    /// llama_model_is_hybrid(model_tgt)` — the port's recurrent geometry
+    /// predicate over the target (`recurrent_dims().is_some()` covers both
+    /// the pure-recurrent and the hybrid archs). The model's arch never
+    /// changes after load, so the snapshot equals the live query.
+    need_boundary_stash: bool,
+
     /// `llama_batch batch` (:428) — token ids **and** g rows (`batch.embd`)
     batch: LlamaBatch,
 
@@ -2145,6 +2189,10 @@ impl CommonSpeculativeImplDraftEagle3 {
             smpls.push(DraftSampler::new(vocab_dft));
         }
 
+        // `need_boundary_stash()`'s fact (speculative.cpp:938-942) — read
+        // from the target context the constructor holds
+        let need_boundary_stash = ctx_tgt.weights.recurrent_dims().is_some();
+
         // backend_chains (:497-511) — not ported, see the struct docs
 
         Ok(CommonSpeculativeImplDraftEagle3 {
@@ -2165,6 +2213,7 @@ impl CommonSpeculativeImplDraftEagle3 {
             verify_g_rows: vec![0; n_seq as usize],
             features_buf: Vec::new(),
             g_embd_buf: Vec::new(),
+            need_boundary_stash,
             batch,
             stats: CommonSpeculativeImplStats::default(),
         })
@@ -2596,6 +2645,59 @@ impl CommonSpeculativeImpl for CommonSpeculativeImplDraftEagle3 {
         let n_e = self.n_embd_dec;
         self.pending_g_last[seq_id as usize]
             .copy_from_slice(&self.verify_g[seq_id as usize][i_g * n_e..(i_g + 1) * n_e]);
+    }
+
+    /// `bool get_state(...)` override (speculative.cpp:944-959): stash the
+    /// deferred boundary's (pos, g_embd row) — only needed for
+    /// recurrent/hybrid targets, whose single-position checkpoints drop it
+    /// on restore (`need_boundary_stash`, :938-942). The blob is
+    /// `[i32 pos][f32 g × n_embd_dec]`.
+    fn get_state(&self, seq_id: i32, data: &mut Vec<u8>) -> bool {
+        if !self.need_boundary_stash {
+            return false;
+        }
+        if seq_id < 0
+            || seq_id as usize >= self.pending_pos_last.len()
+            || self.pending_pos_last[seq_id as usize] < 0
+        {
+            return false;
+        }
+
+        let pos = self.pending_pos_last[seq_id as usize];
+        let g = &self.pending_g_last[seq_id as usize];
+
+        // `data.resize(sizeof(llama_pos) + g.size()*sizeof(float))` + the
+        // two memcpys (:952-957)
+        data.clear();
+        data.extend_from_slice(&pos.to_le_bytes());
+        for v in g {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        true
+    }
+
+    /// `void set_state(...)` override (speculative.cpp:961-979): restore the
+    /// stashed boundary — a size mismatch (or a stash from another impl
+    /// width) is silently ignored, exactly like the C's early returns.
+    fn set_state(&mut self, seq_id: i32, data: &[u8]) {
+        if !self.need_boundary_stash {
+            return;
+        }
+        if seq_id < 0 || seq_id as usize >= self.pending_pos_last.len() {
+            return;
+        }
+        if data.len() != 4 + self.n_embd_dec * 4 {
+            return;
+        }
+
+        let pos = i32::from_le_bytes(data[0..4].try_into().unwrap());
+        self.pending_pos_last[seq_id as usize] = pos;
+        // `pending_g_last[seq_id].resize(n_embd_dec)` (already sized by the
+        // constructor) + the row memcpy (:974-978)
+        let row = &mut self.pending_g_last[seq_id as usize];
+        for (i, v) in row.iter_mut().enumerate() {
+            *v = f32::from_le_bytes(data[4 + i * 4..8 + i * 4].try_into().unwrap());
+        }
     }
 }
 
@@ -4066,6 +4168,28 @@ impl CommonSpeculative {
     pub fn get_draft_params(&mut self, seq_id: i32) -> &mut CommonSpeculativeDraftParams {
         assert!(seq_id >= 0 && (seq_id as usize) < self.dparams.len());
         &mut self.dparams[seq_id as usize]
+    }
+
+    /// `common_speculative_get_state` (speculative.cpp:3002-3013) — the
+    /// first impl that stashes a per-seq state wins (the TODO above it
+    /// notes more-than-one-stateful-impl is unsupported). The engine's
+    /// checkpoint stash (`cur.data_spec`, server-context.cpp:2577).
+    pub fn get_state(&self, seq_id: i32, data: &mut Vec<u8>) -> bool {
+        for impl_ in &self.impls {
+            if impl_.get_state(seq_id, data) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `common_speculative_set_state` (speculative.cpp:3016-3027) — offered
+    /// to every impl; the ones without state ignore it. The engine's
+    /// rollback restore (server-context.cpp:3759).
+    pub fn set_state(&mut self, seq_id: i32, data: &[u8]) {
+        for impl_ in self.impls.iter_mut() {
+            impl_.set_state(seq_id, data);
+        }
     }
 
     /// `common_speculative_begin` (speculative.cpp:2781-2791)

@@ -505,7 +505,11 @@ pub fn print_usage(prog: &str) {
     println!("  --progress                                  print test progress indicators");
     println!("  --no-warmup                                 skip warmup runs before benchmarking");
     println!("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)");
-    println!("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)");
+    // f39148a95: the help text's "default: 4096" was wrong — the parse
+    // default has always been 0 (llama-bench.cpp:415); the n_ctx_needed
+    // max(fit_min_ctx) side of the fix rides the GPU fit machinery this
+    // CPU-only port does not apply (ledgered)
+    println!("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)");
     println!("  --rust-token-counts                         rust-only: report tokens evaluated per test on stderr");
     println!();
     println!("test parameters:");

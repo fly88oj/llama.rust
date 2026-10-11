@@ -33,7 +33,7 @@
 //!     becomes `Err`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::json_schema::{
     build_grammar as schema_build_grammar, gbnf_format_literal, schema_from_json, GrammarOptions,
@@ -743,7 +743,7 @@ pub enum ParserKind {
         name: String,
         /// `common_chat_schema_document_ptr` — `None` after a serialization
         /// round trip (the reference's load() leaves `node == nullptr`)
-        doc: Option<Rc<SchemaDocument>>,
+        doc: Option<Arc<SchemaDocument>>,
         node: crate::json_schema::NodeId,
         raw: bool,
     },
@@ -1634,7 +1634,7 @@ impl PegArena {
                 refs: BTreeMap::new(),
             },
         );
-        let doc = Rc::new(document);
+        let doc = Arc::new(document);
         schema_build_grammar(&doc, GrammarOptions::default(), |builder| {
             let mut gen = GbnfGen {
                 arena: self,
@@ -1645,68 +1645,6 @@ impl PegArena {
         })
     }
 
-    // ---- serialization (peg-parser.cpp:1817-2118) ---------------------------
-
-    /// `to_json()` (peg-parser.cpp:1899-1909)
-    pub fn to_json(&self) -> Json {
-        let parsers = Json::Array(self.parsers.iter().map(serialize_parser_variant).collect());
-        let rules = Json::Object(
-            self.rules
-                .iter()
-                .map(|(name, id)| (name.clone(), Json::Uint(*id as u64)))
-                .collect(),
-        );
-        Json::Object(vec![
-            ("parsers".to_string(), parsers),
-            ("rules".to_string(), rules),
-            ("root".to_string(), Json::Uint(self.root as u64)),
-        ])
-    }
-
-    /// `from_json` (peg-parser.cpp:2077-2110)
-    pub fn from_json(j: &Json) -> Result<PegArena, String> {
-        let parsers_json = j
-            .at("parsers")
-            .filter(|v| v.is_array())
-            .ok_or("JSON missing or invalid 'parsers' array")?;
-        let rules_json = j
-            .at("rules")
-            .filter(|v| v.is_object())
-            .ok_or("JSON missing or invalid 'rules' object")?;
-        let root_json = j.at("root").ok_or("JSON missing 'root' field")?;
-
-        let mut arena = PegArena::default();
-        for parser_json in parsers_json.iter() {
-            arena.parsers.push(deserialize_parser_variant(parser_json)?);
-        }
-        for (name, id) in rules_json.items() {
-            let id = id.get_i64().map_err(|e| e.to_string())? as usize;
-            if id >= arena.parsers.len() {
-                return Err(format!("Rule '{name}' references invalid parser ID: {id}"));
-            }
-            arena.rules.push((name, id));
-        }
-        let root = match root_json {
-            Json::Null => INVALID_PARSER_ID,
-            other => other.get_i64().map_err(|e| e.to_string())? as usize,
-        };
-        if root != INVALID_PARSER_ID && root >= arena.parsers.len() {
-            return Err(format!("Root references invalid parser ID: {root}"));
-        }
-        arena.root = root;
-        Ok(arena)
-    }
-
-    /// `save()` (peg-parser.cpp:2112-2114)
-    pub fn save(&self) -> String {
-        self.to_json().dump()
-    }
-
-    /// `load(data)` (peg-parser.cpp:2116-2118)
-    pub fn load(&mut self, data: &str) -> Result<(), String> {
-        *self = PegArena::from_json(&Json::parse(data)?)?;
-        Ok(())
-    }
 }
 
 fn is_c_space(c: u8) -> bool {
@@ -2285,7 +2223,7 @@ impl PegBuilder {
         &mut self,
         p: ParserId,
         name: &str,
-        doc: Rc<SchemaDocument>,
+        doc: Arc<SchemaDocument>,
         node: crate::json_schema::NodeId,
         raw: bool,
     ) -> ParserId {
@@ -2300,7 +2238,7 @@ impl PegBuilder {
 
     /// `schema(p, name, schema_json, raw)` (peg-parser.cpp:1152-1155)
     pub fn schema(&mut self, p: ParserId, name: &str, schema: &Json, raw: bool) -> ParserId {
-        let doc = Rc::new(
+        let doc = Arc::new(
             schema_from_json(schema)
                 .map_err(|e| e.to_string())
                 .unwrap_or_else(|_| {
@@ -2707,15 +2645,15 @@ impl SchemaMerger {
         for parser in &arena.parsers {
             if let ParserKind::Schema { doc, node, .. } = parser {
                 if let Some(doc) = doc {
-                    merger.merge(Rc::clone(doc), *node);
+                    merger.merge(Arc::clone(doc), *node);
                 }
             }
         }
         merger
     }
 
-    fn merge(&mut self, doc: Rc<SchemaDocument>, node: usize) -> usize {
-        let key = (Rc::as_ptr(&doc) as usize, node);
+    fn merge(&mut self, doc: Arc<SchemaDocument>, node: usize) -> usize {
+        let key = (Arc::as_ptr(&doc) as usize, node);
         if let Some(&merged) = self.map.get(&key) {
             return merged;
         }
@@ -2727,8 +2665,8 @@ impl SchemaMerger {
         merged
     }
 
-    fn merge_node(&mut self, doc: &Rc<SchemaDocument>, node: usize) -> usize {
-        let key = (Rc::as_ptr(doc) as usize, node);
+    fn merge_node(&mut self, doc: &Arc<SchemaDocument>, node: usize) -> usize {
+        let key = (Arc::as_ptr(doc) as usize, node);
         if let Some(&merged) = self.map.get(&key) {
             return merged;
         }
@@ -2951,7 +2889,7 @@ impl GbnfGen<'_, '_, '_> {
                 };
                 match doc {
                     Some(doc) => {
-                        let merged = self.mmerger(Rc::clone(doc), *node);
+                        let merged = self.mmerger(Arc::clone(doc), *node);
                         self.builder.add_schema(name, merged)
                     }
                     // deserialized parser without its schema document: the
@@ -2981,11 +2919,11 @@ impl GbnfGen<'_, '_, '_> {
         }
     }
 
-    fn mmerger(&self, doc: Rc<SchemaDocument>, node: usize) -> usize {
+    fn mmerger(&self, doc: Arc<SchemaDocument>, node: usize) -> usize {
         *self
             .merger
             .map
-            .get(&(Rc::as_ptr(&doc) as usize, node))
+            .get(&(Arc::as_ptr(&doc) as usize, node))
             .unwrap_or(&node)
     }
 
@@ -3049,314 +2987,6 @@ impl GbnfGen<'_, '_, '_> {
 // ---------------------------------------------------------------------------
 // serialization variants (peg-parser.cpp:1817-2075)
 // ---------------------------------------------------------------------------
-
-fn serialize_parser_variant(variant: &ParserKind) -> Json {
-    fn obj(fields: Vec<(&str, Json)>) -> Json {
-        Json::Object(
-            fields
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-        )
-    }
-    fn ids(v: &[ParserId]) -> Json {
-        Json::Array(v.iter().map(|&i| Json::Uint(i as u64)).collect())
-    }
-    match variant {
-        ParserKind::Epsilon => obj(vec![("type", Json::String("epsilon".into()))]),
-        ParserKind::Start => obj(vec![("type", Json::String("start".into()))]),
-        ParserKind::End => obj(vec![("type", Json::String("end".into()))]),
-        ParserKind::Literal(literal) => obj(vec![
-            ("type", Json::String("literal".into())),
-            ("literal", Json::String(literal.clone())),
-        ]),
-        ParserKind::Sequence(children) => obj(vec![
-            ("type", Json::String("sequence".into())),
-            ("children", ids(children)),
-        ]),
-        ParserKind::Choice(children) => obj(vec![
-            ("type", Json::String("choice".into())),
-            ("children", ids(children)),
-        ]),
-        ParserKind::Repetition { child, min, max } => obj(vec![
-            ("type", Json::String("repetition".into())),
-            ("child", Json::Uint(*child as u64)),
-            ("min_count", Json::Int(*min as i64)),
-            ("max_count", Json::Int(*max as i64)),
-        ]),
-        ParserKind::And { child } => obj(vec![
-            ("type", Json::String("and".into())),
-            ("child", Json::Uint(*child as u64)),
-        ]),
-        ParserKind::Not { child } => obj(vec![
-            ("type", Json::String("not".into())),
-            ("child", Json::Uint(*child as u64)),
-        ]),
-        ParserKind::Any => obj(vec![("type", Json::String("any".into()))]),
-        ParserKind::Space => obj(vec![("type", Json::String("space".into()))]),
-        ParserKind::Chars {
-            pattern,
-            ranges,
-            negated,
-            min,
-            max,
-        } => {
-            let ranges_json = Json::Array(
-                ranges
-                    .iter()
-                    .map(|r| {
-                        obj(vec![
-                            ("start", Json::Uint(r.start as u64)),
-                            ("end", Json::Uint(r.end as u64)),
-                        ])
-                    })
-                    .collect(),
-            );
-            obj(vec![
-                ("type", Json::String("chars".into())),
-                ("pattern", Json::String(pattern.clone())),
-                ("ranges", ranges_json),
-                ("negated", Json::Bool(*negated)),
-                ("min_count", Json::Int(*min as i64)),
-                ("max_count", Json::Int(*max as i64)),
-            ])
-        }
-        ParserKind::Str { delimiter } => obj(vec![
-            ("type", Json::String("string".into())),
-            ("delimiter", Json::String((*delimiter as char).to_string())),
-        ]),
-        ParserKind::Until { delimiters } => obj(vec![
-            ("type", Json::String("until".into())),
-            (
-                "delimiters",
-                Json::Array(delimiters.iter().map(|d| Json::String(d.clone())).collect()),
-            ),
-        ]),
-        ParserKind::Schema {
-            child, name, raw, ..
-        } => obj(vec![
-            ("type", Json::String("schema".into())),
-            ("child", Json::Uint(*child as u64)),
-            ("name", Json::String(name.clone())),
-            ("raw", Json::Bool(*raw)),
-        ]),
-        ParserKind::Rule {
-            name,
-            child,
-            trigger,
-        } => obj(vec![
-            ("type", Json::String("rule".into())),
-            ("name", Json::String(name.clone())),
-            ("child", Json::Uint(*child as u64)),
-            ("trigger", Json::Bool(*trigger)),
-        ]),
-        ParserKind::Ref { name } => obj(vec![
-            ("type", Json::String("ref".into())),
-            ("name", Json::String(name.clone())),
-        ]),
-        ParserKind::Atomic { child } => obj(vec![
-            ("type", Json::String("atomic".into())),
-            ("child", Json::Uint(*child as u64)),
-        ]),
-        ParserKind::Tag { child, tag } => obj(vec![
-            ("type", Json::String("tag".into())),
-            ("child", Json::Uint(*child as u64)),
-            ("tag", Json::String(tag.clone())),
-        ]),
-        ParserKind::Gbnf { child, grammar } => obj(vec![
-            ("type", Json::String("gbnf".into())),
-            ("child", Json::Uint(*child as u64)),
-            ("grammar", Json::String(grammar.clone())),
-        ]),
-        ParserKind::Ac { child, delimiters } => obj(vec![
-            ("type", Json::String("ac".into())),
-            ("child", Json::Uint(*child as u64)),
-            (
-                "delimiters",
-                Json::Array(delimiters.iter().map(|d| Json::String(d.clone())).collect()),
-            ),
-        ]),
-    }
-}
-
-fn deserialize_parser_variant(j: &Json) -> Result<ParserKind, String> {
-    let ty = j
-        .at("type")
-        .and_then(|v| if v.is_string() { Some(v) } else { None })
-        .and_then(|v| v.get_str().ok())
-        .ok_or("Parser variant JSON missing or invalid 'type' field")?
-        .to_string();
-
-    let uint = |key: &str| -> Result<usize, String> {
-        j.at(key)
-            .ok_or_else(|| format!("parser missing '{key}' field"))?
-            .get_i64()
-            .map(|v| v as usize)
-            .map_err(|e| e.to_string())
-    };
-    let int = |key: &str| -> Result<i32, String> {
-        j.at(key)
-            .ok_or_else(|| format!("parser missing '{key}' field"))?
-            .get_i64()
-            .map(|v| v as i32)
-            .map_err(|e| e.to_string())
-    };
-    let string = |key: &str| -> Result<String, String> {
-        j.at(key)
-            .and_then(|v| v.get_str().ok().map(|s| s.to_string()))
-            .ok_or_else(|| format!("parser missing or invalid '{key}' field"))
-    };
-    match ty.as_str() {
-        "epsilon" => Ok(ParserKind::Epsilon),
-        "start" => Ok(ParserKind::Start),
-        "end" => Ok(ParserKind::End),
-        "literal" => Ok(ParserKind::Literal(string("literal")?)),
-        "sequence" => {
-            let children = j
-                .at("children")
-                .filter(|v| v.is_array())
-                .ok_or("sequence parser missing or invalid 'children' field")?;
-            let mut ids = Vec::new();
-            for c in children.iter() {
-                ids.push(c.get_i64().map_err(|e| e.to_string())? as usize);
-            }
-            Ok(ParserKind::Sequence(ids))
-        }
-        "choice" => {
-            let children = j
-                .at("children")
-                .filter(|v| v.is_array())
-                .ok_or("choice parser missing or invalid 'children' field")?;
-            let mut ids = Vec::new();
-            for c in children.iter() {
-                ids.push(c.get_i64().map_err(|e| e.to_string())? as usize);
-            }
-            Ok(ParserKind::Choice(ids))
-        }
-        "repetition" => Ok(ParserKind::Repetition {
-            child: uint("child")?,
-            min: int("min_count")?,
-            max: int("max_count")?,
-        }),
-        "and" => Ok(ParserKind::And {
-            child: uint("child")?,
-        }),
-        "not" => Ok(ParserKind::Not {
-            child: uint("child")?,
-        }),
-        "any" => Ok(ParserKind::Any),
-        "space" => Ok(ParserKind::Space),
-        "chars" => {
-            let pattern = string("pattern")?;
-            let negated = match j.at("negated") {
-                Some(Json::Bool(b)) => *b,
-                _ => return Err("chars parser missing required fields".to_string()),
-            };
-            let min = int("min_count")?;
-            let max = int("max_count")?;
-            let mut ranges = Vec::new();
-            let ranges_json = j
-                .at("ranges")
-                .filter(|v| v.is_array())
-                .ok_or("chars parser missing required fields")?;
-            for r in ranges_json.iter() {
-                let start = r
-                    .at("start")
-                    .and_then(|v| v.get_i64().ok())
-                    .ok_or("char_range missing 'start' or 'end' field")?
-                    as u32;
-                let end = r
-                    .at("end")
-                    .and_then(|v| v.get_i64().ok())
-                    .ok_or("char_range missing 'start' or 'end' field")?
-                    as u32;
-                ranges.push(CharRange { start, end });
-            }
-            Ok(ParserKind::Chars {
-                pattern,
-                ranges,
-                negated,
-                min,
-                max,
-            })
-        }
-        "string" => {
-            let delimiter = string("delimiter")?;
-            if delimiter.is_empty() {
-                return Err("string parser delimiter is empty.".to_string());
-            }
-            Ok(ParserKind::Str {
-                delimiter: delimiter.as_bytes()[0],
-            })
-        }
-        "until" => {
-            let delimiters = j
-                .at("delimiters")
-                .filter(|v| v.is_array())
-                .ok_or("until parser missing or invalid 'delimiters' field")?;
-            let mut out = Vec::new();
-            for d in delimiters.iter() {
-                out.push(d.get_str().map_err(|e| e.to_string())?.to_string());
-            }
-            Ok(ParserKind::Until { delimiters: out })
-        }
-        "schema" => Ok(ParserKind::Schema {
-            child: uint("child")?,
-            name: string("name")?,
-            raw: match j.at("raw") {
-                Some(Json::Bool(b)) => *b,
-                _ => return Err("schema parser missing required fields".to_string()),
-            },
-            // schema documents are not serialized in the reference either:
-            // deserialize leaves `node == nullptr` (peg-parser.cpp:2010-2018)
-            doc: None,
-            node: 0,
-        }),
-        "rule" => Ok(ParserKind::Rule {
-            name: string("name")?,
-            child: uint("child")?,
-            trigger: match j.at("trigger") {
-                Some(Json::Bool(b)) => *b,
-                _ => return Err("rule parser missing required fields".to_string()),
-            },
-        }),
-        "ref" => Ok(ParserKind::Ref {
-            name: string("name")?,
-        }),
-        "atomic" => Ok(ParserKind::Atomic {
-            child: uint("child")?,
-        }),
-        "tag" => Ok(ParserKind::Tag {
-            child: uint("child")?,
-            tag: string("tag")?,
-        }),
-        "gbnf" => Ok(ParserKind::Gbnf {
-            child: uint("child")?,
-            grammar: string("grammar")?,
-        }),
-        "ac" => {
-            let child = uint("child")?;
-            let delimiters = j
-                .at("delimiters")
-                .filter(|v| v.is_array())
-                .ok_or("ac parser requires 'child' and a non-empty 'delimiters' array")?;
-            let mut out = Vec::new();
-            for d in delimiters.iter() {
-                out.push(d.get_str().map_err(|e| e.to_string())?.to_string());
-            }
-            if out.is_empty() {
-                return Err(
-                    "ac parser requires 'child' and a non-empty 'delimiters' array".to_string(),
-                );
-            }
-            Ok(ParserKind::Ac {
-                child,
-                delimiters: out,
-            })
-        }
-        other => Err(format!("Unknown parser type: {other}")),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // tests
@@ -3451,16 +3081,16 @@ mod tests {
     }
 
     #[test]
-    fn save_load_roundtrip() {
+    fn json_parser_roundtrip_use() {
+        // 8b5436102 removed the arena JSON serialization (save/load), so the
+        // arena is used directly where the round-trip used to be exercised
         let arena = build_peg_parser(|p| {
             let j = p.json();
             let end = p.end();
             p.sequence(&[j, end])
         })
         .unwrap();
-        let saved = arena.save();
-        let loaded = PegArena::from_json(&Json::parse(&saved).unwrap()).unwrap();
-        assert!(parse_str(&loaded, r#"{"k": true}"#).success());
+        assert!(parse_str(&arena, r#"{"k": true}"#).success());
     }
 
     #[test]

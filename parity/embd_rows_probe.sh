@@ -27,8 +27,13 @@ EOF
       curl -s -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
       sleep 1
     done
-    curl -s -m 300 "http://127.0.0.1:$PORT/embedding" \
-        -H 'Content-Type: application/json' -d @/tmp/e-body.json >"/tmp/e-$SIDE.json"
+    # the aa94f2086 server /health can precede slot readiness — retry on 503
+    for _ in $(seq 1 60); do
+      curl -s -m 300 "http://127.0.0.1:$PORT/embedding" \
+          -H 'Content-Type: application/json' -d @/tmp/e-body.json >"/tmp/e-$SIDE.json"
+      grep -q '"error"' "/tmp/e-$SIDE.json" || break
+      sleep 1
+    done
   done
   stop
   python3 - <<'EOF'

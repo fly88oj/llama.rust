@@ -2612,15 +2612,34 @@ pub fn build_gemma4_forward(
     let mut graph = Graph::new(8192);
     assert_eq!(p.is_swa.len(), n_layer, "Gemma4Params::is_swa per layer");
 
+    // do the PLE first to guarantee it is done in the host buffer
+    // (gemma4.cpp:162-168 @aa94f2086, 8e2d31e0e): build_inp_per_layer's bare
+    // get_rows is gathered and expanded on the graph BEFORE build_inp_embd,
+    // so the per-layer rows stick at the front of the compute graph
+    let ple_rows = match (w.per_layer_tok_embd, w.per_layer_model_proj, w.per_layer_proj_norm) {
+        (Some(tab), Some(_), Some(_)) => {
+            // build_inp_per_layer token path (gemma4.cpp:488-492): the mixed
+            // ubatch rides the same token ids (embd rows are token id 0)
+            let rows = ctx.get_rows(tab, inp.tokens);
+            graph.build_forward(ctx, rows); // ggml_build_forward_expand(gf, inp_per_layer) :167
+            Some(rows)
+        }
+        _ => None,
+    };
+
     // inpL = build_inp_embd + `ggml_scale(sqrtf(n_embd))` when the input is
-    // token ids (gemma4.cpp:168-171; ours always is); the lora delta
-    // (llama-graph.cpp:2389-2405) is added before that scale, like the C
+    // token ids (gemma4.cpp:170-174; ours always is); the lora delta
+    // (llama-graph.cpp:2521-2536) is added before that scale, like the C.
+    // 8e2d31e0e: build_inp_embd's get_rows is pinned at the graph front
+    // (ggml_build_forward_order, llama-graph.cpp:2507) — after the PLE rows
     let inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
+    graph.build_forward(ctx, inp_l);
     let mut inp_l = crate::adapter::lora_embd(ctx, w.tok_embd, inp_l, inp.tokens);
     inp_l = ctx.scale(inp_l, (p.n_embd as f32).sqrt());
 
-    // per-layer inputs (gemma4.cpp:184-191 → build_inp_per_layer +
-    // project_per_level_inputs, gemma4.cpp:400-497)
+    // per-layer inputs (gemma4.cpp:176-191 → the scale/reshape the C moved
+    // out of build_inp_per_layer + project_per_layer_inputs,
+    // gemma4.cpp:400-497)
     //
     // def4d406a: upstream replaced `llm_graph_input_embd` with the dedicated
     // `llm_graph_input_gemma4_ple` (gemma4.cpp:439-469) whose set_input
@@ -2629,14 +2648,13 @@ pub fn build_gemma4_forward(
     // `res->add_input(std::move(inp))` to cover the multimodal branch too
     // ([TAG_GEMMA4_IMG_PADDING] — the port's decode always carries tokens;
     // embd batches go through DecodeContext::decode_embd's value-identical
-    // row materialization, the parity ledger batch 18)
-    let inp_per_layer = match (
-        w.per_layer_tok_embd,
-        w.per_layer_model_proj,
-        w.per_layer_proj_norm,
-    ) {
-        (Some(tab), Some(proj), Some(norm)) => Some(build_gemma4_per_layer(
-            ctx, tab, proj, norm, inp_l, inp.tokens, p, t,
+    // row materialization, the parity ledger batch 18. 8e2d31e0e rewrote the
+    // multimodal arm as get_rows on a 1-row `token0` input set to the
+    // padding id 0 (gemma4.cpp:492-498) — the gather-based arm replaces the
+    // old view+cast of row 0 and is the only remaining form upstream)
+    let inp_per_layer = match (ple_rows, w.per_layer_model_proj, w.per_layer_proj_norm) {
+        (Some(rows), Some(proj), Some(norm)) => Some(build_gemma4_per_layer(
+            ctx, rows, proj, norm, inp_l, p, t,
         )),
         _ => None,
     };
@@ -3010,26 +3028,29 @@ fn build_moe_ffn_gemma4(
     moe_out
 }
 
-/// build_inp_per_layer + project_per_layer_inputs (gemma4.cpp:398-497).
+/// project_per_layer_inputs + the scale/reshape the C applies in the graph
+/// body (gemma4.cpp:178-191 + :400-497; the gather itself runs before
+/// build_inp_embd in the caller — 8e2d31e0e).
 #[allow(clippy::too_many_arguments)]
 fn build_gemma4_per_layer(
     ctx: &mut Context,
-    tab: TensorId,
+    rows: TensorId,
     model_proj: TensorId,
     proj_norm: TensorId,
     inp_batch: TensorId,
-    tokens: TensorId,
     p: &Gemma4Params,
     t: i64,
 ) -> TensorId {
     let n_embd_per_layer = p.n_embd_per_layer;
     let n_layer = p.is_swa.len() as i64;
 
-    // inp_per_layer = get_rows(per_layer_tok_embd, tokens) → [n_embd_per_layer,
-    // n_layer, n_tokens], scaled by sqrt(n_embd_per_layer) (gemma4.cpp:409-413)
-    let mut ipl = ctx.get_rows(tab, tokens);
+    // inp_per_layer = get_rows(per_layer_tok_embd, tokens), scaled by
+    // sqrt(n_embd_per_layer) then reshaped to [n_embd_per_layer, n_layer,
+    // n_tokens] (gemma4.cpp:180-186 @aa94f2086 — 8e2d31e0e moved the
+    // scale/reshape out of build_inp_per_layer and swapped their order;
+    // both are element-wise/row-preserving, values identical)
+    let mut ipl = ctx.scale(rows, (n_embd_per_layer as f32).sqrt());
     ipl = ctx.reshape_3d(ipl, n_embd_per_layer, n_layer, t);
-    ipl = ctx.scale(ipl, (n_embd_per_layer as f32).sqrt());
 
     // per_layer_proj = mul_mat(per_layer_model_proj, inp_batch), scaled by
     // 1/sqrt(n_embd), reshaped, rms-normed (gemma4.cpp:477-484)
@@ -4910,12 +4931,13 @@ pub struct ModernBertSwa {
     pub freq_scale_swa: f32,
 }
 
-/// The resolved FFN op (`hparams.llm_ffn_op`, modern-bert.cpp:17-21): GEGLU by
-/// default, `hidden_activation` override for the SiLU derivatives (granite
+/// The resolved FFN op (`hparams.llm_ffn_op`, modern-bert.cpp:17-21,
+/// 6184e92c5): GEGLU_ERF (the exact erf GELU) by default,
+/// `hidden_activation` override for the SiLU derivatives (granite
 /// embedding).
 pub struct ModernBertParams {
     pub swa: ModernBertSwa,
-    /// the `hparams.llm_ffn_op` of the file (GEGLU default)
+    /// the `hparams.llm_ffn_op` of the file (GEGLU_ERF default)
     pub ffn_op: crate::hparams::LlmFfnOpType,
 }
 
@@ -4981,7 +5003,8 @@ pub struct ModernBertModelWeights {
 /// attention with NORM... NEOX-mode rope at the layer's own freq base (SWA
 /// layers get the *_swa pair) and the symmetric-SWA mask twin on those layers
 /// → residual → ffn LayerNorm → the `llm_ffn_op` FFN over the 2*n_ff-wide up
-/// (GEGLU default, SwiGLU for the granite derivatives) → residual; final
+/// (GEGLU_ERF default — the exact erf GELU since 6184e92c5, SwiGLU for the
+/// granite derivatives) → residual; final
 /// output LayerNorm. `res->t_embd` only; the reranker head is pooling-side.
 pub fn build_modern_bert_forward(
     ctx: &mut Context,
@@ -5080,17 +5103,23 @@ pub fn build_modern_bert_forward(
         let first = ctx.view_2d(up, n_half, t, nb1, 0);
         let second = ctx.view_2d(up, n_half, t, nb1, (n_half * 4) as usize);
         let act = match mp.ffn_op {
-            // ggml_geglu(up) (llama-graph.cpp:1904-1908)
+            // ggml_geglu_erf(up) (llama-graph.cpp:1962-1966, 6184e92c5) — the
+            // default act of the ModernBERT encoders is the exact (erf) GELU;
+            // "gelu"/"gelu_python" also land here via the string map
+            Op::GEGLU_ERF => ctx.geglu_erf_split(first, second),
+            // ggml_geglu(up) (llama-graph.cpp:1957-1961) — the tanh aliases
+            // ("gelu_pytorch_tanh"/"gelu_new"/"gelu_fast"/"gelu_accurate"/
+            // "gelu_python_tanh"/"geglu")
             Op::GEGLU => ctx.geglu_split(first, second),
             // hidden_activation "silu"/"swish"/"swiglu" → LLM_FFN_SWIGLU →
-            // ggml_swiglu(up) (llama-graph.cpp:1926-1930)
+            // ggml_swiglu(up) (llama-graph.cpp:1941-1945)
             Op::SWIGLU => ctx.swiglu_split(first, second),
             // hidden_activation "reglu" → LLM_FFN_REGLU → ggml_reglu(up)
-            // (llama-graph.cpp:1912-1916)
+            // (llama-graph.cpp:1967-1971)
             Op::REGLU => ctx.reglu_split(first, second),
             other => unimplemented!(
                 "modern-bert: ffn op {other:?} (not a gated op of the \
-                 LLM_FFN_OP_TYPES_FROM_STRING table, llama-model.cpp:1042-1050)"
+                 LLM_FFN_OP_TYPES_FROM_STRING table, llama-model.cpp:1068-1086)"
             ),
         };
         let cur = crate::adapter::lora_mm(ctx, lw.ffn_down, act);
@@ -24727,26 +24756,34 @@ pub fn build_qwen4exp_forward(
     let hc = p.hc;
     let _ = sinfo;
 
-    let mut inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
-    inp_l = crate::adapter::lora_embd(ctx, w.tok_embd, inp_l, inp.tokens);
-
-    // the wide residual starts as hc identical copies of the embedding
-    // (qwen4exp.cpp:389-391)
-    let embd3 = ctx.reshape_3d(inp_l, p.n_embd, 1, t);
-    let mut res_hc = ctx.repeat_4d(embd3, p.n_embd, hc, t, 1);
-    ctx.set_name(res_hc, "hc_init");
-
-    // build_inp_ple (qwen4exp.cpp:1202-1220): gather the hashed rows, then
-    // flatten the heads — get_rows lays the head dimension out slowest
+    // build_inp_ple first (qwen4exp.cpp:420-425 @aa94f2086, 8e2d31e0e):
+    // gather the hashed rows, then flatten the heads — get_rows lays the
+    // head dimension out slowest — and expand it on the graph BEFORE
+    // build_inp_embd, so ple_emb and the input embeddings are in the same
+    // graph split and the gather sticks at the front of the compute graph
     let ple_emb = match (w.per_layer_tok_embd, ple_input) {
         (Some(tbl), Some(pi)) => {
             let mut emb = ctx.get_rows(tbl, pi.rows);
             emb = ctx.reshape_2d(emb, p.ple_head_dim * p.ple_n_heads, t);
             ctx.set_name(emb, "ple_embd");
+            graph.build_forward(ctx, emb); // ggml_build_forward_expand(gf, ple_emb) :424
             Some(emb)
         }
         _ => None,
     };
+
+    // inpL = build_inp_embd(model.tok_embd) (qwen4exp.cpp:427-429) — the
+    // get_rows pinned at the graph front (ggml_build_forward_order,
+    // llama-graph.cpp:2507)
+    let mut inp_l = ctx.get_rows(w.tok_embd, inp.tokens);
+    graph.build_forward(ctx, inp_l);
+    inp_l = crate::adapter::lora_embd(ctx, w.tok_embd, inp_l, inp.tokens);
+
+    // the wide residual starts as hc identical copies of the embedding
+    // (qwen4exp.cpp:443-446)
+    let embd3 = ctx.reshape_3d(inp_l, p.n_embd, 1, t);
+    let mut res_hc = ctx.repeat_4d(embd3, p.n_embd, hc, t, 1);
+    ctx.set_name(res_hc, "hc_init");
 
     for il in 0..n_layer {
         let lw = &w.layers[il];
@@ -44895,10 +44932,12 @@ pub fn build_gemma_embedding2_forward(
 
     // inpL x sqrt(n_embd) — build_inp_embd(tok_scale) (gemma-embedding2.
     // cpp:86; the encode batches carry tokens, the mixed form carries the
-    // raw embd rows beside them)
+    // raw embd rows beside them). 8e2d31e0e: build_inp_embd pins its
+    // GET_ROWS at the graph front via the new `graph` arg
     let n_embd = ctx.ne(w.tok_embd)[0];
     let mut inp_l = crate::graph::build_inp_embd(
         ctx,
+        &mut graph,
         w.tok_embd,
         inp.tokens,
         mixed,
@@ -45115,7 +45154,10 @@ pub struct Lfm2DecisionParams {
 /// `graph_decision`'s inputs — the two no-cache masks of
 /// `llm_graph_input_attn_media` (enc: the media never reads the text; head:
 /// text and media read their own kind only) and the `llm_graph_input_conv_mask`
-/// neighbor taps (lfm2.cpp:352-394).
+/// neighbor taps (lfm2.cpp:352-394). `mixed` carries the media rows of a
+/// token+embd ubatch through `build_inp_embd`'s mixed arm
+/// (llama-graph.cpp:2462-2616 — `graph_decision`'s
+/// `build_inp_embd(model.tok_embd)` reads the same input).
 pub struct Lfm2DecisionInputs {
     pub tokens: TensorId,
     pub pos: TensorId,
@@ -45128,6 +45170,8 @@ pub struct Lfm2DecisionInputs {
     /// its right)
     pub conv_left: TensorId,
     pub conv_right: TensorId,
+    /// the mixed-batch bundle (`InpMixed`); `None` = a token-only batch
+    pub mixed: Option<crate::graph::InpMixed>,
     pub out_ids: Option<TensorId>,
 }
 
@@ -45252,8 +45296,22 @@ pub fn build_lfm2_decision_forward(
     assert_eq!(p.n_shortconv_l_cache, 3, "lfm2 decision: l_cache == 3");
     let mut graph = Graph::new(8192);
 
-    let mut cur = ctx.get_rows(w.tok_embd, inp.tokens);
-    cur = crate::adapter::lora_embd(ctx, w.tok_embd, cur, inp.tokens);
+    // build_inp_embd(model.tok_embd) (lfm2.cpp:397-398) — the shared
+    // embedding-input builder of llama-graph.cpp:2462-2616: token rows
+    // through get_rows, media rows through the mixed set_rows arm. lfm2 has
+    // no embedding scale and no n_embd_inp pad (tok_scale 1.0)
+    let mut cur = crate::graph::build_inp_embd(
+        ctx,
+        &mut graph,
+        w.tok_embd,
+        inp.tokens,
+        inp.mixed.as_ref(),
+        1.0,
+        crate::graph::InpEmbdScale {
+            n_embd_inp: n_embd,
+            ..Default::default()
+        },
+    );
     ctx.set_name(cur, "model.embed_tokens"); // cb(cur, ..., -1) :399
 
     let kq_scale = 1.0 / (n_embd_head as f32).sqrt(); // :470/:540

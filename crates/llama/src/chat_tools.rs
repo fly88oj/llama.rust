@@ -57,7 +57,7 @@
 //!     clock, the documented chat.rs deviation from `std::localtime`.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::chat::{caps_get, mini_jinja, JinjaCaps};
 use crate::json_schema::{schema_from_json, Json, SchemaDocument, SchemaKind};
@@ -322,13 +322,19 @@ pub enum ChatContinuation {
     Content,
 }
 
-/// `common_chat_continuation_parse` (chat.cpp:622-636)
-pub fn chat_continuation_parse(value: &Json) -> ChatContinuation {
+/// `common_chat_continuation_parse` (chat.cpp:617-631, 8b5436102) — bool or
+/// the named modes; anything else is an error (the old code silently mapped
+/// invalid values to NONE)
+pub fn chat_continuation_parse(value: &Json) -> Result<ChatContinuation, String> {
     match value {
-        Json::Bool(true) => ChatContinuation::Auto,
-        Json::String(s) if s == "reasoning_content" => ChatContinuation::Reasoning,
-        Json::String(s) if s == "content" => ChatContinuation::Content,
-        _ => ChatContinuation::None,
+        Json::Null => Ok(ChatContinuation::None),
+        Json::Bool(b) => Ok(if *b { ChatContinuation::Auto } else { ChatContinuation::None }),
+        Json::String(s) if s == "reasoning_content" => Ok(ChatContinuation::Reasoning),
+        Json::String(s) if s == "content" => Ok(ChatContinuation::Content),
+        _ => Err(
+            "Invalid continue_final_message: expected a boolean, \"content\" or \"reasoning_content\""
+                .to_string(),
+        ),
     }
 }
 
@@ -342,11 +348,15 @@ pub enum GrammarTriggerType {
 }
 
 /// `common_grammar_trigger` (common.h:150-155) — `word` carries the trigger
-/// value for every type (a word or a pattern, per `ty`).
+/// value for every type (a word or a pattern, per `ty`); `token` is set for
+/// TOKEN-type triggers (a single-token WORD promoted by
+/// [`sampling_add_grammar_triggers`], -1 otherwise).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GrammarTrigger {
     pub ty: GrammarTriggerType,
     pub word: String,
+    /// `llama_token token = LLAMA_TOKEN_NULL` (common.h:154)
+    pub token: i32,
 }
 
 impl GrammarTrigger {
@@ -356,6 +366,7 @@ impl GrammarTrigger {
         GrammarTrigger {
             ty: GrammarTriggerType::Word,
             word: word.to_string(),
+            token: -1,
         }
     }
 
@@ -365,6 +376,7 @@ impl GrammarTrigger {
         GrammarTrigger {
             ty: GrammarTriggerType::Pattern,
             word: pattern.to_string(),
+            token: -1,
         }
     }
 }
@@ -2884,7 +2896,15 @@ impl<'a> ChatPegMapper<'a> {
 /// `CHATML_TEMPLATE_SRC` (chat.cpp:715-721)
 pub const CHATML_TEMPLATE_SRC: &str = "{%- for message in messages -%}\n  {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' -}}\n{%- endfor -%}\n{%- if add_generation_prompt -%}\n  {{- '<|im_start|>assistant\\n' -}}\n{%- endif -%}";
 
-/// `common_chat_template` (chat.h:51-78): parsed program + tokens + caps.
+/// Builds the prompt and parser for a template that has a dedicated handler
+/// (see common/parsers) — `common_chat_params_init_fn` (chat.h:29-31,
+/// 8b5436102)
+pub type ChatParamsInitFn =
+    fn(&ChatTemplate, &GenerationParams) -> Result<ChatParams, String>;
+
+/// `common_chat_template` (chat.h:51-91, 8b5436102): parsed program + tokens +
+/// caps, with the dedicated handler picked once from the source and the
+/// differential analysis cached for the templates without one.
 #[derive(Clone)]
 pub struct ChatTemplate {
     /// parsed mini-jinja program (lexer → parser, chat.h:58-62)
@@ -2893,21 +2913,54 @@ pub struct ChatTemplate {
     pub eos_tok: String,
     pub src: String,
     pub caps: JinjaCaps,
+    /// Dedicated handler picked once from the source, null when the
+    /// differential autoparser is used (chat.h:64-65)
+    pub params_init: Option<ChatParamsInitFn>,
+    /// Differential analysis, run once here when there is no dedicated
+    /// handler. None when there is one, or when the analysis failed, in
+    /// which case `analysis_error` says why (chat.h:67-69)
+    pub analysis: Option<Autoparser>,
+    pub analysis_error: String,
 }
 
 impl ChatTemplate {
-    /// the `common_chat_template` constructor (chat.h:58-69)
+    /// the `common_chat_template` constructor (chat.h:58-69 → chat.cpp:1253-1280,
+    /// 8b5436102): the specialized-handler detection and the differential
+    /// analysis run once here instead of on every apply
     pub fn new(src: &str, bos_token: &str, eos_token: &str) -> Result<ChatTemplate, String> {
         let toks = mini_jinja::lex(src)?;
         let prog = mini_jinja::parse(&toks)?;
         let caps = caps_get(src)?;
-        Ok(ChatTemplate {
+        // `this->src = lexer_res.source` (chat.cpp:1261) — the port's lexer
+        // does not rewrite the source, so `src` is carried as-is (documented
+        // equivalence)
+        let mut tmpl = ChatTemplate {
             prog,
             src: src.to_string(),
             bos_tok: bos_token.to_string(),
             eos_tok: eos_token.to_string(),
             caps,
-        })
+            params_init: None,
+            analysis: None,
+            analysis_error: String::new(),
+        };
+
+        tmpl.params_init = crate::chat_parsers::detect_params_init(&tmpl.src);
+        if tmpl.params_init.is_some() {
+            return Ok(tmpl);
+        }
+
+        // The analysis depends only on the template, so run it once here
+        // instead of on every apply. A failure is kept for apply to report,
+        // so a bad template still loads like it did before (chat.cpp:1270-1278).
+        // EXEMPTION: the port's analyzer is infallible — a render failure
+        // inside a differential comparison degrades to "no marker" (the
+        // documented compare_variants equivalence), so the C++ catch that
+        // populates analysis_error has no reachable port counterpart.
+        let mut analysis = Autoparser::default();
+        analysis.analyze_template(&tmpl);
+        tmpl.analysis = Some(analysis);
+        Ok(tmpl)
     }
 
     pub fn source(&self) -> &str {
@@ -3575,7 +3628,10 @@ fn assistant_with_tool_calls_json(calls: Vec<Json>) -> Json {
     ])
 }
 
-/// `struct autoparser` (chat-auto-parser.h:380-409)
+/// `struct autoparser` (chat-auto-parser.h:380-409) — Clone since
+/// `common_chat_template` holds it and is itself copyable (the C++ moves the
+/// unique_ptr around; 8b5436102)
+#[derive(Clone)]
 pub struct Autoparser {
     pub jinja_caps: JinjaCaps,
     pub user_start: String,
@@ -5676,8 +5732,7 @@ pub fn generate_parser_with(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = autoparser_build_parser(autoparser, inputs, &parser_generation_prompt)?;
-    data.parser = parser.save();
+    data.parser = autoparser_build_parser(autoparser, inputs, &parser_generation_prompt)?;
 
     // Build grammar if tools are present (chat-auto-parser-generator.cpp:67-94)
     let has_tools = autoparser.tools.format.mode != ToolFormat::None
@@ -5698,7 +5753,7 @@ pub fn generate_parser_with(
 
     if include_grammar {
         data.grammar_lazy = !has_response_format && inputs.tool_choice == ChatToolChoice::Auto;
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         // Set grammar triggers based on tool section markers
         if data.grammar_lazy {
@@ -6075,14 +6130,14 @@ pub(crate) fn foreach_function<F: FnMut(usize, &Json)>(tools: &Json, mut f: F) {
 /// schema properties, passing each parameter with its index and the document
 /// that owns it.
 pub(crate) fn foreach_parameter<
-    F: FnMut(usize, &crate::json_schema::SchemaProperty, &Rc<SchemaDocument>),
+    F: FnMut(usize, &crate::json_schema::SchemaProperty, &Arc<SchemaDocument>),
 >(
     function: &Json,
     mut f: F,
 ) {
     let params = tool_parameters(function);
     let doc = match schema_from_json(&params) {
-        Ok(d) => Rc::new(d),
+        Ok(d) => Arc::new(d),
         Err(_) => return,
     };
     if let Some(node) = doc.nodes.get(doc.root) {
@@ -6284,7 +6339,7 @@ fn build_tool_parser_tag_tagged(
                     let sch = p.p.schema_node(
                         j,
                         &format!("tool-{tool_index}-arg-{param_index}-schema"),
-                        Rc::clone(doc),
+                        Arc::clone(doc),
                         param.schema,
                         false,
                     );
@@ -6509,7 +6564,8 @@ impl Default for TemplatesInputs {
     }
 }
 
-/// `common_chat_params` (chat.h:269-283)
+/// `common_chat_params` (chat.h:269-283, 8b5436102) — `parser` is the built
+/// arena, not its serialization
 #[derive(Default)]
 pub struct ChatParams {
     pub format: ChatFormat,
@@ -6523,23 +6579,24 @@ pub struct ChatParams {
     pub grammar_triggers: Vec<GrammarTrigger>,
     pub preserved_tokens: Vec<String>,
     pub additional_stops: Vec<String>,
-    /// serialized [`PegArena`] (the C++ stores `parser.save()`)
-    pub parser: String,
+    /// the built PEG parser (`common_peg_arena parser`, chat.h:277-278)
+    pub parser: PegArena,
     /// message delimiters for context reuse (chat.cpp:1341-1349); role +
     /// delimiter string (tokenization happens in the integrator)
     pub message_delimiters: Vec<(String, String)>,
 }
 
-/// `common_chat_try_specialized_template` (chat.cpp:1090-1223) — dispatch
-/// into the specialized handlers under `common/parsers/*.cpp` (ported in
-/// [`crate::chat_parsers`]); returns None when no handler matches so the
-/// differential autoparser takes over.
+/// `common_chat_try_specialized_template` (chat.cpp:1283-1289, 8b5436102) —
+/// dispatch through the handler the template picked at construction; None
+/// when the template uses the differential autoparser.
 fn try_specialized_template(
     tmpl: &ChatTemplate,
-    src: &str,
-    params: &mut GenerationParams,
+    params: &GenerationParams,
 ) -> Result<Option<ChatParams>, String> {
-    crate::chat_parsers::try_specialized_template(tmpl, src, params)
+    match tmpl.params_init {
+        None => Ok(None),
+        Some(init) => Ok(Some(init(tmpl, params)?)),
+    }
 }
 
 /// `common_chat_templates_apply_jinja` (chat.cpp:1225-1366)
@@ -6657,20 +6714,24 @@ pub fn chat_templates_apply_jinja(
             let rest = p.p.rest();
             let c = p.content(rest);
             p.p.sequence(&[pre, c])
-        })?
-        .save();
+        })?;
         return Ok(data);
     }
 
-    if let Some(result) = try_specialized_template(tmpl, src, &mut params)? {
+    if let Some(result) = try_specialized_template(tmpl, &params)? {
         return Ok(result);
     }
 
-    // chat.cpp:1335-1365: the differential autoparser
-    let mut autoparser = Autoparser::default();
-    autoparser.analyze_template(tmpl);
+    // chat.cpp:1335-1365: the differential autoparser (cached in the template
+    // since 8b5436102)
+    let Some(autoparser) = tmpl.analysis.as_ref() else {
+        return Err(format!(
+            "Unable to generate parser for this template. Automatic parser generation failed: {}",
+            tmpl.analysis_error
+        ));
+    };
 
-    let mut auto_params = generate_parser_with(tmpl, &params, &autoparser).map_err(|e| {
+    let mut auto_params = generate_parser_with(tmpl, &params, autoparser).map_err(|e| {
         format!(
             "Unable to generate parser for this template. Automatic parser generation failed: {e}"
         )
@@ -6693,9 +6754,6 @@ pub fn chat_templates_apply_jinja(
             auto_params.thinking_end_tags = vec![end_tag];
         }
     }
-    // validate the serialized parser round-trips (chat.cpp:1359-1360)
-    let mut arena = PegArena::default();
-    arena.load(&auto_params.parser)?;
     Ok(auto_params)
 }
 
@@ -6893,38 +6951,30 @@ pub fn chat_input_tokenize(vocab: &crate::vocab::Vocab, text: &str) -> ChatInput
     input
 }
 
-/// `common_chat_parser_params` (chat.h:287-303)
+/// `common_chat_parser_params` (chat.h:318-331, 8b5436102) — slimmed to the
+/// PEG-parse inputs; the reasoning/continuation/echo knobs moved to
+/// [`ChatSession`] / the task params
+#[derive(Clone)]
 pub struct ChatParserParams {
     pub format: ChatFormat,
-    pub reasoning_format: ReasoningFormat,
-    pub reasoning_in_content: bool,
     /// `generation_prompt` — `common_chat_input` since 18b5f8b18 (chat.h:317)
     pub generation_prompt: ChatInput,
-    pub parse_tool_calls: bool,
-    pub is_continuation: bool,
-    pub echo: bool,
     pub debug: bool,
     pub parser: PegArena,
 }
 
 impl ChatParserParams {
-    /// from a [`ChatParams`] (chat.h:299-302) — loads the serialized parser;
-    /// `generation_prompt` becomes a plain-text `common_chat_input`
-    /// (chat.h:317-318, 18b5f8b18)
-    pub fn from_chat_params(params: &ChatParams) -> Result<ChatParserParams, String> {
-        let mut parser = PegArena::default();
-        parser.load(&params.parser)?;
-        Ok(ChatParserParams {
+    /// from a [`ChatParams`] (chat.h:325-331, 8b5436102) — only the format
+    /// and the generation prompt carry over; the parser stays empty and the
+    /// arena is passed separately to [`chat_peg_parse`] (the upstream tests
+    /// do the same, tests/test-chat.cpp:4637-4640)
+    pub fn from_chat_params(params: &ChatParams) -> ChatParserParams {
+        ChatParserParams {
             format: params.format,
-            reasoning_format: ReasoningFormat::None,
-            reasoning_in_content: false,
             generation_prompt: ChatInput::from_plain(params.generation_prompt.clone()),
-            parse_tool_calls: true,
-            is_continuation: false,
-            echo: false,
             debug: false,
-            parser,
-        })
+            parser: PegArena::default(),
+        }
     }
 }
 
@@ -6932,12 +6982,7 @@ impl Default for ChatParserParams {
     fn default() -> Self {
         ChatParserParams {
             format: ChatFormat::ContentOnly,
-            reasoning_format: ReasoningFormat::None,
-            reasoning_in_content: false,
             generation_prompt: ChatInput::default(),
-            parse_tool_calls: true,
-            is_continuation: false,
-            echo: false,
             debug: false,
             parser: PegArena::default(),
         }
@@ -6952,19 +6997,33 @@ pub fn chat_peg_parse(
     is_partial: bool,
     params: &ChatParserParams,
 ) -> Result<ChatMsg, String> {
-    let default_parser;
-    let parser: &PegArena = if src_parser.is_empty() {
-        // "No parser definition detected, assuming pure content parser."
-        default_parser = build_chat_peg_parser(|p| {
+    // `static const common_peg_arena content_only = …` (chat.cpp:1565-1567,
+    // 8b5436102) — built once instead of per call. (The arena's schema
+    // documents are Arc'd, so a plain static would work; the thread-local
+    // keeps lazy init without an explicit OnceLock.)
+    thread_local! {
+        static CONTENT_ONLY: PegArena = build_chat_peg_parser(|p| {
             let rest = p.p.rest();
             let c = p.content(rest);
             let end = p.p.end();
             p.p.sequence(&[c, end])
-        })?;
-        &default_parser
+        })
+        .expect("content-only parser is a fixed trivial program");
+    }
+    if src_parser.is_empty() {
+        // "No parser definition detected, assuming pure content parser."
+        CONTENT_ONLY.with(|content_only| chat_peg_parse_impl(content_only, input, is_partial, params))
     } else {
-        src_parser
-    };
+        chat_peg_parse_impl(src_parser, input, is_partial, params)
+    }
+}
+
+fn chat_peg_parse_impl(
+    parser: &PegArena,
+    input: &ChatInput,
+    is_partial: bool,
+    params: &ChatParserParams,
+) -> Result<ChatMsg, String> {
 
     // `common_chat_input effective_input = input;
     //  effective_input.prepend(params.generation_prompt)` (chat.cpp:1526-1530)
@@ -7030,4 +7089,320 @@ pub fn chat_parse(
     params: &ChatParserParams,
 ) -> Result<ChatMsg, String> {
     chat_peg_parse(&params.parser, input, is_partial, params)
+}
+
+// ---------------------------------------------------------------------------
+// chat session — common_chat_session (chat.h:369-425, chat.cpp:1630-1707, 8b5436102)
+// ---------------------------------------------------------------------------
+
+/// the sampling-side sinks of the chat session: the subset of
+/// `common_params_sampling` the chat API touches (grammar + grammar_lazy +
+/// generation_prompt + preserved_tokens + grammar_triggers). Upstream home
+/// is common/sampling.cpp; the port's `sampling.rs` is owned by a later
+/// phase, so the helpers below live here against this struct
+/// (sampling.cpp:1054-1087 1:1).
+#[derive(Default)]
+pub struct ChatSamplingSide {
+    /// `sampling.grammar` — the tool_calls-typed grammar text ("" = none)
+    pub grammar: String,
+    pub grammar_lazy: bool,
+    pub generation_prompt: String,
+    /// `std::set<llama_token>` — kept sorted + unique
+    pub preserved_tokens: Vec<i32>,
+    pub grammar_triggers: Vec<GrammarTrigger>,
+}
+
+/// `common_sampling_add_preserved_tokens` (sampling.cpp:1054-1062) — add the
+/// strings that are a single token in the vocab to the preserved tokens
+pub fn sampling_add_preserved_tokens(
+    sampling: &mut ChatSamplingSide,
+    vocab: &crate::vocab::Vocab,
+    tokens: &[String],
+) {
+    for t in tokens {
+        let ids = vocab.tokenize(t, false, true);
+        if ids.len() == 1 {
+            // std::set insert
+            if let Err(pos) = sampling.preserved_tokens.binary_search(&ids[0]) {
+                sampling.preserved_tokens.insert(pos, ids[0]);
+            }
+        }
+    }
+}
+
+/// `common_sampling_add_grammar_triggers` (sampling.cpp:1064-1087) — add
+/// grammar triggers; a trigger word that is a single token becomes a token
+/// trigger and must be a preserved token
+pub fn sampling_add_grammar_triggers(
+    sampling: &mut ChatSamplingSide,
+    vocab: &crate::vocab::Vocab,
+    triggers: Vec<GrammarTrigger>,
+) -> Result<(), String> {
+    for mut trigger in triggers {
+        if trigger.ty == GrammarTriggerType::Word {
+            let word = trigger.word.clone();
+            let ids = vocab.tokenize(&word, false, true);
+            if ids.len() == 1 {
+                let token = ids[0];
+                if !sampling.preserved_tokens.contains(&token) {
+                    return Err(format!(
+                        "Grammar trigger word should be marked as preserved token: {word}"
+                    ));
+                }
+                trigger.ty = GrammarTriggerType::Token;
+                trigger.token = token;
+                sampling.grammar_triggers.push(trigger);
+            } else {
+                sampling.grammar_triggers.push(trigger);
+            }
+        } else {
+            sampling.grammar_triggers.push(trigger);
+        }
+    }
+    if sampling.grammar_lazy && sampling.grammar_triggers.is_empty() {
+        return Err("Error: no triggers set for lazy grammar!".to_string());
+    }
+    Ok(())
+}
+
+/// `common_chat_session_params` (chat.h:369-372)
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChatSessionParams {
+    /// include the assistant prefill in the output when continuing a message
+    pub echo: bool,
+    /// enable debug output for the PEG parser
+    pub debug: bool,
+}
+
+/// `common_chat_session` (chat.h:374-425) — renders the prompt once and owns
+/// all output parsing for one generation. `feed`/`finish` mirror
+/// chat.cpp:1689-1707.
+#[derive(Clone)]
+pub struct ChatSession {
+    prompt_text: String,
+    grammar_text: String,
+    grammar_lazy: bool,
+    grammar_triggers: Vec<GrammarTrigger>,
+    /// `std::set<llama_token>` — sorted unique
+    preserved_tokens: Vec<i32>,
+    stops: Vec<String>,
+    generation_prompt_text: String,
+    thinking_start: String,
+    thinking_ends: Vec<String>,
+
+    parser_params: ChatParserParams,
+    /// (role, delimiter) pairs with the delimiter's token sequence
+    /// (`common_chat_msg_delimiters::tokenize`, chat.cpp:101-112)
+    delimiters: Vec<(String, Vec<i32>)>,
+    input: ChatInput,
+    result: ChatMsg,
+    templated: bool,
+    finished: bool,
+}
+
+impl Default for ChatSession {
+    /// the C++ default constructor (`result.role = "assistant"`)
+    fn default() -> Self {
+        let mut result = ChatMsg::default();
+        result.role = "assistant".to_string();
+        ChatSession {
+            prompt_text: String::new(),
+            grammar_text: String::new(),
+            grammar_lazy: false,
+            grammar_triggers: Vec::new(),
+            preserved_tokens: Vec::new(),
+            stops: Vec::new(),
+            generation_prompt_text: String::new(),
+            thinking_start: String::new(),
+            thinking_ends: Vec::new(),
+            parser_params: ChatParserParams::default(),
+            delimiters: Vec::new(),
+            input: ChatInput::default(),
+            result,
+            templated: false,
+            finished: false,
+        }
+    }
+}
+
+impl ChatSession {
+    /// `common_chat_session(tmpls, vocab, inputs, params)` (chat.cpp:1630-1664)
+    pub fn new(
+        tmpls: &ChatTemplates,
+        vocab: Option<&crate::vocab::Vocab>,
+        inputs: &TemplatesInputs,
+        params: &ChatSessionParams,
+    ) -> Result<ChatSession, String> {
+        let applied = chat_templates_apply(tmpls, inputs)?;
+
+        let mut session = ChatSession {
+            templated: true,
+            prompt_text: applied.prompt,
+            grammar_text: applied.grammar,
+            grammar_lazy: applied.grammar_lazy,
+            stops: applied.additional_stops,
+            generation_prompt_text: applied.generation_prompt.clone(),
+            thinking_start: applied.thinking_start_tag,
+            thinking_ends: applied.thinking_end_tags,
+            parser_params: ChatParserParams {
+                format: applied.format,
+                generation_prompt: match vocab {
+                    Some(v) => chat_input_tokenize(v, &applied.generation_prompt),
+                    None => ChatInput::from_plain(applied.generation_prompt.clone()),
+                },
+                debug: params.debug,
+                parser: applied.parser,
+            },
+            delimiters: Vec::new(),
+            ..ChatSession::default()
+        };
+        session.result.role = "assistant".to_string();
+
+        // message delimiters: (role, tokenized delimiter) — `delimiters`
+        // tokenization only happens with a vocab (chat.cpp:1653-1662)
+        for (role, delimiter) in &applied.message_delimiters {
+            let tokens = match vocab {
+                Some(v) => v.tokenize(delimiter, false, true),
+                None => Vec::new(),
+            };
+            session.delimiters.push((role.clone(), tokens));
+        }
+
+        if let Some(vocab) = vocab {
+            let mut resolved = ChatSamplingSide {
+                grammar_lazy: applied.grammar_lazy,
+                ..ChatSamplingSide::default()
+            };
+            sampling_add_preserved_tokens(&mut resolved, vocab, &applied.preserved_tokens);
+            sampling_add_grammar_triggers(&mut resolved, vocab, applied.grammar_triggers)?;
+            session.preserved_tokens = resolved.preserved_tokens;
+            session.grammar_triggers = resolved.grammar_triggers;
+        } else {
+            session.grammar_triggers = applied.grammar_triggers;
+        }
+
+        if inputs.continue_final_message != ChatContinuation::None && !params.echo {
+            // start from the prefill so it is not emitted as part of the first
+            // delta (chat.cpp:1666-1669): the empty member input parses with
+            // `generation_prompt` prepended (chat.cpp:1526-1530), which is
+            // where the continuation prefill lives
+            let msg = chat_parse(&session.input, true, &session.parser_params)?;
+            session.result = msg;
+        }
+        Ok(session)
+    }
+
+    pub fn prompt(&self) -> &str {
+        &self.prompt_text
+    }
+    pub fn format(&self) -> ChatFormat {
+        self.parser_params.format
+    }
+    pub fn msg(&self) -> &ChatMsg {
+        &self.result
+    }
+    pub fn parser(&self) -> &PegArena {
+        &self.parser_params.parser
+    }
+
+    pub fn grammar(&self) -> &str {
+        &self.grammar_text
+    }
+    pub fn grammar_lazy(&self) -> bool {
+        self.grammar_lazy
+    }
+    pub fn generation_prompt(&self) -> &str {
+        &self.generation_prompt_text
+    }
+    pub fn thinking_start_tag(&self) -> &str {
+        &self.thinking_start
+    }
+    pub fn thinking_end_tags(&self) -> &[String] {
+        &self.thinking_ends
+    }
+    pub fn additional_stops(&self) -> &[String] {
+        &self.stops
+    }
+
+    /// the tokenized message delimiters (role + token sequence); empty when
+    /// constructed without a vocab
+    pub fn message_delimiters(&self) -> &[(String, Vec<i32>)] {
+        &self.delimiters
+    }
+
+    /// the resolved preserved-token ids (empty when constructed without a vocab)
+    pub fn preserved_tokens(&self) -> &[i32] {
+        &self.preserved_tokens
+    }
+
+    /// the resolved grammar triggers (empty when constructed without a vocab)
+    pub fn grammar_triggers(&self) -> &[GrammarTrigger] {
+        &self.grammar_triggers
+    }
+
+    /// `apply_sampling` (chat.cpp:1671-1681) — writes the session's
+    /// grammar/preserved/trigger state into the caller's sampling sink. The
+    /// TOOL_CALLS grammar kind maps to the port's server-side
+    /// `grammar_prefill` flag (set by the task apply, server-task.h:261-271).
+    pub fn apply_sampling(&self, sampling: &mut ChatSamplingSide) {
+        if !self.templated {
+            return;
+        }
+        if !self.grammar_text.is_empty() {
+            sampling.grammar = self.grammar_text.clone();
+        }
+        sampling.grammar_lazy = self.grammar_lazy;
+        sampling.generation_prompt = self.generation_prompt_text.clone();
+        for &tok in &self.preserved_tokens {
+            if let Err(pos) = sampling.preserved_tokens.binary_search(&tok) {
+                sampling.preserved_tokens.insert(pos, tok);
+            }
+        }
+        sampling.grammar_triggers.extend(self.grammar_triggers.iter().cloned());
+    }
+
+    /// `feed` (chat.cpp:1683-1690)
+    pub fn feed(&mut self, chunk: &ChatInput) -> Result<&ChatMsg, String> {
+        assert!(!self.finished, "feed() after finish()");
+        self.input.append_chunk(chunk);
+        let msg = chat_parse(&self.input, true, &self.parser_params)?;
+        if !msg.empty() {
+            self.result = msg;
+        }
+        Ok(&self.result)
+    }
+
+    /// `finish` (chat.cpp:1692-1700)
+    pub fn finish(&mut self, chunk: &ChatInput) -> Result<&ChatMsg, String> {
+        assert!(!self.finished, "finish() called twice");
+        self.finished = true;
+        self.input.append_chunk(chunk);
+        let msg = chat_parse(&self.input, false, &self.parser_params)?;
+        if !msg.empty() {
+            self.result = msg;
+        }
+        Ok(&self.result)
+    }
+
+    /// `has_template` (chat.h:409)
+    pub fn has_template(&self) -> bool {
+        self.templated
+    }
+
+    /// replace the current message — the server's `update_chat_msg` assigns
+    /// tool-call ids onto the reference `feed`/`finish` return (C++ aliasing,
+    /// server-task.cpp:170-177); the port stores the mutated copy back here
+    pub fn set_msg(&mut self, msg: ChatMsg) {
+        self.result = msg;
+    }
+
+    /// the accumulated input (test/debug surface; upstream keeps it private)
+    pub fn generated_input(&self) -> &ChatInput {
+        &self.input
+    }
+
+    /// `finish()` with no chunk — `finish(const common_chat_input & chunk = {})`
+    pub fn finish_empty(&mut self) -> Result<&ChatMsg, String> {
+        self.finish(&ChatInput::default())
+    }
 }

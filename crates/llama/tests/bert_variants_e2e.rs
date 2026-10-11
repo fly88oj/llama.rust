@@ -680,8 +680,8 @@ fn pin_hparams(m: &LlamaModel, spec: &SynthSpec) {
             } else {
                 assert_eq!(
                     hp.llm_ffn_op,
-                    llama::hparams::LlmFfnOpType::GEGLU,
-                    "the GEGLU default"
+                    llama::hparams::LlmFfnOpType::GEGLU_ERF,
+                    "the GEGLU_ERF default (6184e92c5: the exact erf GELU)"
                 );
             }
             if spec.family == Family::ModernBertRank {

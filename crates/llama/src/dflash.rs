@@ -766,12 +766,11 @@ pub fn load_dflash_draft(
         .expect("output_norm.weight");
 
     // optional: reduced-vocab drafts ship their own lm head, full-vocab
-    // drafts can share the target's via ctx_other (:166-171)
-    let mut output = ld.create_tensor("output.weight", &[n_embd, n_vocab_draft], false)?;
-    if output.is_none() && tok_embd.is_some() {
-        // TENSOR_DUPLICATED: tie to the draft's own embeddings
-        output = tok_embd;
-    }
+    // drafts can share the target's via ctx_other (:166-168). The
+    // tok_embd-tied fallback (TENSOR_DUPLICATED on token_embd.weight) was
+    // removed by a11f57ba9 — an absent output.weight no longer ties to the
+    // draft's own embeddings
+    let output = ld.create_tensor("output.weight", &[n_embd, n_vocab_draft], false)?;
 
     // the DFlash2 selector head (:138-159): present iff selector_hidden is in
     // the file; the conv/selector hparams must then all be set

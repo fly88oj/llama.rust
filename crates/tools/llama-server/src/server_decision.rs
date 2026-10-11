@@ -1097,23 +1097,27 @@ impl ServerDecisionContext {
     /// `fill_task` (server-decision.cpp:594-668): build one task's tokens and
     /// its output spec. `media_marker` is `get_media_marker()`
     /// (server-common.cpp) — the port passes the plain text chunk marker.
-    /// `files` is the request's media (empty: the port's systemone gate
-    /// answers 501 for any media until mtmd is wired).
+    /// `media` is the request's mtmd-passed media (None: no media reached
+    /// the gate — without an mmproj the systemone handler answers 501).
     pub fn fill_task(
         &self,
         state: &Json,
         questions: &[ServerDecisionQuestion],
         question: &ServerDecisionQuestion,
         variant: usize,
-        n_images: usize,
+        media: Option<&DecisionMedia>,
         media_marker: &str,
-        files: &[String],
-    ) -> Result<(Vec<i32>, DecisionSpec), String> {
+    ) -> Result<(DecisionTokens, DecisionSpec), String> {
         // (server-decision.cpp:660-663, a657f7e98)
         if self.ty == CommonDecisionType::Lfm2D1Omni {
-            return self.fill_task_d1omni(state, questions, question, variant, files, media_marker);
+            return self.fill_task_d1omni(state, questions, question, variant, media, media_marker);
         }
 
+        // the non-omni formats reach here text-only: the engine's media gate
+        // (engine.rs run_decision) rejects their media with 501 before the
+        // task assembly — the port has no mixed-batch decode for them yet
+        // (the reference rides process_mtmd_prompt at :683)
+        let n_images = media.map(|m| m.n_files).unwrap_or(0);
         let prompt = self.render(state, questions, question, variant, n_images, media_marker, false)?;
 
         let mut spec = DecisionSpec {
@@ -1159,7 +1163,7 @@ impl ServerDecisionContext {
             }
             spec.pointer = tokens.len() as i32 - 1;
         }
-        Ok((tokens, spec))
+        Ok((DecisionTokens::text(tokens), spec))
     }
 
     /// `fill_task_laya` (server-decision.cpp:501-554): the prompt is
@@ -1246,48 +1250,53 @@ impl ServerDecisionContext {
     /// `fill_task_d1omni` — each piece is cut to its budget as the model was
     /// trained (d1-omni prompt.py: encode), the state gets the room that is
     /// left. The media come first, the text after them has a budget of its
-    /// own. The port's systemone gate answers 501 for any media (no mmproj
-    /// wiring), so `files` is always empty here — the media branch mirrors
-    /// the reference for when mtmd lands.
+    /// own (server-decision.cpp:764-885): `media` carries the mtmd-passed
+    /// prefix rows (`process_mtmd_prompt` of the markers string, engine.rs
+    /// `prepare_decision_media`), None keeps the text-only shape.
     fn fill_task_d1omni(
         &self,
         state: &Json,
         questions: &[ServerDecisionQuestion],
         question: &ServerDecisionQuestion,
         variant: usize,
-        files: &[String],
+        media: Option<&DecisionMedia>,
         media_marker: &str,
-    ) -> Result<(Vec<i32>, DecisionSpec), String> {
+    ) -> Result<(DecisionTokens, DecisionSpec), String> {
         let invalid = || "unexpected layout of the decision prompt".to_string();
 
         // the prompt depends on the kind of media, mtmd tells an audio clip
-        // from an image by its content — without media there are no markers
-        // and no audio
-        let markers = String::new();
-        let media: Vec<i32> = Vec::new();
-        let is_audio = false;
-        if !files.is_empty() {
-            // unreachable in the port today: the systemone handler 501s on
-            // media before fill_task (`process_mtmd_prompt` needs the mtmd
-            // context); with media the reference prepends the marker string
-            // per file, detects audio from the chunk types, and the media
-            // tokens ride in front of the text budget below
-            return Err(
-                "This server does not support image input for decisions. For a model that \
-                 supports it, start it with `--mmproj`"
-                    .to_string(),
-            );
+        // from an image by its content (server-decision.cpp:776-789) — the
+        // media prefix and its kind arrive pre-tokenized from the engine
+        let (media_rows, is_audio, n_files, n_media): (
+            Option<&DecisionTokens>,
+            bool,
+            usize,
+            usize,
+        ) = match media {
+            Some(m) => (
+                Some(&m.rows),
+                m.is_audio,
+                m.n_files,
+                m.n_media(),
+            ),
+            None => (None, false, 0, 0),
+        };
+        // (server-decision.cpp:790-792) one audio clip XOR images
+        if is_audio && n_files > 1 {
+            return Err("a request has images or one audio clip, not both".to_string());
         }
-        let n_media = media.len();
 
-        let prompt = self.render(state, questions, question, variant, files.len(), media_marker, is_audio)?;
+        let prompt = self.render(state, questions, question, variant, n_files, media_marker, is_audio)?;
         let pieces = string_split(&prompt, D1OMNI_SEP);
-        if pieces.is_empty() || pieces[0] != markers {
+        // pieces[0] is the markers string the media was tokenized from
+        // (server-decision.cpp:799-802): n_files markers, empty without media
+        let want_markers = media_marker.repeat(n_files);
+        if pieces.is_empty() || pieces[0] != want_markers {
             return Err(invalid());
         }
 
         let mut n_max = D1OMNI_MAX_TOKENS;
-        if !files.is_empty() {
+        if n_files > 0 {
             n_max = D1OMNI_MAX_TOKENS_IMAGE
                 .min(D1OMNI_MAX_TOKENS - D1OMNI_MAX_TOKENS.min(n_media));
             if is_audio {
@@ -1370,8 +1379,22 @@ impl ServerDecisionContext {
 
         // the output has one score per question type
         spec.column = question.ty as i32;
-        let _ = media; // with files the media tokens go first (unreachable today)
-        Ok((tokens, spec))
+        // (server-decision.cpp:876-885) with files the task tokens are the
+        // media prefix followed by the text tokens — the markers were already
+        // offset by n_media above, the media map indices carry over (the
+        // chunks sit inside the prefix)
+        let out = match media_rows {
+            None => DecisionTokens::text(tokens),
+            Some(rows) => {
+                let mut out_tokens = rows.tokens.clone();
+                out_tokens.extend_from_slice(&tokens);
+                DecisionTokens {
+                    tokens: out_tokens,
+                    media: rows.media.clone(),
+                }
+            }
+        };
+        Ok((out, spec))
     }
 
     // -----------------------------------------------------------------------
@@ -1383,7 +1406,7 @@ impl ServerDecisionContext {
         &self,
         state: &Json,
         questions: &[ServerDecisionQuestion],
-    ) -> Result<(Vec<i32>, DecisionSpec), String> {
+    ) -> Result<(DecisionTokens, DecisionSpec), String> {
         // `LLAMA_DECISION_ORDER_*` (src/llama-ext.h:107-113)
         const ORDER_NONE: i32 = 0;
         const ORDER_QUESTION_NOUL: i32 = 1;
@@ -1512,7 +1535,7 @@ impl ServerDecisionContext {
             return Err("unexpected layout of the decision prompt".to_string());
         }
 
-        Ok((tokens, spec))
+        Ok((DecisionTokens::text(tokens), spec))
     }
 
     // -----------------------------------------------------------------------
@@ -1705,6 +1728,85 @@ fn decision_load_image(url: &Json, files: &mut Vec<String>) -> Result<(), String
     }
     files.push(s.to_string());
     Ok(())
+}
+
+/// `base64_decode` (common.cpp): RFC 4648 with padding; Err on any
+/// non-alphabet byte (the C's decoder stops at the first invalid character
+/// and returns what it has — the empty result becomes handle_media's
+/// "Invalid base64 value")
+fn decision_base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|b| !b.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
+    let mut chunk = [0u8; 4];
+    let mut n_chunk = 0usize;
+    for &b in &bytes {
+        if b == b'=' {
+            break;
+        }
+        let v = T
+            .iter()
+            .position(|&t| t == b)
+            .ok_or_else(|| "Invalid base64 value".to_string())? as u32;
+        chunk[n_chunk] = v as u8;
+        n_chunk += 1;
+        if n_chunk == 4 {
+            let n = ((chunk[0] as u32) << 18)
+                | ((chunk[1] as u32) << 12)
+                | ((chunk[2] as u32) << 6)
+                | chunk[3] as u32;
+            out.push((n >> 16) as u8);
+            out.push((n >> 8) as u8);
+            out.push(n as u8);
+            n_chunk = 0;
+        }
+    }
+    match n_chunk {
+        0 => {}
+        1 => return Err("Invalid base64 value".to_string()),
+        2 => {
+            let n = ((chunk[0] as u32) << 18) | ((chunk[1] as u32) << 12);
+            out.push((n >> 16) as u8);
+        }
+        3 => {
+            let n = ((chunk[0] as u32) << 18) | ((chunk[1] as u32) << 12) | ((chunk[2] as u32) << 6);
+            out.push((n >> 16) as u8);
+            out.push((n >> 8) as u8);
+        }
+        _ => unreachable!(),
+    }
+    Ok(out)
+}
+
+/// `handle_media`'s data:-URL / raw-base64 arms (server-common.cpp:1168-1192)
+/// for the decision files: a data URL must be `data:{image,video,audio}/...;base64,`
+/// (split at the first comma), anything else decodes as raw base64. The
+/// http/file:// arms were already rejected at parse time.
+pub(crate) fn decision_media_bytes(file: &str) -> Result<Vec<u8>, String> {
+    if let Some(rest) = file.strip_prefix("data:") {
+        let Some((head, data)) = rest.split_once(',') else {
+            return Err("Invalid uri-encoded base64 value".to_string());
+        };
+        if !(head.starts_with("image/") || head.starts_with("video/") || head.starts_with("audio/")) {
+            return Err(format!("Invalid uri format: {head}"));
+        }
+        if !head.ends_with("base64") {
+            return Err("uri must be base64 encoded".to_string());
+        }
+        let out = decision_base64_decode(data)?;
+        if out.is_empty() {
+            return Err("Invalid base64 value".to_string());
+        }
+        return Ok(out);
+    }
+    let out = decision_base64_decode(file)?;
+    if out.is_empty() {
+        return Err("Invalid base64 value".to_string());
+    }
+    Ok(out)
 }
 
 /// `decision_load_audio` (server-decision.cpp:252-259, a657f7e98): audio is
@@ -1979,11 +2081,75 @@ fn decision_confidence_score(probs: &[f64]) -> f64 {
 // shared prompt prefix (server-decision.cpp:768-802)
 // ---------------------------------------------------------------------------
 
+/// one encoded media chunk of a prompt — `server_tokens`' map_idx_to_media
+/// entry (server-common.h:152-175): `n_tokens` embedding rows (n_embd wide)
+/// occupying the prompt positions `[idx, idx + n_tokens)`; the token list
+/// carries LLAMA_TOKEN_NULL (-1) at those positions
+#[derive(Clone, Debug)]
+pub struct MediaEmbds {
+    pub n_tokens: usize,
+    /// `[n_tokens * n_embd]`, shared between a request's variants
+    pub embd: std::sync::Arc<Vec<f32>>,
+}
+
+/// `server_tokens` (server-common.h:152) — the token rows of one task with
+/// the media chunks mapped in: -1 at a media position, a normal token id
+/// elsewhere, the chunk's encoded rows in `media`
+#[derive(Clone, Debug, Default)]
+pub struct DecisionTokens {
+    pub tokens: Vec<i32>,
+    /// start index (into `tokens`) -> the encoded chunk rows
+    pub media: std::collections::BTreeMap<usize, MediaEmbds>,
+}
+
+impl DecisionTokens {
+    /// a text-only list
+    pub fn text(tokens: Vec<i32>) -> Self {
+        DecisionTokens {
+            tokens,
+            media: std::collections::BTreeMap::new(),
+        }
+    }
+    /// `task.tokens.size()` — the row count the decode feeds to the graph
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+}
+
+/// the request's media after the mtmd pass (`process_mtmd_prompt`,
+/// server-common.cpp:974-1007): the flattened prefix rows of every file
+/// (media first, add_special BOS/EOS of the marker string included) plus
+/// the encoded chunks, the audio/image kind and the file count
+#[derive(Clone, Debug)]
+pub struct DecisionMedia {
+    /// the flattened media prefix (server_tokens of the markers string)
+    pub rows: DecisionTokens,
+    /// `is_audio` (server-decision.cpp:780-789): mtmd told an audio clip
+    /// from an image by its content
+    pub is_audio: bool,
+    /// `files.size()` — the marker count the template renders
+    pub n_files: usize,
+}
+
+impl DecisionMedia {
+    /// `n_media` (server-decision.cpp:789) — `media.size()`, the total row
+    /// count of the prefix (markers + their chunks)
+    pub fn n_media(&self) -> usize {
+        self.rows.tokens.len()
+    }
+}
+
 /// one prompt to evaluate (the port's stand-in for `server_task` on the
 /// grouping path: tokens + the decision spec + which question/variant it is)
 #[derive(Clone, Debug)]
 pub struct DecisionTaskSpec {
     pub tokens: Vec<i32>,
+    /// the media chunks of this prompt (-1 rows of `tokens`); empty for the
+    /// text-only decision formats (they never reach the media gate)
+    pub media: std::collections::BTreeMap<usize, MediaEmbds>,
     pub spec: DecisionSpec,
     /// the flat (question, variant) index — the route's answer assembly order
     pub index: usize,
@@ -2342,6 +2508,7 @@ mod tests {
     fn group_tasks_shares_prefix() {
         let mk = |tokens: &[i32], index: usize| DecisionTaskSpec {
             tokens: tokens.to_vec(),
+            media: std::collections::BTreeMap::new(),
             spec: DecisionSpec::default(),
             index,
         };
@@ -2436,6 +2603,7 @@ mod tests {
         w.set_kv("tokenizer.ggml.bos_token_id", Value::U32(0));
         w.set_kv("tokenizer.ggml.eos_token_id", Value::U32(1));
 
+
         let f = std::fs::File::create(&path).unwrap();
         let mut out = std::io::BufWriter::new(f);
         w.write(&mut out, &[]).unwrap();
@@ -2465,9 +2633,8 @@ mod tests {
                 &[q.clone()],
                 &q,
                 0,
-                0,
+                None,
                 "<media>",
-                &[],
             )
             .unwrap();
         assert!(!tokens.is_empty());
@@ -2616,7 +2783,7 @@ mod tests {
             ],
         };
         let (_tok, spec) = ctx
-            .fill_task(&Json::Null, &[q.clone()], &q, 0, 0, "<media>", &[])
+            .fill_task(&Json::Null, &[q.clone()], &q, 0, None, "<media>")
             .unwrap();
         assert_eq!(spec.label_groups.len(), 2);
         assert_eq!(
@@ -2775,6 +2942,57 @@ mod tests {
             ),
         ]);
         assert!(ctx.parse_state(&vids).is_err());
+    }
+
+    /// `fill_task_d1omni`'s media gate semantics (server-decision.cpp:776-
+    /// 885): one audio clip XOR images, and the text-only shape stays clean.
+    /// The full media piece layout (markers offset by n_media, the audio
+    /// budget, the BOS/NULL prefix) is pinned end-to-end against the
+    /// reference by parity/systemone_d1omni_media_parity.sh — the unit vocab
+    /// has no CONTROL `<|mask|>` piece, so the marker scan cannot run here.
+    #[test]
+    fn d1omni_fill_task_media() {
+        use super::*;
+        let ctx = ServerDecisionContext::init(&test_gguf("lfm2-d1-omni"), test_vocab()).unwrap();
+        let q = ServerDecisionQuestion {
+            id: "q".into(),
+            ty: ServerDecisionQuestionType::Noul,
+            instructions: Json::String("x".into()),
+            options: vec![
+                ServerDecisionOption { key: "true".into(), description: Json::Null },
+                ServerDecisionOption { key: "false".into(), description: Json::Null },
+            ],
+        };
+        // the `server_tokens` stand-in: BOS, 32 NULL rows, EOS, a [32 x
+        // n_embd] encoded block mapped at its start index
+        let mut rows = DecisionTokens::default();
+        rows.tokens.push(1);
+        rows.tokens.extend(std::iter::repeat(-1).take(32));
+        rows.tokens.push(2);
+        rows.media.insert(
+            1,
+            MediaEmbds { n_tokens: 32, embd: std::sync::Arc::new(vec![0.5; 32 * 64]) },
+        );
+        let media = DecisionMedia { rows, is_audio: true, n_files: 1 };
+        assert_eq!(media.n_media(), 34); // server-decision.cpp:789
+
+        // one audio clip XOR images (server-decision.cpp:790-792) — the
+        // check fires before the render
+        let two = DecisionMedia { rows: DecisionTokens::default(), is_audio: true, n_files: 2 };
+        let err = ctx
+            .fill_task(&Json::String("s".into()), &[q.clone()], &q, 0, Some(&two), "<__media__>")
+            .unwrap_err();
+        assert_eq!(err, "a request has images or one audio clip, not both");
+
+        // the text-only DecisionTokens shape (fill_task's None path) is the
+        // plain token list — `DecisionTokens::text` carries no NULL rows;
+        // the unit template has no sep pieces, so the render itself is the
+        // e2e lane's job (systemone_d1omni_media_parity.sh + the text-only
+        // 33/33 lane)
+        let plain = DecisionTokens::text(vec![5, 6, 7]);
+        assert!(plain.media.is_empty());
+        assert!(plain.tokens.iter().all(|&t| t >= 0));
+        assert_eq!(plain.len(), 3);
     }
 
     /// `server_model_output_modalities` (4d60b4d08 + the decision-type commits)

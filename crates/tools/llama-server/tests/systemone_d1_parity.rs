@@ -569,6 +569,200 @@ pub fn gen_pplx_fixture() -> String {
     write_gguf(PPLX_FILE, kvs, &t, 0x5eed_0000_1fd2_0005)
 }
 
+// ---------------------------------------------------------------------------
+// fixture 4: the d1omni_a audio mmproj of the omni media lane
+// (parity/systemone_d1omni_media_parity.sh) — the conformer audio encoder of
+// tests/mtmd_audio_synth2.rs's lfm2a synth, plus d1omni_a's residual block
+// (mm.a.mlp.{4,5,6}, conformer.cpp:210-216) and a MINIMAL vision section so
+// the reference's ctx_v exists (`has_inp_image` = mtmd_support_vision =
+// ctx_v != nullptr — without a vision encoder the reference 501s ANY media,
+// audio included; the real d1-omni mmproj carries both towers). The vision
+// half is a load-only mlp stub (n_mmproj_embd reads mm.2's ne[1],
+// clip.cpp:6070): the reference must run with --no-warmup so the stub's ViT
+// is never built, and the media e2e only sends audio.
+// ---------------------------------------------------------------------------
+
+pub const D1OMNI_MMPROJ: &str = "/tmp/s2t-d1/mmproj-d1omni-a-synth.gguf";
+
+pub fn gen_d1omni_mmproj_fixture() -> String {
+    if std::path::Path::new(D1OMNI_MMPROJ).exists() {
+        return D1OMNI_MMPROJ.to_string();
+    }
+    let mut w = GgufWriter::new(32);
+    w.set_kv("general.architecture", Value::String("clip".to_string()));
+    w.set_kv(
+        "general.name",
+        Value::String("llama-rust-synth-d1omni-a".to_string()),
+    );
+    w.set_kv("general.file_type", Value::U32(0)); // F32
+
+    // a vision+audio mixed file: per-modality projector keys (the generic
+    // clip.projector_type is read first for EVERY modality, clip.cpp:1283-
+    // 1290, so a mixed file must not carry it)
+    w.set_kv("clip.has_vision_encoder", Value::Bool(true));
+    w.set_kv("clip.has_audio_encoder", Value::Bool(true));
+    w.set_kv("clip.vision.projector_type", Value::String("mlp".to_string()));
+    w.set_kv(
+        "clip.audio.projector_type",
+        Value::String("d1omni_a".to_string()),
+    );
+
+    let mut st = 0x1234_0007u32;
+    let mut datas: Vec<Vec<u8>> = Vec::new();
+    let mut add = |w: &mut GgufWriter, name: String, ne: [i64; 4], st: &mut u32| {
+        let n = (ne[0] * ne[1] * ne[2] * ne[3]) as usize;
+        let mut bytes = Vec::with_capacity(n * 4);
+        for _ in 0..n {
+            // the synth2 LCG (deterministic weights)
+            *st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let v = ((*st >> 8) as f32 / 16_777_216.0 - 0.5) as f32;
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        w.add_tensor(&name, GgmlType::F32, ne);
+        datas.push(bytes);
+    };
+
+    // ---- the vision stub (load-only): hparams the loader requires + the
+    // one tensor the mlp n_mmproj_embd arm dereferences. block_count 0
+    // loads no ViT layers (clip.cpp:2332-2335, n_layers_to_load = n_layer).
+    {
+        w.set_kv("clip.vision.embedding_length", Value::U32(64));
+        w.set_kv("clip.vision.attention.head_count", Value::U32(1));
+        w.set_kv("clip.vision.feed_forward_length", Value::U32(1));
+        w.set_kv("clip.vision.block_count", Value::U32(0));
+        w.set_kv("clip.vision.projection_dim", Value::U32(64));
+        w.set_kv("clip.vision.attention.layer_norm_epsilon", Value::F32(1e-6));
+        w.set_kv("clip.vision.image_size", Value::U32(28));
+        w.set_kv("clip.vision.patch_size", Value::U32(14));
+        w.set_kv(
+            "clip.vision.image_mean",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+        w.set_kv(
+            "clip.vision.image_std",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+        // PROJECTOR_TYPE_MLP: n_mmproj_embd = mm_2_w->ne[1] (clip.cpp:6070)
+        // — 64, matching the audio tower and the text model's n_embd
+        add(&mut w, "mm.2.weight".into(), [64, 64, 1, 1], &mut st);
+    }
+
+    // ---- the d1omni_a audio tower (clip.cpp:1990-2009 + :3434-3447) ------
+    {
+        // clip.cpp:1951-1959 — n_fft 512 / window 400 / hop 160 @ 16 kHz;
+        // the mmproj width must equal the omni fixture's N_EMBD (64)
+        w.set_kv("clip.audio.embedding_length", Value::U32(512));
+        w.set_kv("clip.audio.attention.head_count", Value::U32(8));
+        w.set_kv("clip.audio.feed_forward_length", Value::U32(128));
+        w.set_kv("clip.audio.block_count", Value::U32(2));
+        w.set_kv("clip.audio.projection_dim", Value::U32(64));
+        w.set_kv("clip.audio.attention.layer_norm_epsilon", Value::F32(1e-5));
+        w.set_kv("clip.audio.num_mel_bins", Value::U32(128));
+
+        // conv-subsampling stack (clip.cpp:3360-3369): the transposed mel
+        // [128 mel, T frames]; C1=C2=C3=8
+        for (i, ne) in [
+            (0usize, [3i64, 3, 1, 8]), // conv2d (IC=1: mel bins are the height)
+            (2, [3, 3, 1, 8]),         // depthwise
+            (3, [1, 1, 8, 8]),         // direct 1x1
+            (5, [3, 3, 1, 8]),         // depthwise
+            (6, [1, 1, 8, 8]),         // direct 1x1
+        ] {
+            add(&mut w, format!("a.conv1d.{i}.weight"), ne, &mut st);
+            // the graph adds the bias UNRESHAPEd (conformer.cpp:22)
+            add(&mut w, format!("a.conv1d.{i}.bias"), [1, 1, ne[3], 1], &mut st);
+        }
+        // out projection: [16*8=128, 512] (clip.cpp:3368-3369)
+        add(&mut w, "a.pre_encode.out.weight".into(), [128, 512, 1, 1], &mut st);
+        add(&mut w, "a.pre_encode.out.bias".into(), [512, 1, 1, 1], &mut st);
+        // d1omni_a ships no learned position embeddings (the RPE input is
+        // computed at set_input, clip.cpp:5668-5683; the tensor is only
+        // asserted, conformer.cpp:7 — optional for d1omni_a, a657f7e98)
+
+        // audio adapter (clip.cpp:3371-3377): norm + mm.a.mlp.1/3 FFN;
+        // n_mmproj_embd = mm_3_w->ne[1] = 64 (clip.cpp:6124-6125)
+        add(&mut w, "mm.a.mlp.0.weight".into(), [512, 1, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.0.bias".into(), [512, 1, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.1.weight".into(), [512, 128, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.1.bias".into(), [128, 1, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.3.weight".into(), [128, 64, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.3.bias".into(), [64, 1, 1, 1], &mut st);
+        // d1omni_a's residual block after the projector (conformer.cpp:210-
+        // 216, clip.cpp:3439-3447): the block sits on the PROJECTED rows —
+        // norm(64), up 64->128, down 128->64, so the residual add lines up
+        // (the norm follows the 64-wide mm_3 output, NOT the 512-wide trunk)
+        add(&mut w, "mm.a.mlp.4.weight".into(), [64, 1, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.4.bias".into(), [64, 1, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.5.weight".into(), [64, 128, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.5.bias".into(), [128, 1, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.6.weight".into(), [128, 64, 1, 1], &mut st);
+        add(&mut w, "mm.a.mlp.6.bias".into(), [64, 1, 1, 1], &mut st);
+
+        // the two conformer layers (clip.cpp:3379-3406, same shapes as the
+        // lfm2a synth of tests/mtmd_audio_synth2.rs)
+        for il in 0..2i64 {
+            let mut f = |n: String, ne: [i64; 4], w: &mut GgufWriter, st: &mut u32| {
+                add(w, n, ne, st)
+            };
+            f(format!("a.blk.{il}.ln1.weight"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ln1.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ln2.weight"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ln2.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_q.weight"), [512, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_q.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_k.weight"), [512, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_k.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_v.weight"), [512, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_v.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_out.weight"), [512, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.attn_out.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_up.weight"), [512, 128, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_up.bias"), [128, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_down.weight"), [128, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_down.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_norm.weight"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_norm.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_norm_1.weight"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_norm_1.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_up_1.weight"), [512, 128, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_up_1.bias"), [128, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_down_1.weight"), [128, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.ffn_down_1.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            // [d_head, n_head, 1] — broadcasts over the token dim in the
+            // Shaw attention add (conformer.cpp:93)
+            f(format!("a.blk.{il}.pos_bias_u"), [64, 8, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.pos_bias_v"), [64, 8, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.linear_pos.weight"), [512, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.norm_conv.weight"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.norm_conv.bias"), [512, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.conv_norm.weight"), [128, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.conv_norm.bias"), [128, 1, 1, 1], &mut w, &mut st);
+            // causal depthwise conv (ssm_conv): [9, 128] — pad4+roll4+pad4
+            f(format!("a.blk.{il}.conv_dw.weight"), [9, 128, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.conv_dw.bias"), [128, 1, 1, 1], &mut w, &mut st);
+            // GLU width 128 -> pw1 out 256
+            f(format!("a.blk.{il}.conv_pw1.weight"), [512, 256, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.conv_pw1.bias"), [256, 1, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.conv_pw2.weight"), [128, 512, 1, 1], &mut w, &mut st);
+            f(format!("a.blk.{il}.conv_pw2.bias"), [512, 1, 1, 1], &mut w, &mut st);
+        }
+    }
+
+    let dir = std::path::Path::new(D1OMNI_MMPROJ).parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let tmp = format!("{D1OMNI_MMPROJ}.tmp{}", std::process::id());
+    let refs: Vec<&[u8]> = datas.iter().map(|d| d.as_slice()).collect();
+    {
+        use std::io::Write;
+        let f = std::fs::File::create(&tmp).expect("create synth mmproj");
+        let mut bw = std::io::BufWriter::new(f);
+        w.write(&mut bw, &refs).expect("write synth mmproj");
+        bw.flush().unwrap();
+    }
+    std::fs::rename(&tmp, D1OMNI_MMPROJ).expect("publish synth mmproj");
+    D1OMNI_MMPROJ.to_string()
+}
+
 // `gen` entry: `cargo test --release -p llama-server --test systemone_d1_parity gen -- --ignored`
 #[test]
 #[ignore]
@@ -577,6 +771,7 @@ fn gen() {
         ("tinylfm2d1", gen_d1_fixture()),
         ("tinylfm2d1omni", gen_d1omni_fixture()),
         ("tinypplx", gen_pplx_fixture()),
+        ("mmproj-d1omni-a", gen_d1omni_mmproj_fixture()),
     ] {
         println!("{name} synth: {path} ({} bytes)", std::fs::metadata(&path).unwrap().len());
     }

@@ -4001,7 +4001,9 @@ impl KvCache {
     ///    `llama_kv_cache::state_write` (:2055) — base then swa
     ///    (llama-kv-cache-iswa.cpp:259-264);
     ///  * the `partial_only` flag (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`)
-    ///    skips the compressed halves (the raw cells only), :1595/:1607.
+    ///    skips the compressed halves (the raw cells only), :1595/:1607, and
+    ///    skips the raw BASE half of an iswa pair (the swa half alone,
+    ///    llama-kv-cache-iswa.cpp:260-264 — the dsv4 raw pair included).
     pub fn state_seq_write(
         &self,
         io: &mut StateWriter,
@@ -4020,9 +4022,13 @@ impl KvCache {
             });
 
             // kv_raw->state_write (:1605): base then swa — the dsv4 raw pair
-            // is k-only (dsv4_make_k_only, :1253)
+            // is k-only (dsv4_make_k_only, :1253). kv_raw is an
+            // `llama_kv_cache_iswa`, whose state_write skips the BASE half
+            // under PARTIAL_ONLY (llama-kv-cache-iswa.cpp:260-264)
             let k_only = true;
-            self.raw_state_write(&self.raw_view_base(k_only), io, gctx, seq_id);
+            if !partial_only {
+                self.raw_state_write(&self.raw_view_base(k_only), io, gctx, seq_id);
+            }
             if let Some(view) = self.raw_view_swa(k_only) {
                 self.raw_state_write(&view, io, gctx, seq_id);
             }
@@ -4079,8 +4085,15 @@ impl KvCache {
         }
 
         // the plain / iswa shape: the raw half(s) alone (with their V rows
-        // unless the cache is a K-only MLA one)
-        self.raw_state_write(&self.raw_view_base(self.k_only), io, gctx, seq_id);
+        // unless the cache is a K-only MLA one). An iswa cache skips the base
+        // half under PARTIAL_ONLY (llama_kv_cache_iswa::state_write,
+        // llama-kv-cache-iswa.cpp:260-264 `if ((flags &
+        // LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) kv_base->state_write`);
+        // a plain single cache ignores the flag (GGML_UNUSED,
+        // llama-kv-cache.cpp:2072)
+        if !(partial_only && self.swa.is_some()) {
+            self.raw_state_write(&self.raw_view_base(self.k_only), io, gctx, seq_id);
+        }
         if let Some(view) = self.raw_view_swa(self.k_only) {
             self.raw_state_write(&view, io, gctx, seq_id);
         }
@@ -4115,8 +4128,12 @@ impl KvCache {
                 return Err("DSV4 state flags mismatch".into());
             }
 
-            // kv_raw->state_read (:1653) — the dsv4 raw pair is k-only
-            self.raw_state_read(false, io, gctx, seq_id, true)?;
+            // kv_raw->state_read (:1653) — the dsv4 raw pair is k-only; the
+            // iswa pair's read skips the base half under PARTIAL_ONLY
+            // (llama-kv-cache-iswa.cpp:266-273), mirroring the write
+            if !blob_partial {
+                self.raw_state_read(false, io, gctx, seq_id, true)?;
+            }
             if self.swa.is_some() {
                 self.raw_state_read(true, io, gctx, seq_id, true)?;
             }
@@ -4180,8 +4197,12 @@ impl KvCache {
             return Ok(());
         }
 
-        // the plain / iswa shape
-        self.raw_state_read(false, io, gctx, seq_id, self.k_only)?;
+        // the plain / iswa shape — the base half is absent from a partial
+        // blob of an iswa cache (see the write side,
+        // llama-kv-cache-iswa.cpp:266-273)
+        if !(partial_only && self.swa.is_some()) {
+            self.raw_state_read(false, io, gctx, seq_id, self.k_only)?;
+        }
         if self.swa.is_some() {
             self.raw_state_read(true, io, gctx, seq_id, self.k_only)?;
         }

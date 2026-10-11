@@ -24,15 +24,20 @@ LM_OUT=/tmp/tts-lm-synth
 GEN_OUT=/tmp/tts-gen-synth
 cd "$ROOT"
 
-# build the probes if missing
-if [ ! -x parity/ref_lm_tts_dump ] || [ parity/ref_lm_tts_dump.c -nt parity/ref_lm_tts_dump ]; then
+# build the probes if missing — or if they resolve a libllama from another
+# tree (a probe left over from a previous reference tree silently compares
+# against the WRONG library: the 2026-10-11 "+8B state" drift was exactly
+# that, a Sep-28/29 probe still rpath-ing the old pinned tree)
+if [ ! -x parity/ref_lm_tts_dump ] || [ parity/ref_lm_tts_dump.c -nt parity/ref_lm_tts_dump ] \
+        || [ -n "$(ldd parity/ref_lm_tts_dump 2>/dev/null | grep libllama | grep -v "$REFBIN")" ]; then
     gcc -O2 -I${DATA_HOME}/llm/llama.cpp-pinned/include \
         -I${DATA_HOME}/llm/llama.cpp-pinned/ggml/include \
         parity/ref_lm_tts_dump.c -o parity/ref_lm_tts_dump \
         -L"$REFBIN" -lllama -lggml -lggml-base -lggml-cpu -lm \
         -Wl,-rpath,"$REFBIN" || exit 1
 fi
-if [ ! -x parity/ref_gen_audio_dump ] || [ parity/ref_gen_audio_dump.cpp -nt parity/ref_gen_audio_dump ]; then
+if [ ! -x parity/ref_gen_audio_dump ] || [ parity/ref_gen_audio_dump.cpp -nt parity/ref_gen_audio_dump ] \
+        || [ -n "$(ldd parity/ref_gen_audio_dump 2>/dev/null | grep libllama | grep -v "$REFBIN")" ]; then
     g++ -O2 -std=c++17 -o parity/ref_gen_audio_dump parity/ref_gen_audio_dump.cpp \
         -I${DATA_HOME}/llm/llama.cpp-pinned/tools/mtmd \
         -I${DATA_HOME}/llm/llama.cpp-pinned/ggml/include \

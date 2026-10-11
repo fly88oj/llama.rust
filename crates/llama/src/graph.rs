@@ -148,14 +148,28 @@ pub struct InpEmbdScale {
     pub n_embd_inp: i64,
 }
 
-/// `llm_graph_context::build_inp_embd` (llama-graph.cpp:2461-2580 @c35b66744,
-/// 0bb496dbd) — the shared embedding-input builder: token rows through
+/// `llm_graph_context::build_inp_embd` (llama-graph.cpp:2462-2616 @aa94f2086,
+/// 8e2d31e0e) — the shared embedding-input builder: token rows through
 /// `get_rows(tok_embd, tokens)` (+ lora + pad), raw embd rows through the
 /// input tensor, mixed batches through `set_rows(dup(mixed_embd),
 /// build_tok(mixed_tokens), mixed_slots)`.
 ///
+/// 8e2d31e0e ("graph : reorder get_rows for embeddings") hoists the plain
+/// `get_rows` of the token rows out of `build_tok` into the embeddings
+/// placeholders step (:2503-2515) and registers them on the graph with
+/// `ggml_build_forward_order` so the GET_ROWS ops stick at the *beginning*
+/// of the compute graph — the embeddings remain in the host buffer and the
+/// GET_ROWS run before any other computations. `build_tok` now applies the
+/// lora delta and the n_embd_inp pad on top of the pre-gathered rows
+/// (:2517-2541). Values are unchanged (same ops, same per-element order);
+/// only the node order in the graph moves. The port's `Graph::build_forward`
+/// marks nodes visited at first touch, so an early call pins the get_rows at
+/// the graph front exactly like the C's forward_order (the C's compute=false
+/// flag has no port twin — the port builds only the selected arm, so every
+/// registered node computes).
+///
 /// The C keeps all arms in the graph and `ggml_build_forward_select` picks
-/// one (`idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1`, :2536); the
+/// one (`idx = ubatch.is_mixed() ? 2 : ubatch.token ? 0 : 1`, :2575); the
 /// port knows the batch kind when the step tensors are created, so
 /// `mixed.is_some()` selects the mixed arm here and its absence keeps the
 /// token arm — the embd-only batches ride the caller's materialized-row
@@ -169,6 +183,7 @@ pub struct InpEmbdScale {
 /// their token-only graphs; both are value-identical on token batches).
 pub fn build_inp_embd(
     ctx: &mut Context,
+    graph: &mut Graph,
     tok_embd: TensorId,
     tokens: TensorId,
     mixed: Option<&InpMixed>,
@@ -177,17 +192,33 @@ pub fn build_inp_embd(
 ) -> TensorId {
     let n_embd = ctx.ne(tok_embd)[0];
 
-    // token embeddings with lora and padding — the C's `build_tok` lambda
-    // (llama-graph.cpp:2477-2503)
+    // the embeddings placeholders for the 3 paths (:2503-2515): embd0/embd2
+    // gather the token rows here — before the lora/pad of `build_tok` and
+    // before any other computation — so the GET_ROWS ops stick at the
+    // beginning of the compute graph (`ggml_build_forward_order`, :2507/
+    // :2513). embd1 (the raw-embd arm) is the caller's input tensor, kept
+    // by the materialized-row swap (see doc above).
+    let embd0 = ctx.get_rows(tok_embd, tokens); // :2506
+    graph.build_forward(ctx, embd0); // ggml_build_forward_order(gf, embd0) :2507
+
+    let embd2 = mixed.map(|m| {
+        let embd2 = ctx.get_rows(tok_embd, m.tokens); // :2513
+        graph.build_forward(ctx, embd2); // ggml_build_forward_order(gf, embd2) :2514
+        embd2
+    });
+
+    // helper for extracting token embeddings with lora and padding
+    // (:2517-2541) — 8e2d31e0e: `cur` arrives pre-gathered, the lambda adds
+    // the lora delta and pads to n_embd_inp on top
     fn build_tok(
         ctx: &mut Context,
         tok_embd: TensorId,
+        cur: TensorId,
         ids: TensorId,
         n_embd: i64,
         n_embd_inp: i64,
     ) -> TensorId {
-        let cur = ctx.get_rows(tok_embd, ids);
-        // apply lora for embedding tokens if needed (:2483-2497)
+        // apply lora for embedding tokens if needed (:2521-2536)
         let cur = crate::adapter::lora_embd(ctx, tok_embd, cur, ids);
         if n_embd_inp != n_embd {
             ctx.pad(cur, (n_embd_inp - n_embd) as i32, 0, 0, 0)
@@ -196,34 +227,35 @@ pub fn build_inp_embd(
         }
     }
 
-    // select one of the 3 inputs, based on the batch contents (:2505-2537)
+    // select one of the 3 inputs, based on the batch contents (:2544-2575)
     let mut cur = match mixed {
         // mixed path: set_rows the token rows into a copy of the embd rows,
         // with its own inputs (select branches must not share tensors)
         Some(m) => {
-            let tok_rows = build_tok(ctx, tok_embd, m.tokens, n_embd, scale.n_embd_inp);
             // note: set_rows writes into its destination, so it gets a copy
-            // of the input (:2533)
+            // of the input (:2569)
+            let embd_mixed =
+                build_tok(ctx, tok_embd, embd2.expect("mixed arm"), m.tokens, n_embd, scale.n_embd_inp);
             let dst = ctx.dup(m.embd);
-            ctx.set_rows(dst, tok_rows, m.slots)
+            ctx.set_rows(dst, embd_mixed, m.slots)
         }
         // token embeddings path (ubatch.token != nullptr); the embd-only
         // twin reaches it through the materialized-row swap (see doc)
-        None => build_tok(ctx, tok_embd, tokens, n_embd, scale.n_embd_inp),
+        None => build_tok(ctx, tok_embd, embd0, tokens, n_embd, scale.n_embd_inp),
     };
 
     // NOTE: For deepstack models, only apply scale to token inputs (ie
     // text-only input). Raw embeddings are assumed to be multimodal inputs
-    // that should not be scaled. (llama-graph.cpp:2553-2554)
+    // that should not be scaled. (llama-graph.cpp:2592-2593)
     let scale_tok_only = scale.f_embedding_scale != 0.0 && scale.n_deepstack_layers > 0;
 
-    // For Granite architecture (:2556-2561)
+    // For Granite architecture (:2595-2601)
     if scale.f_embedding_scale != 0.0 && !scale_tok_only {
         cur = ctx.scale(cur, scale.f_embedding_scale);
     }
 
     // scale the token rows only, applied after the select so that the graph
-    // is the same for any batch contents (:2563-2570)
+    // is the same for any batch contents (:2603-2610)
     let scale_tok = tok_scale * if scale_tok_only {
         scale.f_embedding_scale
     } else {
@@ -324,13 +356,15 @@ pub fn build_qwen2_forward(
     let mut graph = Graph::new(1024);
 
     // inpL = embd lookup [n_embd, T] — `build_inp_embd(tok_embd)` with the
-    // default tok_scale (llama-graph.cpp:2461, 0bb496dbd): the token arm is
+    // default tok_scale (llama-graph.cpp:2462, 0bb496dbd): the token arm is
     // get_rows + lora (qwen2 has no f_embedding_scale, no n_embd_inp pad, so
     // the op sequence is the pre-refactor inline); a type-marked ubatch
-    // routes through the mixed set_rows arm
+    // routes through the mixed set_rows arm. 8e2d31e0e: the get_rows is
+    // pinned at the graph front through the new `graph` arg
     let n_embd = ctx.ne(w.tok_embd)[0];
     let mut inp_l = build_inp_embd(
         ctx,
+        &mut graph,
         w.tok_embd,
         inp.tokens,
         mixed,

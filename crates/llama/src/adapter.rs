@@ -495,6 +495,45 @@ pub type AdaptersLora = Vec<(Rc<AdapterLora>, f32)>;
 thread_local! {
     /// `llama_context::loras` (llama-context.h:288) — see the module docs.
     static ACTIVE_LORAS: RefCell<AdaptersLora> = const { RefCell::new(Vec::new()) };
+
+    /// `llm_graph_context::prec_policy` (llama-graph.h:1047, set from
+    /// `params.prec_policy` = `&model.prec_policy`, llama-context.cpp:2602) —
+    /// the model-driven src1-precision hint consulted by `build_lora_mm` /
+    /// `build_lora_mm_id`. A clone (the policy is a handful of tensor
+    /// names), registered per graph-building context like the loras above;
+    /// `None` when the model carries no `general.tensor_extra.prec_a4`
+    /// policy — the consult is then a no-op, matching the C's null pointer.
+    static PREC_POLICY: RefCell<Option<crate::model::PrecPolicy>> = const { RefCell::new(None) };
+}
+
+/// Register the model's precision policy for the current graph-building
+/// thread (the C wires `&model.prec_policy` into the graph params at context
+/// construction, llama-context.cpp:2602; the port's `lora_mm_s` /
+/// `lora_mm_id` are free functions, so the policy rides this thread-local —
+/// the same pattern as [`set_adapters_lora`]). Call before building the
+/// decode graph; `None` clears it.
+pub fn set_prec_policy(policy: Option<crate::model::PrecPolicy>) {
+    PREC_POLICY.with(|p| *p.borrow_mut() = policy);
+}
+
+/// Borrow the active policy for the duration of `f`
+/// (llama-graph.cpp:1553 `if (prec_policy)`).
+pub fn with_prec_policy<R>(f: impl FnOnce(Option<&crate::model::PrecPolicy>) -> R) -> R {
+    PREC_POLICY.with(|p| f(p.borrow().as_ref()))
+}
+
+/// `llm_graph_context::build_lora_mm`'s `prec_policy->apply(res)`
+/// (llama-graph.cpp:1553-1555 / 1597-1599, → llama-model.cpp:1249-1260):
+/// write the weight's src1-precision op-param right after the mul_mat —
+/// a GPU W4A4 quantize hint the CPU backend never reads (numerics
+/// unchanged; op-dump parity keeps the slot bit-for-bit).
+fn prec_policy_apply_mm(ctx: &mut Context, res: TensorId, w: TensorId) {
+    let name = ctx.name(w).to_string();
+    with_prec_policy(|policy| {
+        if let Some(policy) = policy {
+            policy.apply(ctx, res, &name);
+        }
+    });
 }
 
 /// `llama_context::set_adapters_lora` (llama-context.cpp:1332-1348; the public
@@ -606,13 +645,17 @@ pub fn lora_mm(ctx: &mut Context, w: TensorId, cur: TensorId) -> TensorId {
 /// port but kept in the signature so the call sites read like the C.
 ///
 /// e9f824d8c: the C applies the model's `prec_policy` right after the
-/// mul_mat (`prec_policy->apply(res)`, :1526-1530 — `ggml_prec_set_src`
-/// writes the src1-precision op-param the GPU W4A4 kernels read; a CPU build
-/// has no such kernel, so the port keeps the policy in
-/// [`crate::model::PrecPolicy`] for the saver round-trip and skips the
-/// op-param here; same for `build_lora_mm_id`, :1562-1566).
+/// mul_mat (`prec_policy->apply(res)`, :1553-1555 — `ggml_prec_set_src`
+/// writes the src1-precision op-param the GPU W4A4 kernels read; a CPU
+/// build has no such kernel, so numerics are unchanged). Batch O3 wired the
+/// port's consult through [`crate::model::PrecPolicy::apply`] +
+/// [`ggml::ops::Context::prec_set_src`], registered per thread via
+/// [`set_prec_policy`]; same for `build_lora_mm_id`, :1597-1599.
 pub fn lora_mm_s(ctx: &mut Context, w: TensorId, cur: TensorId, w_s: Option<TensorId>) -> TensorId {
     let mut res = ctx.mul_mat(w, cur);
+
+    // `if (prec_policy) prec_policy->apply(res);` (llama-graph.cpp:1553-1555)
+    prec_policy_apply_mm(ctx, res, w);
 
     // a7b94df2c (llama-graph.cpp:1560-1562): NVFP4 weights take a BF16
     // accumulator hint — `if (w->type == GGML_TYPE_NVFP4)
@@ -663,6 +706,9 @@ pub fn lora_mm_s(ctx: &mut Context, w: TensorId, cur: TensorId, w_s: Option<Tens
 /// the formula is the same one [`LoraWeight::get_scale`] implements.
 pub fn lora_mm_id(ctx: &mut Context, w: TensorId, cur: TensorId, ids: TensorId) -> TensorId {
     let mut res = ctx.mul_mat_id(w, cur, ids);
+
+    // `if (prec_policy) prec_policy->apply(res);` (llama-graph.cpp:1597-1599)
+    prec_policy_apply_mm(ctx, res, w);
 
     // a7b94df2c (llama-graph.cpp:1604-1606): the mul_mat_id twin of the
     // NVFP4 BF16 accumulator hint above.
@@ -749,6 +795,52 @@ mod tests {
     use super::*;
     use ggml::gguf_write::GgufWriter;
     use ggml::types::GgmlType;
+
+    /// build_lora_mm's `prec_policy->apply(res)` (llama-graph.cpp:1553-1555 →
+    /// llama-model.cpp:1249-1260): a weight named in the policy gets the
+    /// src1-precision op-param written through ggml_prec_set_src
+    /// (op_params[3], the only legal slot — parity/prec_src_ref.txt); an
+    /// unregistered policy leaves the slot untouched. Numerics-free hint:
+    /// only the encoding is observable on the CPU backend.
+    #[test]
+    fn lora_mm_prec_policy_consult() {
+        let mut ctx = Context::new();
+        let w = ctx.new_tensor_2d(GgmlType::F32, 16, 8);
+        ctx.set_name(w, "blk.0.attn_q.weight");
+        let x = ctx.new_tensor_2d(GgmlType::F32, 16, 3);
+
+        // no policy registered: slot untouched
+        let r0 = lora_mm(&mut ctx, w, x);
+        assert_eq!(ctx.op_params(r0)[3], 0);
+
+        // policy naming the weight: slot 3 = GGML_PREC_Q8 (30)
+        let mut policy = crate::model::PrecPolicy::default();
+        policy.prec_src1.insert("blk.0.attn_q.weight".to_string(), 30);
+        set_prec_policy(Some(policy));
+        let r1 = lora_mm(&mut ctx, w, x);
+        set_prec_policy(None);
+        assert_eq!(ctx.op_params(r1)[3], 30);
+
+        // policy naming a different weight: slot untouched
+        let mut other = crate::model::PrecPolicy::default();
+        other.prec_src1.insert("blk.1.ffn.weight".to_string(), 30);
+        set_prec_policy(Some(other));
+        let r2 = lora_mm(&mut ctx, w, x);
+        set_prec_policy(None);
+        assert_eq!(ctx.op_params(r2)[3], 0);
+
+        // mul_mat_id twin (build_lora_mm_id, llama-graph.cpp:1597-1599)
+        let we = ctx.new_tensor_3d(GgmlType::F32, 16, 8, 4);
+        ctx.set_name(we, "blk.0.ffn_down_exps.weight");
+        let x3 = ctx.new_tensor_3d(GgmlType::F32, 16, 2, 2);
+        let ids = ctx.new_tensor_2d(GgmlType::I32, 2, 2);
+        let mut mid = crate::model::PrecPolicy::default();
+        mid.prec_src1.insert("blk.0.ffn_down_exps.weight".to_string(), 30);
+        set_prec_policy(Some(mid));
+        let r3 = lora_mm_id(&mut ctx, we, x3, ids);
+        set_prec_policy(None);
+        assert_eq!(ctx.op_params(r3)[3], 30);
+    }
 
     /// Write a tiny adapter GGUF to a temp path and return it. Tensors are F32
     /// `[n0, n1]` with deterministic contents; `extra_kv` appends metadata.

@@ -11,9 +11,9 @@
 //! (`engine::ChatStreamState`, the port of `task_result_state`).
 
 use llama::chat_tools::{
-    chat_format_name, chat_templates_apply, msgs_parse_oaicompat, tool_choice_parse_oaicompat,
-    tools_parse_oaicompat, ChatMsg, ChatTemplates, ChatToolChoice, ReasoningFormat,
-    TemplatesInputs,
+    chat_continuation_parse, chat_format_name, chat_templates_apply, msgs_parse_oaicompat,
+    tool_choice_parse_oaicompat, tools_parse_oaicompat, ChatContinuation, ChatMsg, ChatSession,
+    ChatSessionParams, ChatTemplates, ChatToolChoice, ReasoningFormat, TemplatesInputs,
 };
 use llama::json_schema::Json;
 
@@ -28,6 +28,13 @@ pub struct ChatOptions<'a> {
     pub enable_thinking: bool,
     /// `opt.reasoning_format` — the common_params default (deepseek)
     pub reasoning_format: ReasoningFormat,
+    /// `opt.reasoning_budget` — `params_base.sampling.reasoning_budget_tokens`
+    /// (server-context.cpp:1619); the port has no `--reasoning-budget-tokens`
+    /// CLI yet, so the server passes -1 and only per-request values apply
+    pub reasoning_budget: i64,
+    /// `opt.reasoning_budget_message` —
+    /// `params_base.sampling.reasoning_budget_message` (server-context.cpp:1620)
+    pub reasoning_budget_message: String,
 }
 
 /// The C++ exception the parse throws, mapped the way `ex_wrapper`
@@ -53,28 +60,22 @@ impl ChatError {
 }
 
 /// The output of a successful parse: the `llama_params` body handed to
-/// `eval_llama_cmpl_schema`, plus the chat metadata the schema does not carry.
+/// `eval_llama_cmpl_schema`, plus the chat session that owns the prompt's
+/// parsing state (8b5436102 — the grammar/triggers/parser no longer ride
+/// the JSON body).
 pub struct ChatParams {
     /// the body for the completion schema (`llama_params`)
     pub llama_params: Json,
-    /// `common_chat_format_name(chat_params.format)` — the differential
-    /// autoparser labels every generic template "peg-native" (chat.cpp:863)
-    pub chat_format: &'static str,
-    /// the assistant-turn prefix the template emits (`generation_prompt`)
-    pub generation_prompt: String,
-    /// `common_grammar_needs_prefill(chat_params.grammar)` — the grammar
-    /// carries the generation-prompt literal and the sampler must consume it
-    /// first (sampling.cpp:294-308)
-    pub grammar_needs_prefill: bool,
-    /// `chat_params.parser` — the serialized PEG arena of the autoparser
-    /// (empty = the pure-content parser)
-    pub parser: String,
+    /// `out_session` — rendered prompt + PEG parser + sampling side, applied
+    /// to the task via `Task::apply_chat_session` (server-task.h:261-271)
+    pub session: ChatSession,
 }
 
-/// `oaicompat_chat_params_parse` (server-common.cpp:1151-1420). The port runs
-/// the jinja path (`opt.use_jinja` is true), so the `--no-jinja` tool errors
-/// of server-common.cpp:1167-1174 are never taken.
+/// `oaicompat_chat_params_parse` (server-common.cpp:1266-1493, 8b5436102). The
+/// port runs the jinja path (`opt.use_jinja` is true), so the `--no-jinja`
+/// tool errors of server-common.cpp:1283-1290 are never taken.
 pub fn oaicompat_chat_params_parse(
+    vocab: Option<&llama::vocab::Vocab>,
     body: &Json,
     opt: &ChatOptions,
 ) -> Result<ChatParams, ChatError> {
@@ -199,14 +200,14 @@ pub fn oaicompat_chat_params_parse(
     let json_schema_text = if json_schema.is_null() { String::new() } else { json_schema.dump() };
 
     // `add_generation_prompt` / `continue_final_message`
-    // (server-common.cpp:1285-1314; `opt.prefill_assistant` is false)
+    // (server-common.cpp:1368-1388; `opt.prefill_assistant` is false)
     let mut add_generation_prompt =
         body.at("add_generation_prompt").map(|v| matches!(v, Json::Bool(true))).unwrap_or(true);
-    let continue_final = body
-        .at("continue_final_message")
-        .map(continuation)
-        .unwrap_or(Continuation::None);
-    if continue_final != Continuation::None {
+    let continue_final = match body.at("continue_final_message") {
+        Some(v) => chat_continuation_parse(v).map_err(ChatError::invalid)?,
+        None => ChatContinuation::None,
+    };
+    if continue_final != ChatContinuation::None {
         if msgs.len() >= 2 && msgs[msgs.len() - 2].role == "assistant" {
             return Err(ChatError::invalid(
                 "Cannot have 2 or more assistant messages at the end of the list.",
@@ -219,7 +220,7 @@ pub fn oaicompat_chat_params_parse(
         }
         add_generation_prompt = false;
     }
-    if continue_final != Continuation::None
+    if continue_final != ChatContinuation::None
         && !msgs.is_empty()
         && msgs.last().unwrap().role == "assistant"
         && !msgs.last().unwrap().tool_calls.is_empty()
@@ -299,75 +300,73 @@ pub fn oaicompat_chat_params_parse(
         chat_template_kwargs: kwargs,
         ..TemplatesInputs::default()
     };
-    // `common_chat_templates_apply` (server-common.cpp:1360, chat.cpp:1434-1439)
-    let chat_params = chat_templates_apply(opt.templates, &inputs)
+    // Apply chat template to the list of messages (server-common.cpp:1430-1432,
+    // 8b5436102): the session owns the prompt, the PEG parser and the sampling
+    // side from here on
+    let session_params = ChatSessionParams {
+        echo: body.at("echo").map(|v| matches!(v, Json::Bool(true))).unwrap_or(false),
+        debug: false,
+    };
+    let session = ChatSession::new(opt.templates, vocab, &inputs, &session_params)
         .map_err(|e| ChatError::invalid(format!("Failed to apply chat template: {e}")))?;
-    let chat_format = chat_format_name(chat_params.format).map_err(ChatError::runtime)?;
 
-    // build `llama_params` (server-common.cpp:1362-1392)
+    // build `llama_params` (server-common.cpp:1434 + reasoning budget
+    // 1437-1455): the chat metadata itself no longer rides the JSON
     let mut llama_params: Vec<(String, Json)> = Vec::new();
     let mut stop_json: Vec<Json> = stop.iter().map(|s| Json::String(s.clone())).collect();
-    // `for (const auto & stop : chat_params.additional_stops)`
-    // (server-common.cpp:1380-1382)
-    for s in &chat_params.additional_stops {
-        stop_json.push(Json::String(s.clone()));
-    }
+    // only the body's stops land in "stop" — the template's additional stops
+    // become task antiprompts via `apply_chat_session` (server-common.cpp:1434)
     llama_params.push(("stop".into(), Json::Array(stop_json)));
-    llama_params.push(("chat_format".into(), Json::Int(chat_params.format as i64)));
-    llama_params.push(("prompt".into(), Json::String(chat_params.prompt.clone())));
-    let mut grammar_needs_prefill = false;
-    if !chat_params.grammar.is_empty() {
-        llama_params.push(("grammar".into(), Json::String(chat_params.grammar.clone())));
-        llama_params.push(("grammar_type".into(), Json::String("tool_calls".into())));
-        grammar_needs_prefill = true;
-    }
-    llama_params.push(("grammar_lazy".into(), Json::Bool(chat_params.grammar_lazy)));
-    // `server_grammar_trigger::to_json` (server-common.h:84-92): the type is
-    // the enum's integer (common.h:143-148: TOKEN=0, WORD=1, PATTERN=2,
-    // PATTERN_FULL=3). The autoparser emits WORD; the specialized parsers
-    // (gpt-oss, functionary, muse-glimmer, …) emit PATTERN.
-    let triggers: Vec<Json> = chat_params
-        .grammar_triggers
-        .iter()
-        .map(|t| {
-            let ty = match t.ty {
-                llama::chat_tools::GrammarTriggerType::Token => 0,
-                llama::chat_tools::GrammarTriggerType::Word => 1,
-                llama::chat_tools::GrammarTriggerType::Pattern => 2,
-                llama::chat_tools::GrammarTriggerType::PatternFull => 3,
-            };
-            Json::Object(vec![
-                ("type".into(), Json::Int(ty)),
-                ("value".into(), Json::String(t.word.clone())),
-            ])
-        })
-        .collect();
-    llama_params.push(("grammar_triggers".into(), Json::Array(triggers)));
-    llama_params.push((
-        "preserved_tokens".into(),
-        Json::Array(chat_params.preserved_tokens.iter().map(|t| Json::String(t.clone())).collect()),
-    ));
-    llama_params.push((
-        "generation_prompt".into(),
-        Json::String(chat_params.generation_prompt.clone()),
-    ));
-    if !chat_params.parser.is_empty() {
-        llama_params.push(("chat_parser".into(), Json::String(chat_params.parser.clone())));
-    }
-    // `chat_params.message_delimiters.to_json()` (chat.cpp:115-124)
-    let delims: Vec<Json> = chat_params
-        .message_delimiters
-        .iter()
-        .map(|(role, d)| {
-            Json::Object(vec![
-                ("role".into(), Json::String(role.clone())),
-                ("delimiter".into(), Json::String(d.clone())),
-            ])
-        })
-        .collect();
-    llama_params.push(("message_delimiters".into(), Json::Array(delims)));
+    llama_params.push(("prompt".into(), Json::String(session.prompt().to_string())));
 
-    // Handle "logprobs" field (server-common.cpp:1394-1401)
+    // Reasoning budget: pass parameters through to sampling layer
+    // (server-common.cpp:1437-1455). The completion schema consumes the
+    // reasoning_budget_* fields (api.rs `eval_llama_cmpl_schema`,
+    // server-schema.cpp:333-383) and the budget sampler runs inside
+    // `SamplingContext` (sampling.rs, common/reasoning-budget.cpp).
+    {
+        let mut reasoning_budget = body
+            .at("reasoning_budget_tokens")
+            .and_then(|v| v.get_i64().ok())
+            .or_else(|| body.at("thinking_budget_tokens").and_then(|v| v.get_i64().ok()))
+            .unwrap_or(-1);
+        if reasoning_budget == -1 {
+            reasoning_budget = opt.reasoning_budget;
+        }
+        if !session.thinking_end_tags().is_empty() {
+            llama_params.push(("reasoning_budget_tokens".into(), Json::Int(reasoning_budget)));
+            llama_params.push((
+                "reasoning_budget_start_tag".into(),
+                Json::String(session.thinking_start_tag().to_string()),
+            ));
+            llama_params.push((
+                "reasoning_budget_end_tags".into(),
+                Json::Array(
+                    session
+                        .thinking_end_tags()
+                        .iter()
+                        .map(|t| Json::String(t.clone()))
+                        .collect(),
+                ),
+            ));
+            let budget_message = body
+                .at("reasoning_budget_message")
+                .and_then(|v| v.get_str().ok())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| opt.reasoning_budget_message.clone());
+            llama_params.push(("reasoning_budget_message".into(), Json::String(budget_message)));
+            llama_params.push((
+                "reasoning_control".into(),
+                Json::Bool(
+                    body.at("reasoning_control")
+                        .map(|v| matches!(v, Json::Bool(true)))
+                        .unwrap_or(false),
+                ),
+            ));
+        }
+    }
+
+    // Handle "logprobs" field (server-common.cpp:1457-1466)
     let logprobs = body.at("logprobs").map(|v| matches!(v, Json::Bool(true))).unwrap_or(false);
     if logprobs {
         if has_tools && stream {
@@ -382,7 +381,7 @@ pub fn oaicompat_chat_params_parse(
         return Err(ChatError::invalid("top_logprobs requires logprobs to be set to true"));
     }
 
-    // Copy remaining properties (server-common.cpp:1404-1410): everything the
+    // Copy remaining properties (server-common.cpp:1468-1477): everything the
     // chat parse has not set flows through, so OAI fields (max_tokens,
     // temperature, …) and llama.cpp-specific ones (mirostat, …) both reach the
     // completion schema; "n_predict" always overwrites.
@@ -395,28 +394,19 @@ pub fn oaicompat_chat_params_parse(
         }
     }
 
+    // the session owns these, the server applies them with
+    // `Task::apply_chat_session()` (server-common.cpp:1479-1487)
+    llama_params.retain(|(k, _)| {
+        !matches!(k.as_str(), "grammar_lazy" | "grammar_triggers" | "preserved_tokens")
+    });
+    if !session.grammar().is_empty() {
+        llama_params.retain(|(k, _)| !matches!(k.as_str(), "grammar" | "json_schema"));
+    }
+
     Ok(ChatParams {
         llama_params: Json::Object(llama_params),
-        chat_format,
-        generation_prompt: chat_params.generation_prompt,
-        grammar_needs_prefill,
-        parser: chat_params.parser,
+        session,
     })
-}
-
-/// `common_chat_continuation_parse` (chat.cpp:622-636) — bool or the named modes.
-#[derive(PartialEq)]
-enum Continuation {
-    None,
-    Auto,
-}
-
-fn continuation(v: &Json) -> Continuation {
-    match v {
-        Json::Bool(true) => Continuation::Auto,
-        Json::String(s) if s == "auto" => Continuation::Auto,
-        _ => Continuation::None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -533,6 +523,131 @@ mod tests {
         Json::Object(items)
     }
 
+    /// the Qwen3 template of the reference tree — the same file the upstream
+    /// `test_reasoning_budget_*` tests read (tests/test-chat.cpp:5914-5981);
+    /// its `<think>...</think>` markers are what the autoparser detects
+    fn qwen3_templates() -> Option<ChatTemplates> {
+        /// corpus file: <LLAMA_RUST_DATA_HOME>/llm/llama.cpp-next/models/templates/Qwen-Qwen3-0.6B.jinja
+        #[allow(non_snake_case)]
+        fn QWEN3_JINJA() -> &'static str {
+            crate::chat::__llama_rust_data_path("llm/llama.cpp-next/models/templates/Qwen-Qwen3-0.6B.jinja")
+        }
+        if !std::path::Path::new(QWEN3_JINJA()).exists() {
+            eprintln!("skip: {} missing", QWEN3_JINJA());
+            return None;
+        }
+        let src = std::fs::read_to_string(QWEN3_JINJA()).unwrap();
+        llama::chat_tools::ChatTemplates::init(&llama::chat_tools::ChatTemplatesInit {
+            chat_template_override: src,
+            chat_template_tool_use: String::new(),
+            bos_token: "<|endoftext|>".into(),
+            eos_token: "<|im_end|>".into(),
+            add_bos: false,
+            add_eos: false,
+        })
+        .ok()
+    }
+
+    /// `test_reasoning_budget_tokens_per_request` +
+    /// `test_reasoning_budget_message_per_request`
+    /// (tests/test-chat.cpp:5914-5981, the 99f3dc322 tests): the per-request
+    /// `reasoning_budget_tokens` / `reasoning_budget_message` win over the
+    /// server defaults, the completion schema lowers the four keys into the
+    /// sampling params (server-schema.cpp:333-383), and the budget sampler
+    /// runs off them (common/sampling.cpp:313-326) — budget 0 forces the end
+    /// tag immediately once the start tag is seen.
+    #[test]
+    fn reasoning_budget_per_request() {
+        let (Some(v), Some(t)) = (vocab(), qwen3_templates()) else {
+            return;
+        };
+        let opt = ChatOptions {
+            templates: &t,
+            enable_thinking: true,
+            reasoning_format: ReasoningFormat::None,
+            reasoning_budget: -1,
+            reasoning_budget_message: "server default".into(),
+        };
+
+        // (1) the per-request token budget: 0 (suppress thinking) wins over
+        // the server default (-1)
+        let body = Json::parse(
+            r#"{"messages":[{"role":"user","content":"hello"}],"reasoning_budget_tokens":0,
+                "reasoning_budget_message":"per-request message"}"#,
+        )
+        .unwrap();
+        let parsed = oaicompat_chat_params_parse(Some(&v), &body, &opt).unwrap();
+        let lp = &parsed.llama_params;
+        assert_eq!(lp.at("reasoning_budget_tokens").unwrap().get_i64().unwrap(), 0);
+        let start_tag = lp
+            .at("reasoning_budget_start_tag")
+            .and_then(|x| x.get_str().ok())
+            .map(|s| s.to_string())
+            .expect("reasoning_budget_start_tag missing (thinking markers not detected)");
+        let end_tag = lp
+            .at("reasoning_budget_end_tags")
+            .and_then(|x| match x {
+                Json::Array(a) => a.first().and_then(|s| s.get_str().ok()).map(|s| s.to_string()),
+                _ => None,
+            })
+            .expect("reasoning_budget_end_tags missing");
+        assert_eq!(
+            lp.at("reasoning_budget_message").unwrap().get_str().unwrap(),
+            "per-request message"
+        );
+
+        // (2) the schema consumption (server-schema.cpp:333-383): the four
+        // keys lower into the sampling params, and the message's tokens are
+        // prepended to the first end tag as the forced sequence
+        let base = crate::api::TaskParams::default();
+        let p = crate::api::eval_llama_cmpl_schema(lp, &base, &v).unwrap();
+        assert_eq!(p.sampling.reasoning_budget_tokens, 0);
+        assert_eq!(p.sampling.reasoning_budget_start, v.tokenize(&start_tag, false, true));
+        assert_eq!(p.sampling.reasoning_budget_end, vec![v.tokenize(&end_tag, false, true)]);
+        assert_eq!(p.sampling.reasoning_budget_message, "per-request message");
+        let mut forced = v.tokenize("per-request message", false, true);
+        forced.extend_from_slice(&p.sampling.reasoning_budget_end[0]);
+        assert_eq!(p.sampling.reasoning_budget_forced, forced);
+
+        // (3) the budget sampler (common/sampling.cpp:313-326): built inside
+        // SamplingContext; the start tag arms it, budget 0 forces immediately
+        // (reasoning-budget.cpp:87-92), and the forced token is the only one
+        // that survives apply()
+        let mut sampling = p.sampling.clone();
+        sampling.generation_prompt = String::new();
+        let mut smpl = llama::sampling::SamplingContext::new_with_vocab(
+            v.n_tokens() as i32,
+            Some(&v),
+            sampling,
+        );
+        let rb = smpl.rbudget.as_mut().expect("the budget sampler was not built");
+        assert_eq!(rb.get_state(), llama::sampling::ReasoningBudgetState::Idle);
+        for &tok in &p.sampling.reasoning_budget_start {
+            rb.accept(tok);
+        }
+        assert_eq!(rb.get_state(), llama::sampling::ReasoningBudgetState::Forcing);
+
+        // apply() masks everything but the first forced token: a greedy chain
+        // whose argmax differs still returns it (reasoning-budget.cpp:166-186)
+        let first_forced = p.sampling.reasoning_budget_forced[0];
+        let mut logits = vec![-3.0f32; v.n_tokens() as usize];
+        logits[5] = 2.0; // the would-be argmax
+        let id = smpl.sample(&logits);
+        assert_eq!(id, first_forced);
+
+        // the server default still applies when the request carries no budget
+        let body = Json::parse(r#"{"messages":[{"role":"user","content":"hello"}]}"#).unwrap();
+        let parsed = oaicompat_chat_params_parse(Some(&v), &body, &opt).unwrap();
+        let lp = &parsed.llama_params;
+        assert_eq!(lp.at("reasoning_budget_tokens").unwrap().get_i64().unwrap(), -1);
+        assert_eq!(
+            lp.at("reasoning_budget_message").unwrap().get_str().unwrap(),
+            "server default"
+        );
+        let p = crate::api::eval_llama_cmpl_schema(lp, &base, &v).unwrap();
+        assert_eq!(p.sampling.reasoning_budget_tokens, -1);
+    }
+
     /// a rendered qwen2.5 chat prompt tokenizes with its `<|im_*|>` markers
     /// as single special ids — the reference `/tokenize` answers. The vocab's
     /// own entry point duplicates the text after the second occurrence of a
@@ -576,56 +691,68 @@ mod tests {
     #[test]
     fn tools_apply_and_parse() {
         let Some(t) = qwen_templates() else { return };
+        let v = vocab().unwrap();
         let opt = ChatOptions {
             templates: &t,
             enable_thinking: false,
             reasoning_format: ReasoningFormat::None,
+            reasoning_budget: -1,
+            reasoning_budget_message: String::new(),
         };
-        let v = vocab().unwrap();
         let parsed = oaicompat_chat_params_parse(
+            Some(&v),
             &body(Some(weather_tools()), None, "What is the weather in Tokyo right now? Use the tool."),
             &opt,
         )
         .unwrap();
-        assert_eq!(parsed.chat_format, "peg-native");
+        // the differential autoparser's label for a generic template
+        // (chat.cpp:863-864)
+        assert_eq!(llama::chat_tools::chat_format_name(parsed.session.format()).unwrap(), "peg-native");
         let lp = &parsed.llama_params;
         // the tool section is rendered into the system prompt
         let prompt = lp.at("prompt").unwrap().get_str().unwrap();
         assert!(prompt.contains("# Tools"), "{prompt}");
         assert!(prompt.contains("\"name\": \"get_weather\""), "{prompt}");
-        // lazy grammar + the `<tool_call>` WORD trigger (the per-call marker
-        // carries its trailing newline, so it is multi-token — the schema
-        // upgrade to a TOKEN trigger does not apply)
-        assert_eq!(lp.at("grammar_lazy"), Some(&Json::Bool(true)));
-        assert!(!lp.at("grammar").unwrap().get_str().unwrap().is_empty());
-        let trig = lp.at("grammar_triggers").unwrap();
-        assert_eq!(trig.dump(), r#"[{"type":1,"value":"<tool_call>\n"}]"#);
-        // preserved markers of the template (single-token only — the lowering
-        // happens in the schema)
-        let pt = lp.at("preserved_tokens").unwrap().dump();
-        assert_eq!(pt, r#"["<tool_call>","</tool_call>"]"#);
-        assert!(!parsed.parser.is_empty());
-        assert_eq!(lp.at("generation_prompt").unwrap().get_str().unwrap(), "<|im_start|>assistant\n");
-        assert!(parsed.grammar_needs_prefill);
+        // the session owns the grammar side now (8b5436102): the keys are
+        // erased from llama_params and applied via Task::apply_chat_session
+        assert!(lp.at("grammar_lazy").is_none());
+        assert!(lp.at("grammar").is_none());
+        assert!(lp.at("grammar_triggers").is_none());
+        assert!(lp.at("preserved_tokens").is_none());
+        assert!(lp.at("generation_prompt").is_none());
+        assert!(parsed.session.grammar_lazy());
+        assert!(!parsed.session.grammar().is_empty());
+        assert_eq!(parsed.session.generation_prompt(), "<|im_start|>assistant\n");
 
-        // the schema keeps the multi-token word as a WORD trigger
-        // (server-schema.cpp:366-377 — only a single-token word upgrades)
-        let base = crate::api::TaskParams::default();
-        let schema = crate::api::eval_llama_cmpl_schema(lp, &base, &v).unwrap();
+        // `task.apply_chat_session(session)` (server-task.h:261-271): the
+        // sampling side lands on the task — the `<tool_call>` WORD trigger
+        // carries its trailing newline, so it is multi-token and stays WORD
+        let mut task = crate::engine::Task {
+            id: 1,
+            index: 0,
+            kind: crate::engine::TaskKind::Completion,
+            tokens: Vec::new(),
+            params: crate::api::TaskParams::default(),
+            prompt_text: String::new(),
+            slot_action: None,
+            decision_body: Json::Null,
+            chat_session: None,
+            tx: std::sync::mpsc::channel().0,
+        };
+        task.apply_chat_session(&parsed.session);
+        let schema = &task.params;
         assert!(schema.grammar_lazy);
         assert_eq!(schema.grammar_triggers.len(), 1);
         assert_eq!(schema.grammar_triggers[0].at("type"), Some(&Json::Int(1)));
-        assert!(schema.preserved_tokens.contains(&151657));
         assert!(schema.grammar_prefill);
+        assert_eq!(schema.chat_format, "peg-native");
+        assert_eq!(schema.generation_prompt, "<|im_start|>assistant\n");
+        assert_eq!(task.chat_session.as_ref().unwrap().prompt(), prompt);
 
-        // the engine's stream state parses the reference's captured output
+        // the session parses the reference's captured output
         let raw = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tokyo\", \"unit\": \"fahrenheit\"}}\n</tool_call>";
-        let mut pp = llama::chat_tools::ChatParserParams::default();
-        pp.format = llama::chat_tools::ChatFormat::PegNative;
-        pp.generation_prompt = llama::chat_tools::ChatInput::from_plain(parsed.generation_prompt.clone());
-        pp.parser = llama::peg::PegArena::default();
-        pp.parser.load(&parsed.parser).unwrap();
-        let msg = llama::chat_tools::chat_parse(&llama::chat_tools::ChatInput::from(raw), false, &pp).unwrap();
+        let mut session = parsed.session.clone();
+        let msg = session.finish(&llama::chat_tools::ChatInput::from(raw)).unwrap();
         assert_eq!(msg.tool_calls.len(), 1);
         assert_eq!(msg.tool_calls[0].name, "get_weather");
         assert_eq!(
@@ -635,14 +762,12 @@ mod tests {
 
         // a partial parse of the same text yields the same tool call once the
         // closing tag is present, and diffs stream the name/arguments
-        let partial = llama::chat_tools::chat_parse(
-            &llama::chat_tools::ChatInput::from(
+        let mut session = parsed.session;
+        let partial = session
+            .feed(&llama::chat_tools::ChatInput::from(
                 "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Tok",
-            ),
-            true,
-            &pp,
-        )
-        .unwrap();
+            ))
+            .unwrap();
         assert_eq!(partial.tool_calls.len(), 1);
         assert_eq!(partial.tool_calls[0].name, "get_weather");
     }
@@ -657,16 +782,24 @@ mod tests {
             templates: &t,
             enable_thinking: false,
             reasoning_format: ReasoningFormat::None,
+            reasoning_budget: -1,
+            reasoning_budget_message: String::new(),
         };
         let parsed = oaicompat_chat_params_parse(
+            None,
             &body(Some(weather_tools()), Some("required"), "What is the weather in Tokyo?"),
             &opt,
         )
         .unwrap();
-        assert_eq!(parsed.llama_params.at("grammar_lazy"), Some(&Json::Bool(false)));
-        assert!(!parsed.llama_params.at("grammar").unwrap().get_str().unwrap().is_empty());
-        assert_eq!(parsed.llama_params.at("grammar_triggers").unwrap().dump(), "[]");
-        assert!(parsed.grammar_needs_prefill);
+        assert!(!parsed.session.grammar_lazy());
+        assert!(!parsed.session.grammar().is_empty());
+        assert!(parsed.session.grammar_triggers().is_empty());
+        // `tool_choice: required` swaps the lazy grammar for an eager one
+        // (chat-auto-parser-generator.cpp:78-80) — applied as a prefilled
+        // tool_calls grammar through apply_chat_session
+        let mut side = llama::chat_tools::ChatSamplingSide::default();
+        parsed.session.apply_sampling(&mut side);
+        assert!(!side.grammar.is_empty());
     }
 
     /// a tools request with a plain-text (no tool call) answer: no grammar is
@@ -679,20 +812,19 @@ mod tests {
             templates: &t,
             enable_thinking: false,
             reasoning_format: ReasoningFormat::None,
+            reasoning_budget: -1,
+            reasoning_budget_message: String::new(),
         };
         let parsed = oaicompat_chat_params_parse(
+            None,
             &body(Some(weather_tools()), None, "hi"),
             &opt,
         )
         .unwrap();
-        let mut pp = llama::chat_tools::ChatParserParams::default();
-        pp.format = llama::chat_tools::ChatFormat::PegNative;
-        pp.generation_prompt = llama::chat_tools::ChatInput::from_plain(parsed.generation_prompt.clone());
-        pp.parser = llama::peg::PegArena::default();
-        pp.parser.load(&parsed.parser).unwrap();
-        let msg =
-            llama::chat_tools::chat_parse(&llama::chat_tools::ChatInput::from("Hello! How can I help?"), false, &pp)
-                .unwrap();
+        let mut session = parsed.session;
+        let msg = session
+            .finish(&llama::chat_tools::ChatInput::from("Hello! How can I help?"))
+            .unwrap();
         assert!(msg.tool_calls.is_empty());
         assert_eq!(msg.content, "Hello! How can I help?");
     }

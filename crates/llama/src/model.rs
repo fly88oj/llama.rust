@@ -49,6 +49,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ggml::tensor::{Context, TensorId};
+use ggml::GgmlPrec;
 use ggml::{Gguf, GgufType, TensorInfo, Value};
 use memmap2::Mmap;
 
@@ -655,12 +656,23 @@ pub struct PrecPolicy {
 }
 
 impl PrecPolicy {
-    /// `llama_prec_policy::apply` (llama-model.cpp:1227-1239) — the C sets
-    /// the mul_mat's src1 precision op-param (`ggml_prec_set_src`,
-    /// ggml.c — a GPU-only hint). The CPU port has no op-param slot for it;
-    /// the consult is documented at the call sites (`build_lora_mm`).
-    pub fn apply(&self, _weight: &str) -> bool {
-        false
+    /// `llama_prec_policy::apply` (llama-model.cpp:1249-1260): look the
+    /// mul_mat's weight (`res->src[0]` in the C; the port's name key) up in
+    /// `prec_src1` and, if present, write the src1-precision op-param through
+    /// [`ggml::ops::Context::prec_set_src`] (ggml.c:3317-3341 — slot 2+1=3,
+    /// the GPU W4A4 quantize-src1 hint). Absent weight → false, no write —
+    /// mirroring the C's `it == prec_src1.end()` early-out. Callers:
+    /// `build_lora_mm` / `build_lora_mm_id` (the port's
+    /// [`crate::adapter::lora_mm_s`] consult, llama-graph.cpp:1553-1555,
+    /// 1597-1599).
+    pub fn apply(&self, ctx: &mut Context, res: TensorId, weight: &str) -> bool {
+        let Some(&prec) = self.prec_src1.get(weight) else {
+            return false;
+        };
+        let Some(prec) = GgmlPrec::from_u8(prec) else {
+            return false;
+        };
+        ctx.prec_set_src(res, prec, 1)
     }
 
     /// `llama_prec_policy::load` (llama-model.cpp:1244-1281): the

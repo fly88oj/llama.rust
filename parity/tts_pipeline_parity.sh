@@ -23,8 +23,12 @@ REFBIN=${DATA_HOME}/llm/llama.cpp-next/build-rust-ref/bin
 OUT=/tmp/tts2-pipe
 cd "$ROOT"
 
-# build the probe if missing
-if [ ! -x parity/ref_tts_pipeline ] || [ parity/ref_tts_pipeline.cpp -nt parity/ref_tts_pipeline ]; then
+# build the probe if missing — or if it resolves a libllama from another
+# tree (a probe left over from a previous reference tree silently compares
+# against the WRONG library: the 2026-10-11 "+8B state" drift was exactly
+# that, a Sep-29 probe still rpath-ing the old pinned tree)
+if [ ! -x parity/ref_tts_pipeline ] || [ parity/ref_tts_pipeline.cpp -nt parity/ref_tts_pipeline ] \
+        || [ -n "$(ldd parity/ref_tts_pipeline 2>/dev/null | grep libllama | grep -v "$REFBIN")" ]; then
     # explicit .so paths: this box's ld mis-resolves the -l names
     # (libllama/libggml's double-l) — the files themselves link fine
     g++ -O2 -std=c++17 -o parity/ref_tts_pipeline parity/ref_tts_pipeline.cpp \

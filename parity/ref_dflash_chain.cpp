@@ -142,12 +142,12 @@ int main(int argc, char ** argv) {
     const llama_seq_id seq_id = 0;
 
     {
-        llama_batch batch_prompt = llama_batch_init(inp.size(), 0, 1);
+        common_batch batch_prompt(ctx_tgt);
         for (size_t i = 0; i < inp.size() - 1; ++i) {
-            common_batch_add(batch_prompt, inp[i], i, { seq_id }, false);
+            batch_prompt.add(inp[i], (llama_pos) i, seq_id, false);
         }
 
-        if (llama_decode(ctx_tgt, batch_prompt) != 0) {
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_prompt.get()) != 0) {
             fprintf(stderr, "failed to decode prompt\n");
             return 1;
         }
@@ -156,7 +156,6 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "failed to process speculative prompt\n");
             return 1;
         }
-        llama_batch_free(batch_prompt);
     }
 
     if (g_dump_first) {
@@ -190,13 +189,13 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "dump: n_past %d draft pos_max %d\n",
                 n_past0,
                 (int) llama_memory_seq_pos_max(llama_get_memory(params.speculative.draft.ctx_dft), seq_id));
-        const llama_token mask_id = llama_vocab_mask(llama_model_get_vocab(llama_get_model(params.speculative.draft.ctx_dft)));
-        llama_batch batch_dft = llama_batch_init(4, 0, 1);
-        common_batch_add(batch_dft, inp[inp.size() - 1], n_past0 + 0, { seq_id }, true);
-        common_batch_add(batch_dft, mask_id, n_past0 + 1, { seq_id }, true);
-        common_batch_add(batch_dft, mask_id, n_past0 + 2, { seq_id }, true);
-        common_batch_add(batch_dft, mask_id, n_past0 + 3, { seq_id }, true);
-        if (llama_decode(params.speculative.draft.ctx_dft, batch_dft) != 0) {
+        llama_token mask_id = llama_vocab_mask(llama_model_get_vocab(llama_get_model(params.speculative.draft.ctx_dft)));
+        common_batch batch_dft(params.speculative.draft.ctx_dft);
+        batch_dft.add(inp[inp.size() - 1], n_past0 + 0, seq_id, true);
+        batch_dft.add(mask_id, n_past0 + 1, seq_id, true);
+        batch_dft.add(mask_id, n_past0 + 2, seq_id, true);
+        batch_dft.add(mask_id, n_past0 + 3, seq_id, true);
+        if (llama_process(params.speculative.draft.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch_dft.get()) != 0) {
             fprintf(stderr, "noise decode failed\n");
             return 1;
         }
@@ -231,7 +230,6 @@ int main(int argc, char ** argv) {
                 }
             }
         }
-        llama_batch_free(batch_dft);
         printf("dumped\n");
         return 0;
     }
@@ -244,7 +242,7 @@ int main(int argc, char ** argv) {
 
     common_speculative_begin(spec, seq_id, prompt_tgt);
 
-    llama_batch batch_tgt = llama_batch_init(inp.size(), 0, 1);
+    common_batch batch_tgt(ctx_tgt);
 
     std::vector<llama_token> draft;
 
@@ -275,15 +273,15 @@ int main(int argc, char ** argv) {
             llama_memory_seq_rm(llama_get_memory(params.speculative.draft.ctx_dft), seq_id, n_past, -1);
         }
 
-        common_batch_clear(batch_tgt);
-        common_batch_add(batch_tgt, id_last, n_past, { seq_id }, true);
+        batch_tgt.clear();
+        batch_tgt.add(id_last, n_past, seq_id, true);
         n_past++;
 
         for (size_t i = 0; i < draft.size(); ++i) {
-            common_batch_add(batch_tgt, draft[i], n_past + i, { seq_id }, true);
+            batch_tgt.add(draft[i], n_past + i, seq_id, true);
         }
 
-        if (llama_decode(ctx_tgt, batch_tgt) != 0) {
+        if (llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get()) != 0) {
             fprintf(stderr, "failed to decode target batch\n");
             return 1;
         }

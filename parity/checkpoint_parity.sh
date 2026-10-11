@@ -137,12 +137,77 @@ n_full=$pn_r
 
 read pn_r ct_r <<< "$(post_case $PORT_REF B)"
 read pn_p ct_p <<< "$(post_case $PORT_RUST B)"
-# only the ending (below the second USER: boundary) is processed — the
-# checkpoint rollback reused the base
-[ "$pn_r" -lt 40 ] && [ "$pn_p" -lt 40 ]; check $? "turn B: checkpoint reuse, only the ending processed (ref $pn_r / port $pn_p vs n_full $n_full)"
+# 8b5436102 removed the body `message_delimiters` path: server-context.cpp's
+# `common_chat_msg_delimiters_parse(json_value(data, "message_delimiters"))`
+# is gone (server-context.cpp:4813-4819 pre-refactor) and the plain
+# /completion flow passes a default `common_chat_session` whose
+# `has_template()` is false, so `server_task::apply_chat_session`
+# (server-task.h:261-271) sets no message_spans — turn B now re-processes the
+# whole prompt on both sides (verified against the aa94f2086 reference). The
+# rollback itself moved to the chat path, covered by phase 1b below.
+[ "$pn_r" = "$n_full" ] && [ "$pn_p" = "$n_full" ]; check $? "turn B: body delimiters no longer reach the task, full re-process (ref $pn_r / port $pn_p vs n_full $n_full)"
 [ "$pn_r" = "$pn_p" ]; check $? "turn B: prompt_n equal (ref $pn_r / port $pn_p)"
-[ "$ct_r" = "$ct_p" ]; check $? "turn B: content equal (the rolled-back continuation)"
+[ "$ct_r" = "$ct_p" ]; check $? "turn B: content equal"
 n_live=$pn_r
+stop_servers
+
+# ---- phase 1b: the rollback through the chat session -----------------------
+# after 8b5436102 the user-message spans come from
+# `task.apply_chat_session(chat_session)` — the session's delimiters are the
+# autoparser's `<|im_start|>user` for a ChatML template, so a second
+# /v1/chat/completions request sharing the base prefix reuses the checkpoint
+# and only processes the changed ending.
+echo "== phase 1b: checkpoint rollback via /v1/chat/completions =="
+CHAT_MODEL="${CHAT_MODEL:-${DATA_HOME}/localai/models/qwen2.5-0.5b-instruct-q4_k_m.gguf}"
+start_chat_servers() {
+    parity/limited.sh -- "$REF" -m "$CHAT_MODEL" -c 512 -t 4 --port $PORT_REF --host 127.0.0.1 \
+        --checkpoint-min-step 0 >"$OUT/ref-chat.log" 2>&1 &
+    REF_PID=$!
+    parity/limited.sh -- "$PORT_BIN" -m "$CHAT_MODEL" -c 512 -t 4 --port $PORT_RUST --host 127.0.0.1 \
+        --checkpoint-min-step 0 >"$OUT/port-chat.log" 2>&1 &
+    RUST_PID=$!
+    for i in $(seq 1 90); do
+        ok1=$(curl -s --max-time 2 "http://127.0.0.1:$PORT_REF/health" | grep -c '"ok"' || true)
+        ok2=$(curl -s --max-time 2 "http://127.0.0.1:$PORT_RUST/health" | grep -c '"ok"' || true)
+        [ "$ok1" = "1" ] && [ "$ok2" = "1" ] && return 0
+        sleep 1
+    done
+    echo "chat servers did not come up"; return 1
+}
+post_chat() { # <port> <case> -> "prompt_n"
+    local port="$1" case="$2"
+    python3 - "$port" "$case" "$OUT/chat-$port-$case.json" <<'EOF'
+import json, sys, urllib.request
+port, case, out = sys.argv[1], sys.argv[2], sys.argv[3]
+base = "Once upon a time there was a little robot who lived in a big city. " * 12
+end = {"A": "finish this story with a happy ending.",
+       "B": "finish this story with a sad ending."}[case]
+body = {"messages": [{"role": "user", "content": base + end}], "id_slot": 1,
+        "cache_prompt": True, "temperature": 0.0, "top_k": 1, "n_predict": 8,
+        "verbose": True}
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                             json.dumps(body).encode(),
+                             {"Content-Type": "application/json"})
+d = json.load(urllib.request.urlopen(req, timeout=120))
+json.dump(d, open(out, "w"))
+print(d["timings"]["prompt_n"], d["choices"][0]["message"].get("content", ""))
+EOF
+}
+start_chat_servers || { FAIL=1; exit 1; }
+read pn_r ct_r <<< "$(post_chat $PORT_REF A)"
+read pn_p ct_p <<< "$(post_chat $PORT_RUST A)"
+[ -n "$pn_r" ] && [ "$pn_r" = "$pn_p" ] && [ "$pn_r" -gt 100 ]; check $? "chat turn A: full process, prompt_n equal (ref $pn_r / port $pn_p)"
+read pn_r ct_r <<< "$(post_chat $PORT_REF B)"
+read pn_p ct_p <<< "$(post_chat $PORT_RUST B)"
+# only the changed ending is processed — the checkpoint at the template's
+# user boundary was reused through the chat session's message delimiters
+[ "$pn_r" -lt 40 ] && [ "$pn_p" -lt 40 ]; check $? "chat turn B: session-delimiters checkpoint reuse (ref $pn_r / port $pn_p)"
+[ "$pn_r" = "$pn_p" ]; check $? "chat turn B: prompt_n equal (ref $pn_r / port $pn_p)"
+[ "$ct_r" = "$ct_p" ]; check $? "chat turn B: content equal"
+stop_servers
+
+# phase 2+ continue on the synthetic model
+start_servers --checkpoint-min-step 0 || { FAIL=1; exit 1; }
 
 # ---- phase 2: the save/restore round trip of the checkpoints ---------------
 # (test_slot_restore_preserves_context_checkpoints's tail)

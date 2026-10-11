@@ -227,11 +227,19 @@ impl Json {
 
     /// `common_json::parse(text)` — nlohmann `ordered_json::parse`. The error text
     /// is not nlohmann's, the accepted/rejected inputs are.
+    ///
+    /// nlohmann builds the DOM iteratively (the SAX DOM handler keeps an
+    /// explicit `m_ref_stack`, json.hpp:8900+), so a deeply nested body must
+    /// parse without recursion — the vendor deep-nesting patch
+    /// (10a60cf30) exists because the *recursive* copy/dump/compare crashed.
+    /// The port's parser therefore drives an explicit frame stack instead of
+    /// recursing through `value()` (the pre-10a60cf30 recursion aborted the
+    /// process on ~50k-deep input where the reference answers normally).
     pub fn parse(text: &str) -> Result<Json, String> {
         let bytes = text.as_bytes();
         let mut p = Parser { s: bytes, i: 0 };
         p.skip_ws();
-        let v = p.value()?;
+        let v = p.value_iter()?;
         p.skip_ws();
         if p.i != bytes.len() {
             return Err(format!(
@@ -254,36 +262,75 @@ impl Json {
         out
     }
 
+    /// The dump walks an explicit frame stack instead of recursing — the
+    /// vendor deep-nesting patch (10a60cf30) bounds nlohmann's recursive
+    /// serializer by handing over to an iterative writer at depth 128
+    /// (json.hpp `dump_depth_limit`), so a deeply nested value must dump
+    /// without overflow here too. The byte output is identical to the
+    /// recursive form.
     fn dump_into(&self, out: &mut String) {
-        match self {
-            Json::Null => out.push_str("null"),
-            Json::Bool(true) => out.push_str("true"),
-            Json::Bool(false) => out.push_str("false"),
-            Json::Int(v) => out.push_str(&v.to_string()),
-            Json::Uint(v) => out.push_str(&v.to_string()),
-            Json::Double(v) => out.push_str(&dump_float(*v)),
-            Json::String(s) => dump_string_into(s, out),
-            Json::Array(v) => {
-                out.push('[');
-                for (i, item) in v.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
+        /// a value to emit, an open container's remaining children, or a
+        /// pending closing bracket
+        enum Frame<'a> {
+            Val(&'a Json),
+            Arr(std::slice::Iter<'a, Json>, bool),
+            Obj(std::slice::Iter<'a, (String, Json)>, bool),
+            Close(char),
+        }
+        let mut stack: Vec<Frame> = vec![Frame::Val(self)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Val(v) => match v {
+                    Json::Null => out.push_str("null"),
+                    Json::Bool(true) => out.push_str("true"),
+                    Json::Bool(false) => out.push_str("false"),
+                    Json::Int(n) => out.push_str(&n.to_string()),
+                    Json::Uint(n) => out.push_str(&n.to_string()),
+                    Json::Double(n) => out.push_str(&dump_float(*n)),
+                    Json::String(s) => dump_string_into(s, out),
+                    Json::Array(items) => {
+                        out.push('[');
+                        if items.is_empty() {
+                            out.push(']');
+                        } else {
+                            // the Close sits beneath the children frame so it
+                            // emits once the children are exhausted
+                            stack.push(Frame::Close(']'));
+                            stack.push(Frame::Arr(items.iter(), true));
+                        }
                     }
-                    item.dump_into(out);
-                }
-                out.push(']');
-            }
-            Json::Object(v) => {
-                out.push('{');
-                for (i, (k, item)) in v.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
+                    Json::Object(items) => {
+                        out.push('{');
+                        if items.is_empty() {
+                            out.push('}');
+                        } else {
+                            stack.push(Frame::Close('}'));
+                            stack.push(Frame::Obj(items.iter(), true));
+                        }
                     }
-                    dump_string_into(k, out);
-                    out.push(':');
-                    item.dump_into(out);
+                },
+                // `bool` = no ',' before this child (it is the first)
+                Frame::Arr(mut iter, first) => {
+                    if let Some(item) = iter.next() {
+                        if !first {
+                            out.push(',');
+                        }
+                        stack.push(Frame::Arr(iter, false));
+                        stack.push(Frame::Val(item));
+                    }
                 }
-                out.push('}');
+                Frame::Obj(mut iter, first) => {
+                    if let Some((k, item)) = iter.next() {
+                        if !first {
+                            out.push(',');
+                        }
+                        dump_string_into(k, out);
+                        out.push(':');
+                        stack.push(Frame::Obj(iter, false));
+                        stack.push(Frame::Val(item));
+                    }
+                }
+                Frame::Close(c) => out.push(c),
             }
         }
     }
@@ -420,20 +467,123 @@ impl<'a> Parser<'a> {
         )
     }
 
-    fn value(&mut self) -> Result<Json, String> {
-        let c = *self
-            .s
-            .get(self.i)
-            .ok_or_else(|| self.err("unexpected end of input"))?;
-        match c {
-            b'{' => self.object(),
-            b'[' => self.array(),
-            b'"' => Ok(Json::String(self.string()?)),
-            b't' => self.literal("true", Json::Bool(true)),
-            b'f' => self.literal("false", Json::Bool(false)),
-            b'n' => self.literal("null", Json::Null),
-            b'-' | b'0'..=b'9' => self.number(),
-            _ => Err(self.err("unexpected character")),
+    /// One parse pass over `self.s`, driven by an explicit container stack
+    /// (`m_ref_stack`, json.hpp:8900+) instead of mutual recursion. The
+    /// container-close / element paths reproduce `array()`/`object()`'s
+    /// original byte positions and error messages exactly.
+    fn value_iter(&mut self) -> Result<Json, String> {
+        /// an open container: the accumulated items; an object also carries
+        /// the key of the member currently being parsed (parsed before its
+        /// value, consumed when the value completes — it must survive the
+        /// descent into nested containers, so it lives on the frame)
+        enum Frame {
+            Array(Vec<Json>),
+            Object(Vec<(String, Json)>, Option<String>),
+        }
+        let mut stack: Vec<Frame> = Vec::new();
+
+        'next: loop {
+            // an object member starts with `"key":` (object()'s key/colon)
+            if let Some(Frame::Object(_, key_slot)) = stack.last_mut() {
+                self.skip_ws();
+                if self.s.get(self.i) != Some(&b'"') {
+                    return Err(self.err("object key must be a string"));
+                }
+                let key = self.string()?;
+                self.skip_ws();
+                if self.s.get(self.i) != Some(&b':') {
+                    return Err(self.err("expected ':'"));
+                }
+                self.i += 1;
+                *key_slot = Some(key);
+            }
+
+            // parse one value: leaves directly, containers push a frame
+            self.skip_ws();
+            let c = *self
+                .s
+                .get(self.i)
+                .ok_or_else(|| self.err("unexpected end of input"))?;
+            let mut current: Json = match c {
+                b'[' => {
+                    self.i += 1; // '['
+                    self.skip_ws();
+                    if self.s.get(self.i) == Some(&b']') {
+                        self.i += 1;
+                        Json::Array(Vec::new())
+                    } else {
+                        stack.push(Frame::Array(Vec::new()));
+                        continue 'next;
+                    }
+                }
+                b'{' => {
+                    self.i += 1; // '{'
+                    self.skip_ws();
+                    if self.s.get(self.i) == Some(&b'}') {
+                        self.i += 1;
+                        Json::Object(Vec::new())
+                    } else {
+                        stack.push(Frame::Object(Vec::new(), None));
+                        continue 'next;
+                    }
+                }
+                b'"' => Json::String(self.string()?),
+                b't' => self.literal("true", Json::Bool(true))?,
+                b'f' => self.literal("false", Json::Bool(false))?,
+                b'n' => self.literal("null", Json::Null)?,
+                b'-' | b'0'..=b'9' => self.number()?,
+                _ => return Err(self.err("unexpected character")),
+            };
+
+            // attach the completed value to its parent, closing containers
+            // as their terminators appear
+            loop {
+                let Some(frame) = stack.last_mut() else { return Ok(current); };
+                let closed = match frame {
+                    Frame::Array(items) => {
+                        items.push(current);
+                        self.skip_ws();
+                        match self.s.get(self.i) {
+                            Some(b',') => {
+                                self.i += 1;
+                                continue 'next;
+                            }
+                            Some(b']') => {
+                                self.i += 1;
+                                true
+                            }
+                            _ => return Err(self.err("expected ',' or ']'")),
+                        }
+                    }
+                    Frame::Object(items, key_slot) => {
+                        // duplicate keys keep the first position with the new
+                        // value (nlohmann `object[key] = value`)
+                        let key = key_slot.take().expect("object member key");
+                        match items.iter_mut().find(|(k, _)| *k == key) {
+                            Some(entry) => entry.1 = current,
+                            None => items.push((key, current)),
+                        }
+                        self.skip_ws();
+                        match self.s.get(self.i) {
+                            Some(b',') => {
+                                self.i += 1;
+                                continue 'next;
+                            }
+                            Some(b'}') => {
+                                self.i += 1;
+                                true
+                            }
+                            _ => return Err(self.err("expected ',' or '}'")),
+                        }
+                    }
+                };
+                // the container closed: pop it and feed it to the grandparent
+                debug_assert!(closed);
+                current = match stack.pop().expect("frame exists") {
+                    Frame::Array(items) => Json::Array(items),
+                    Frame::Object(items, _) => Json::Object(items),
+                };
+            }
         }
     }
 
@@ -443,68 +593,6 @@ impl<'a> Parser<'a> {
             Ok(value)
         } else {
             Err(self.err("invalid literal"))
-        }
-    }
-
-    fn array(&mut self) -> Result<Json, String> {
-        self.i += 1; // '['
-        let mut out = Vec::new();
-        self.skip_ws();
-        if self.s.get(self.i) == Some(&b']') {
-            self.i += 1;
-            return Ok(Json::Array(out));
-        }
-        loop {
-            self.skip_ws();
-            out.push(self.value()?);
-            self.skip_ws();
-            match self.s.get(self.i) {
-                Some(b',') => self.i += 1,
-                Some(b']') => {
-                    self.i += 1;
-                    return Ok(Json::Array(out));
-                }
-                _ => return Err(self.err("expected ',' or ']'")),
-            }
-        }
-    }
-
-    fn object(&mut self) -> Result<Json, String> {
-        self.i += 1; // '{'
-        let mut out: Vec<(String, Json)> = Vec::new();
-        self.skip_ws();
-        if self.s.get(self.i) == Some(&b'}') {
-            self.i += 1;
-            return Ok(Json::Object(out));
-        }
-        loop {
-            self.skip_ws();
-            if self.s.get(self.i) != Some(&b'"') {
-                return Err(self.err("object key must be a string"));
-            }
-            let key = self.string()?;
-            self.skip_ws();
-            if self.s.get(self.i) != Some(&b':') {
-                return Err(self.err("expected ':'"));
-            }
-            self.i += 1;
-            self.skip_ws();
-            let value = self.value()?;
-            // duplicate keys keep the first position with the new value
-            // (nlohmann `object[key] = value`)
-            match out.iter_mut().find(|(k, _)| *k == key) {
-                Some(entry) => entry.1 = value,
-                None => out.push((key, value)),
-            }
-            self.skip_ws();
-            match self.s.get(self.i) {
-                Some(b',') => self.i += 1,
-                Some(b'}') => {
-                    self.i += 1;
-                    return Ok(Json::Object(out));
-                }
-                _ => return Err(self.err("expected ',' or '}'")),
-            }
         }
     }
 

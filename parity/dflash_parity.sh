@@ -91,11 +91,16 @@ TGT=/tmp/arch-dflash/llama-synth-dflash-tgt.gguf
 # speculative.cpp:1304; i for DSpark, :1284).
 CHAIN=$(dirname "$0")/../target/release/ref_dflash_chain
 if [ ! -x "$CHAIN" ]; then
+    # includes from the tree REF points at (llama.cpp-next) — the probe reads
+    # the internal src/ headers (llama-context.h, speculative.h) and common/,
+    # and must match the libllama/libllama-common it runs against
     g++ -O2 -std=c++17 "$(dirname "$0")/ref_dflash_chain.cpp" -o "$CHAIN" \
-        -I ${DATA_HOME}/llm/llama.cpp-pinned/include \
-        -I ${DATA_HOME}/llm/llama.cpp-pinned/ggml/include \
-        -I ${DATA_HOME}/llm/llama.cpp-pinned/common \
-        -L $REF -lllama -lllama-common -Wl,-rpath,$REF || {
+        -I${DATA_HOME}/llm/llama.cpp-next/include \
+        -I${DATA_HOME}/llm/llama.cpp-next/ggml/include \
+        -I${DATA_HOME}/llm/llama.cpp-next/common \
+        -I${DATA_HOME}/llm/llama.cpp-next/src \
+        -L${DATA_HOME}/llm/llama.cpp-next/build-rust-ref/bin -lllama-common -lllama \
+        -Wl,-rpath,${DATA_HOME}/llm/llama.cpp-next/build-rust-ref/bin || {
         echo "CHAIN PROBE BUILD FAILED" | tee -a $OUT/errors; fail=1; }
 fi
 if [ -x "$CHAIN" ]; then

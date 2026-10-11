@@ -2101,7 +2101,9 @@ pub fn llm_arch_supports_sm_tensor(arch: LlmArch) -> bool {
             | LlmArch::KIMI_K3
             | LlmArch::GLM5_NEXT
             | LlmArch::QWEN3TTS
-            | LlmArch::K2_HORIZON
+            // K2_HORIZON removed by e60eff95f ("archs : re-enable sm tensor
+            // for K2 Horizon", llama-arch.cpp:1234-1237) together with the
+            // meta-backend host-view fix
     )
 }
 

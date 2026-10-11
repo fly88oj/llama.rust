@@ -129,10 +129,13 @@ pub enum LlmFfnOpType {
     RELU_SQR = 4,
     SWIGLU = 5,
     GEGLU = 6,
-    REGLU = 7,
-    SWIGLU_OAI_MOE = 8,
+    /// exact (erf) GELU gate — 6184e92c5 inserted the enum entry after
+    /// LLM_FFN_GEGLU (llama-graph.h:65), renumbering REGLU..SITU
+    GEGLU_ERF = 7,
+    REGLU = 8,
+    SWIGLU_OAI_MOE = 9,
     /// kimi-k3
-    SITU = 9,
+    SITU = 10,
 }
 
 /// `LLM_CLS_ACT_TYPES_FROM_STRING` (37ac63456, llama-model.cpp:1081-1086) —

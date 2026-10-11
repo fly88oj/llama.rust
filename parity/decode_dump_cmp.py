@@ -14,6 +14,17 @@ token's vector, so the output maps 1:1 onto the per-token embedding rows of
 parity/embd_rows_probe.sh.
 
 usage: python3 parity/decode_dump_cmp.py <ref.bin> <port.bin> [--max-report N]
+                      [--no-names] [--drop-ref-idx i,j,k]
+
+--no-names: align by (op class, type, shape) only — for port graphs whose
+  builders do not mirror the C cb() names. Unary ops are merged into one
+  UNARY class because the port's op_desc renders sigmoid/softplus/silu all
+  as SILU (Silu+params); SWIGLU (ref's fused FFN op) stays its own class so
+  it never pairs against the port's expanded SILU+MUL.
+--drop-ref-idx: comma-separated ref node indices to drop before alignment
+  (the reference's ggml_build_forward_select keeps dead build_inp_embd
+  branches in the graph; their dump slots read as zeros — see
+  parity/glm5_parity.sh's comparator note).
 """
 import difflib
 import struct
@@ -33,6 +44,18 @@ def opclass(op):
     if op in ("CPY", "CONT", "DUP"):
         return "CPY"
     return op
+
+
+UNARY_OPS = {"SIGMOID", "SOFTPLUS", "SILU", "GELU", "GELU_ERF", "EXP", "LOG", "TANH", "RELU"}
+
+
+def opclass_nonames(op):
+    # --no-names mode: unary variants merge (the port renders all unaries as
+    # SILU); SWIGLU keeps its own class (the port expands it to SILU+MUL)
+    c = opclass(op)
+    if c in UNARY_OPS:
+        return "UNARY"
+    return c
 
 
 def parse(path):
@@ -69,6 +92,10 @@ def key(nd):
     if name.startswith("node_") and name[5:].isdigit():
         name = ""
     return (name, opclass(nd["op"]), nd["ty"], nd["ne"])
+
+
+def key_nonames(nd):
+    return (opclass_nonames(nd["op"]), nd["ty"], nd["ne"])
 
 
 def row_stats(a, b, ne, tok_dim):
@@ -109,14 +136,26 @@ def main():
     max_report = 10
     if "--max-report" in sys.argv:
         max_report = int(sys.argv[sys.argv.index("--max-report") + 1])
+    no_names = "--no-names" in sys.argv
+    drop_ref = []
+    if "--drop-ref-idx" in sys.argv:
+        drop_ref = [
+            int(x)
+            for x in sys.argv[sys.argv.index("--drop-ref-idx") + 1].split(",")
+            if x.strip()
+        ]
     rt, rn = parse(ref_path)
     pt, pn = parse(port_path)
+    for i in sorted(drop_ref, reverse=True):
+        print(f"[dropped] ref[{i}] {rn[i]['op']} {rn[i]['name']!r} ne={rn[i]['ne']}")
+        del rn[i]
     print(f"ref : {len(rn)} nodes, tokens {rt}")
     print(f"port: {len(pn)} nodes, tokens {pt}")
     assert rt == pt, "token streams differ — dumps are not comparable"
     n_tokens = len(rt)
 
-    sm = difflib.SequenceMatcher(a=[key(x) for x in rn], b=[key(x) for x in pn], autojunk=False)
+    kf = key_nonames if no_names else key
+    sm = difflib.SequenceMatcher(a=[kf(x) for x in rn], b=[kf(x) for x in pn], autojunk=False)
     n_cmp = 0
     n_div = 0
     reported = 0

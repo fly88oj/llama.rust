@@ -79,6 +79,9 @@ int main(int argc, char ** argv) {
         inputs.tool_choice            = common_chat_tool_choice_parse_oaicompat(cj.value("tool_choice", "auto"));
         inputs.parallel_tool_calls    = cj.value("parallel_tool_calls", false);
         inputs.add_generation_prompt  = cj.value("add_generation_prompt", true);
+        if (cj.contains("continue_final_message")) {
+            inputs.continue_final_message = common_chat_continuation_parse(cj.at("continue_final_message"));
+        }
         inputs.reasoning_format       = common_reasoning_format_from_name(cj.value("reasoning_format", "none"));
         inputs.json_schema            = cj.value("json_schema", std::string());
         inputs.enable_thinking        = cj.value("enable_thinking", true);
@@ -107,30 +110,33 @@ int main(int argc, char ** argv) {
             result["grammar_triggers"] = triggers;
             result["preserved_tokens"] = params.preserved_tokens;
             result["additional_stops"] = params.additional_stops;
-            result["parser"]           = params.parser;
-            {
-                // canonical structural dump: allocation ids in the serialized
-                // arena depend on the C++ evaluation order; the dump from the
-                // root is deterministic and graph-structural
-                common_peg_arena arena;
-                arena.load(params.parser);
-                result["parser_dump"] = arena.dump(arena.root());
-            }
+            // 8b5436102: `params.parser` is the built arena itself (the JSON
+            // serialization layer is gone); the canonical structural dump —
+            // allocation ids in the arena depend on the C++ evaluation order;
+            // the dump from the root is deterministic and graph-structural
+            result["parser_dump"] = params.parser.dump(params.parser.root());
             result["supports_thinking"] = params.supports_thinking;
             result["thinking_start_tag"] = params.thinking_start_tag;
             result["thinking_end_tags"]  = params.thinking_end_tags;
-            result["message_delimiters"] = params.message_delimiters.to_json();
+            {
+                // common_chat_msg_delimiters::to_json() was removed with
+                // 8b5436102; serialize the (role, delimiter) pairs by hand
+                json delims = json::array();
+                for (const auto & d : params.message_delimiters.delimiters) {
+                    delims.push_back({{"role", common_chat_role_to_string(d.role)},
+                                      {"delimiter", d.delimiter}});
+                }
+                result["message_delimiters"] = delims;
+            }
             result["ok"] = true;
 
             if (cj.contains("parse_input")) {
+                // the ctor does not carry the arena (chat.h:325-331); the
+                // parse takes it separately, like tests/test-chat.cpp:4637-4640
                 common_chat_parser_params parse_params(params);
-                // the server loads the serialized arena into the parse params
-                // before parsing (see server-context.cpp chat slot handling)
-                common_peg_arena arena;
-                arena.load(params.parser);
-                parse_params.parser = arena;
-                common_chat_msg msg = common_chat_parse(common_chat_input(cj.at("parse_input").get<std::string>()),
-                                                        cj.value("parse_partial", false), parse_params);
+                common_chat_msg msg = common_chat_peg_parse(params.parser,
+                                                            common_chat_input(cj.at("parse_input").get<std::string>()),
+                                                            cj.value("parse_partial", false), parse_params);
                 result["parse"] = common_chat_msgs_to_json_oaicompat({msg}).at(0);
             }
         } catch (const std::exception & e) {

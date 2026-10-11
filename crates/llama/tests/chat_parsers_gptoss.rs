@@ -89,7 +89,7 @@ fn gpt_oss_server_split_matches_reference() {
     );
     assert!(params.generation_prompt.contains("assistant"));
 
-    let mut pparams = ChatParserParams::from_chat_params(&params).unwrap();
+    let mut pparams = ChatParserParams::from_chat_params(&params);
     pparams.generation_prompt = ChatInput::from_plain(gen_prompt);
     let msg = chat_parse(&llama::chat_tools::ChatInput::from(raw_text.as_str()), false, &pparams)
         .unwrap_or_else(|e| panic!("port parse failed: {e}\nraw: {raw_text:?}"));

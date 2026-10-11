@@ -14,6 +14,12 @@
  * (the same format the port's tests/tts_gen_e2e.rs writes — compared by
  * parity/tts_parity.sh).
  *
+ * --nodes <file>: additionally stream EVERY graph node of the main
+ * clip_encode in the DECDMP1 format of parity/ref_decode_dump.c (cb_eval on
+ * the clip sched, clip.cpp:224-225) — node-level bisection of the genwav
+ * divergence via parity/decode_dump_cmp.py --no-names. The warmup GEN_CODE
+ * call is excluded (a global active flag).
+ *
  * Build:
  *   g++ -O2 -std=c++17 -o parity/ref_gen_audio_dump parity/ref_gen_audio_dump.cpp \
  *     -I$LLAMA_RUST_DATA_HOME/llm/llama.cpp-pinned/tools/mtmd \
@@ -34,6 +40,8 @@
 #include "clip-impl.h"
 #include "clip.h"
 
+#include "ggml.h"
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +49,67 @@
 #include <vector>
 
 static void put_u32(FILE * f, uint32_t v) { fwrite(&v, 4, 1, f); }
+
+// ---- the DECDMP1 node stream (see parity/ref_decode_dump.c) ----
+static FILE * g_nodes = nullptr;
+static int    g_nnodes = 0;
+static int    g_active = 0;
+#define NODE_ELEM_CAP (1ull << 19)
+
+static void node_put_str(const char * s) {
+    const size_t len = strlen(s);
+    fputc(len > 255 ? 255 : (int) len, g_nodes);
+    fwrite(s, 1, len > 255 ? 255 : len, g_nodes);
+}
+
+static bool node_cb(struct ggml_tensor * t, bool ask, void * ud) {
+    (void) ud;
+    if (!g_active || !g_nodes) {
+        return true;
+    }
+    if (ask) {
+        return true;
+    }
+    const int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+    int64_t n = 1;
+    for (int d = 0; d < 4; d++) {
+        n *= ne[d];
+    }
+    g_nnodes++;
+    node_put_str(ggml_op_desc(t));
+    node_put_str(t->name ? t->name : "");
+    node_put_str(ggml_type_name(t->type));
+    fwrite(ne, sizeof(int64_t), 4, g_nodes);
+    uint64_t nu = (uint64_t) n;
+    fwrite(&nu, sizeof(uint64_t), 1, g_nodes);
+    if ((t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) && (uint64_t) n < NODE_ELEM_CAP) {
+        for (int64_t flat = 0; flat < n; flat++) {
+            int64_t rem = flat;
+            size_t  off = 0;
+            for (int d = 0; d < 4; d++) {
+                const int64_t idx = rem % ne[d];
+                rem /= ne[d];
+                off += (size_t) idx * t->nb[d];
+            }
+            const char * p = (const char *) t->data + off;
+            float v;
+            if (t->type == GGML_TYPE_F32) {
+                memcpy(&v, p, sizeof(float));
+            } else {
+                ggml_fp16_t h;
+                memcpy(&h, p, sizeof(h));
+                v = ggml_fp16_to_fp32(h);
+            }
+            fwrite(&v, sizeof(float), 1, g_nodes);
+        }
+    } else if ((uint64_t) n < NODE_ELEM_CAP) {
+        float v = 0.0f;
+        for (int64_t i = 0; i < n; i++) {
+            fwrite(&v, sizeof(float), 1, g_nodes);
+        }
+    }
+    return true;
+}
 
 template <typename T>
 static std::vector<T> read_blob(const char * path) {
@@ -67,11 +136,35 @@ int main(int argc, char ** argv) {
     const uint32_t seed = (uint32_t) strtoul(argv[5], nullptr, 10);
     int n_threads = argc > 10 ? atoi(argv[10]) : 4;
 
+    // --nodes <file> (anywhere after the mode args): stream the main
+    // clip_encode's graph nodes
+    const char * nodes_path = nullptr;
+    for (int i = 6; i < argc; i++) {
+        if (!strcmp(argv[i], "--nodes") && i + 1 < argc) {
+            nodes_path = argv[i + 1];
+        }
+    }
+
     clip_context_params params;
     memset(&params, 0, sizeof(params));
     params.flash_attn_type = CLIP_FLASH_ATTN_TYPE_DISABLED;
     params.warmup = false;
     params.use_gpu = false;
+    if (nodes_path) {
+        g_nodes = fopen(nodes_path, "wb");
+        if (!g_nodes) { perror("nodes fopen"); return 1; }
+        fwrite("DECDMP1\0", 1, 8, g_nodes);
+        // n_tokens header: no token stream here — write 1 dummy (the
+        // comparator asserts equality of both sides' streams)
+        uint32_t one = 1;
+        fwrite(&one, 4, 1, g_nodes);
+        int32_t dummy_tok = 0;
+        fwrite(&dummy_tok, 4, 1, g_nodes);
+        uint32_t nodes_zero = 0;
+        fwrite(&nodes_zero, 4, 1, g_nodes); // patched after the run
+        params.cb_eval = node_cb;
+        params.cb_eval_user_data = nullptr;
+    }
 
     clip_init_result res = clip_init(mmproj, params);
     if (res.ctx_gen_a == nullptr) {
@@ -248,10 +341,12 @@ int main(int argc, char ** argv) {
             p.state_in = &state;
         }
 
+        g_active = 1; // the --nodes stream covers the main encode only
         if (!clip_encode(ctx, &p)) {
             fprintf(stderr, "clip_encode failed (gen_wav)\n");
             return 1;
         }
+        g_active = 0;
 
         put_u32(out, 0); // no codes in gen_wav
         put_u32(out, 0); // no embd
@@ -268,5 +363,15 @@ int main(int argc, char ** argv) {
 
     clip_free(ctx);
     fclose(out);
+    if (g_nodes) {
+        // patch the node count into the header (8 magic + 4 n_tokens + 4 tok)
+        long cur = ftell(g_nodes);
+        fseek(g_nodes, 8 + 4 + 4, SEEK_SET);
+        uint32_t nn = (uint32_t) g_nnodes;
+        fwrite(&nn, 4, 1, g_nodes);
+        fseek(g_nodes, cur, SEEK_SET);
+        fclose(g_nodes);
+        fprintf(stderr, "nodes: %d -> %s\n", g_nnodes, "the --nodes file");
+    }
     return 0;
 }

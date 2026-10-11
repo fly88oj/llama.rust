@@ -252,6 +252,16 @@ pub struct MtmdContext {
     /// the C's LLAMA_TOKEN_NULL (-1) sentinel, like `lookup_token`.
     pub tok_sli_img_end: Vec<i32>,
     pub tok_ov_img_end: Vec<i32>,
+    /// mtmd.cpp:518-521 — the token before the overview thumbnail
+    /// (lfm2's <|img_thumbnail|>, mtmd.cpp:870)
+    pub tok_ov_img_start: Vec<i32>,
+    /// mtmd.cpp:519 `sli_img_start_tmpl` — the printf template preceding
+    /// each slice (lfm2's "<|img_row_%d_col_%d|>", mtmd.cpp:869). Empty ==
+    /// no per-slice lead-in.
+    pub sli_img_start_tmpl: String,
+    /// mtmd.cpp:522 `ov_img_first` — thumbnail before the slices (llava-uhd)
+    /// or after (cohere2v/lfm2, both false)
+    pub ov_img_first: bool,
     out_embd: Vec<f32>,
     /// `ctx_gen_a` (mtmd.cpp:485) — the gen-audio context of a MIXED
     /// audio+gen mmproj. The primary `clip` stays the audio (speaker
@@ -278,7 +288,24 @@ impl MtmdContext {
             image_min_tokens: params.image_min_tokens,
             image_max_tokens: params.image_max_tokens,
         };
-        let clip = clip::clip_init_from_file(mmproj_fname, &clip_params)?;
+        // clip_init (clip.cpp:4065-4120) builds one clip_ctx per modality in
+        // the file (ctx_v / ctx_a); this port's MtmdContext drives ONE
+        // modality through its primary `clip`. A file with an audio encoder
+        // section therefore loads its AUDIO ctx directly — the audio path is
+        // the wired one (the vision+audio d1-omni mmproj takes ctx_a here;
+        // clip_init_from_file would otherwise pick ctx_v for a mixed file,
+        // which the port's vision towers cannot drive), and the single-
+        // modality files keep their own arms (audio-only/audio+gen already
+        // resolve to Audio there, vision-only/gen-only stay untouched)
+        let has_audio = ggml::Gguf::open(mmproj_fname)
+            .ok()
+            .and_then(|g| g.get_bool("clip.has_audio_encoder"))
+            .unwrap_or(false);
+        let clip = if has_audio {
+            clip::clip_init_modality(mmproj_fname, &clip_params, clip::ClipModality::Audio)?
+        } else {
+            clip::clip_init_from_file(mmproj_fname, &clip_params)?
+        };
 
         // mtmd.cpp:584-585 + clip.cpp:4004-4009: a mixed audio+gen mmproj
         // carries BOTH contexts — the primary stays the audio ctx, the GEN
@@ -307,7 +334,37 @@ impl MtmdContext {
         // defaults for this projector.
         let mut tok_sli_img_end: Vec<i32> = Vec::new();
         let mut tok_ov_img_end: Vec<i32> = Vec::new();
+        // mtmd.cpp:518-522 defaults — empty template / empty ov start token,
+        // thumbnail after the slices
+        let mut tok_ov_img_start: Vec<i32> = Vec::new();
+        let mut sli_img_start_tmpl = String::new();
+        let mut ov_img_first = false;
         match clip.model.proj_type {
+            // mtmd.cpp:868-880 — <|image_start|> ... <|image_end|>, the lfm2
+            // multi-tile layout (the tile preprocessor itself lives in
+            // clip.rs's image_preproc arm)
+            clip::ProjectorType::Lfm2 => {
+                img_beg = "<|image_start|>".to_string();
+                img_end = "<|image_end|>".to_string();
+                aud_beg = String::new();
+                aud_end = String::new();
+                audio_preproc = AudioPreproc::None;
+                tok_sli_img_end = Vec::new();
+                tok_ov_img_end = Vec::new();
+            }
+            // mtmd.cpp:873-876 — d1omni_v: the same tiles and thumbnail as
+            // lfm2, without separator tokens (the vision tower's own graph
+            // is the separate d1omni_v lane; the token markers are pinned
+            // here so the projector's mtmd facts stay total)
+            clip::ProjectorType::D1OmniV => {
+                img_beg = String::new();
+                img_end = String::new();
+                aud_beg = String::new();
+                aud_end = String::new();
+                audio_preproc = AudioPreproc::None;
+                tok_sli_img_end = Vec::new();
+                tok_ov_img_end = Vec::new();
+            }
             clip::ProjectorType::Qwen2Vl
             | clip::ProjectorType::Qwen25Vl
             | clip::ProjectorType::Qwen3Vl
@@ -335,6 +392,36 @@ impl MtmdContext {
                 };
                 tok_sli_img_end = lookup("<|IMG_LINE_BREAK|>");
                 tok_ov_img_end = tok_sli_img_end.clone();
+            }
+            // mtmd.cpp:857-873 (LFM2):
+            //   <|image_start|>
+            //     <|img_row_1_col_1|> (tile) <|img_row_1_col_2|> (tile) ...
+            //     <|img_thumbnail|> (thumbnail)
+            //   <|image_end|>
+            // single-tile: <|image_start|> (image) <|image_end|> — the
+            // preprocessor emits no overview for that case, so the chunk list
+            // is just the image between the markers
+            clip::ProjectorType::Lfm2 => {
+                img_beg = "<|image_start|>".to_string();
+                img_end = "<|image_end|>".to_string();
+                aud_beg = String::new();
+                aud_end = String::new();
+                audio_preproc = AudioPreproc::None;
+                let lookup = |text: &str| -> Vec<i32> {
+                    lookup_token(text_model.map(|(v, _, _)| v), text)
+                };
+                sli_img_start_tmpl = "<|img_row_%d_col_%d|>".to_string();
+                tok_ov_img_start = lookup("<|img_thumbnail|>");
+                ov_img_first = false;
+            }
+            // mtmd.cpp:874-878 (D1OMNI_V): same tiles and thumbnail as lfm2,
+            // without separator tokens — every marker stays the empty default
+            clip::ProjectorType::D1OmniV => {
+                img_beg = String::new();
+                img_end = String::new();
+                aud_beg = String::new();
+                aud_end = String::new();
+                audio_preproc = AudioPreproc::None;
             }
             // mtmd.cpp:623 `init_audio` + :933-963 — every whisper-enc family
             // projector uses the whisper mel preprocessor; only qwen2a,
@@ -578,6 +665,9 @@ impl MtmdContext {
             audio_preproc,
             tok_sli_img_end,
             tok_ov_img_end,
+            tok_ov_img_start,
+            sli_img_start_tmpl,
+            ov_img_first,
             out_embd: Vec::new(),
             clip_gen,
         })
@@ -810,6 +900,30 @@ impl MtmdContext {
                 assert_eq!(preproc.entries.len() as i32, n_row * n_col);
                 for y in 0..n_row {
                     for x in 0..n_col {
+                        // mtmd.cpp:1466-1471 — the per-slice lead-in from the
+                        // printf template (lfm2's <|img_row_%d_col_%d|>),
+                        // formatted like the C's snprintf(buf, tmpl, y+1,
+                        // x+1) — each %d consumes the next argument — and
+                        // tokenized with parse_special like img_beg
+                        if !self.sli_img_start_tmpl.is_empty() {
+                            let args = [y + 1, x + 1];
+                            let mut arg_i = 0usize;
+                            let mut text = String::new();
+                            let mut chars = self.sli_img_start_tmpl.chars().peekable();
+                            while let Some(c) = chars.next() {
+                                if c == '%' && chars.peek() == Some(&'d') {
+                                    chars.next();
+                                    text.push_str(
+                                        &args.get(arg_i).map(|v| v.to_string()).unwrap_or_default(),
+                                    );
+                                    arg_i += 1;
+                                } else {
+                                    text.push(c);
+                                }
+                            }
+                            let toks = vocab.tokenize(&text, false, true);
+                            push_text(chunks, toks);
+                        }
                         let e = &preproc.entries[(y * n_col + x) as usize];
                         let n_tokens = self.clip.n_output_tokens(e);
                         assert!(n_tokens > 0);
@@ -823,13 +937,17 @@ impl MtmdContext {
                             },
                         }));
                         // mtmd.cpp:1513 — the marker after every slice
-                        // (tok_sli_img_mid / tok_row_end are empty for cohere2v)
+                        // (tok_sli_img_mid / tok_row_end are empty for
+                        // cohere2v and lfm2)
                         push_text(chunks, self.tok_sli_img_end.clone());
                     }
                 }
             }
 
-            // mtmd.cpp:1530-1534 — the overview last (ov_img_first == false)
+            // mtmd.cpp:1441-1447/1530-1534 — the thumbnail last
+            // (ov_img_first == false for cohere2v and lfm2), preceded by the
+            // overview start token (lfm2's <|img_thumbnail|>)
+            push_text(chunks, self.tok_ov_img_start.clone());
             let n_tokens = self.clip.n_output_tokens(&overview);
             assert!(n_tokens > 0);
             chunks.push(MtmdChunk::Image(MtmdImageTokens {

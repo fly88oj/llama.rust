@@ -26,14 +26,14 @@
 //! detection whose needles match wins.
 
 use std::collections::BTreeMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::chat_tools::{chat_tag, ChatMsg, ChatParams, ChatToolCall};
 use crate::chat_tools::{
     escape_json_string_inner, foreach_function, foreach_parameter, string_ends_with,
     template_direct_apply_impl, template_generation_prompt_impl, tool_parameters, ChatContinuation,
-    ChatFormat, ChatPegBuilder, ChatTemplate, ChatToolChoice, GenerationParams, GrammarTrigger,
-    ReasoningFormat,
+    ChatFormat, ChatParamsInitFn, ChatPegBuilder, ChatTemplate, ChatToolChoice, GenerationParams,
+    GrammarTrigger, ReasoningFormat,
 };
 use crate::json_schema::{schema_from_json, Json, SchemaDocument, SchemaKind, ValueType};
 use crate::peg::{AstNode, ParseContext, ParseResult, ParserId, INVALID_AST_ID};
@@ -224,7 +224,7 @@ pub(crate) fn chat_params_init_ministral_3(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         // ChatPegBuilder deref
         let generation_prompt = p.p.eps();
         let reasoning = if extract_reasoning {
@@ -310,12 +310,11 @@ pub(crate) fn chat_params_init_ministral_3(
         p.p.sequence(&[generation_prompt, seq])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = has_tools && inputs.tool_choice == ChatToolChoice::Auto;
 
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word("[TOOL_CALLS]")];
     }
@@ -424,7 +423,7 @@ pub(crate) fn chat_params_init_gpt_oss(
         has_response_format || (has_tools && inputs.tool_choice != ChatToolChoice::None);
     let extract_reasoning = inputs.reasoning_format != ReasoningFormat::None;
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let start_lit = p.p.literal("<|start|>assistant");
         let start = p.p.rule("start", start_lit, false);
         let end_lit = p.p.literal("<|end|>");
@@ -562,12 +561,11 @@ pub(crate) fn chat_params_init_gpt_oss(
         p.p.sequence(&[zo, start, alt])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy =
             !(has_response_format || (has_tools && inputs.tool_choice == ChatToolChoice::Required));
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![
             GrammarTrigger::pattern("^\\s+to$"),
@@ -688,7 +686,7 @@ pub(crate) fn chat_params_init_llm_jp_harmony(
         has_response_format || (has_tools && inputs.tool_choice != ChatToolChoice::None);
     let extract_reasoning = inputs.reasoning_format != ReasoningFormat::None;
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         // tokenizer space after special tokens; not p.space() since GBNF
         // `space` allows one space only
         let sp = p.p.chars("[ ]", 0, -1);
@@ -824,12 +822,11 @@ pub(crate) fn chat_params_init_llm_jp_harmony(
         p.p.sequence(&[zo, start, final_msg])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy =
             !(has_response_format || (has_tools && inputs.tool_choice == ChatToolChoice::Required));
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![
             GrammarTrigger::pattern("^\\s+to$"),
@@ -905,7 +902,7 @@ pub(crate) fn chat_params_init_muse_glimmer(
     // Constrained grammar whenever tools are offered or a response format is requested.
     let include_grammar = has_response_format || (has_tools && inputs.tool_choice != ChatToolChoice::None);
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let start_lit = p.p.literal("<|start|>assistant");
         let start = p.p.rule("start", start_lit, false);
 
@@ -993,7 +990,7 @@ pub(crate) fn chat_params_init_muse_glimmer(
                         let sch = p.p.schema_node(
                             json_p,
                             &format!("tool-{tool_index}-arg-{param_index}-schema"),
-                            Rc::clone(doc),
+                            Arc::clone(doc),
                             prop.schema,
                             false,
                         );
@@ -1082,12 +1079,11 @@ pub(crate) fn chat_params_init_muse_glimmer(
         p.p.sequence(&[zo, start, final_msg])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = !(has_response_format
             || (has_tools && inputs.tool_choice == ChatToolChoice::Required));
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
         data.grammar_triggers = vec![GrammarTrigger::pattern(
             "(?:^|<\\|start\\|>assistant)( to=(?!self<\\|message\\|>)(?!user<\\|message\\|>)[^<]*?<\\|message\\|>)",
         )];
@@ -1124,7 +1120,7 @@ pub(crate) fn chat_params_init_functionary_v3_2(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         // Functionary v3.2 format:
         // - Normal content: >>>all\n{content}
         // - Tool calls: >>>function_name\n{json_args}
@@ -1210,12 +1206,11 @@ pub(crate) fn chat_params_init_functionary_v3_2(
         p.p.sequence(&[generation_prompt, ret])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = inputs.tool_choice == ChatToolChoice::Auto;
 
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         // Grammar trigger for when the model starts outputting a tool call
         // (after the initial ">>>" in the generation prompt but recipient other than "all")
@@ -1278,7 +1273,7 @@ pub(crate) fn chat_params_init_kimi_k2(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         // Kimi K2 Thinking format:
         // - Reasoning: <think>{reasoning}</think>
         // - Content: text after reasoning
@@ -1388,11 +1383,10 @@ pub(crate) fn chat_params_init_kimi_k2(
         ])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = inputs.tool_choice == ChatToolChoice::Auto;
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word("<|tool_call_begin|>")];
     }
@@ -1481,7 +1475,7 @@ pub(crate) fn chat_params_init_kimi_k3(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let end = p.p.end();
 
         // auto start = p.optional(p.literal(MSG_START));  (no rule wrapper)
@@ -1628,11 +1622,10 @@ pub(crate) fn chat_params_init_kimi_k3(
         p.p.sequence(&[start, reasoning, response, tools, trailer, end])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = inputs.tool_choice != ChatToolChoice::Required;
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(TOOLS_START)];
     }
@@ -1782,7 +1775,7 @@ pub(crate) fn chat_params_init_k2_horizon(
         p.p.optional(inner)
     };
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         // `p.literal(GEN_PREFIX)` (k2-horizon.cpp:50) — the literal prefix,
         // not the template's full generation prompt
         let generation_prompt = p.p.literal(gen_prefix);
@@ -1875,7 +1868,7 @@ pub(crate) fn chat_params_init_k2_horizon(
                         let sch = p.p.schema_node(
                             j,
                             &format!("{rule_name}-schema"),
-                            Rc::clone(doc),
+                            Arc::clone(doc),
                             param.schema,
                             false,
                         );
@@ -2003,12 +1996,11 @@ pub(crate) fn chat_params_init_k2_horizon(
         p.p.sequence(&[generation_prompt, rct])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy =
             !(has_response_format || inputs.tool_choice == ChatToolChoice::Required);
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         if data.grammar_lazy {
             data.grammar_triggers = vec![GrammarTrigger::word(section_start)];
@@ -2111,7 +2103,7 @@ pub(crate) fn chat_params_init_ling3(
     let include_grammar =
         has_response_format || (has_tools && inputs.tool_choice != ChatToolChoice::None);
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let end = p.p.end();
 
         // the effective papeg1!(p, optional, p.p.space())rompt + model output, so the
@@ -2204,7 +2196,7 @@ pub(crate) fn chat_params_init_ling3(
                     let sch = p.p.schema_node(
                         json_p,
                         &format!("{rule_name}-schema"),
-                        Rc::clone(doc),
+                        Arc::clone(doc),
                         param.schema,
                         false,
                     );
@@ -2218,7 +2210,7 @@ pub(crate) fn chat_params_init_ling3(
                     let sch = p.p.schema_node(
                         json_p,
                         &format!("{rule_name}-schema"),
-                        Rc::clone(doc),
+                        Arc::clone(doc),
                         param.schema,
                         false,
                     );
@@ -2313,14 +2305,13 @@ pub(crate) fn chat_params_init_ling3(
         p.p.sequence(&[opener, reasoning, content, tools, tail, end])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         // `!has_response_format && tool_choice != REQUIRED`
         // (parsers/ling3.cpp:191, upstream a7b94df2c)
         data.grammar_lazy =
             !has_response_format && inputs.tool_choice != ChatToolChoice::Required;
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(CALL_START)];
     }
@@ -2409,7 +2400,7 @@ pub(crate) fn chat_params_init_cohere2moe(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let generation_prompt = p.p.literal(&gen_prefix);
         let end = p.p.end();
 
@@ -2509,11 +2500,10 @@ pub(crate) fn chat_params_init_cohere2moe(
         p.p.sequence(&[generation_prompt, reasoning, body, te, end])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = !has_response_format && inputs.tool_choice == ChatToolChoice::Auto;
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(ACTION_START)];
     }
@@ -2598,7 +2588,7 @@ pub(crate) fn chat_params_init_lfm2(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let generation_prompt = p.p.literal(GEN_PROMPT);
         let end = p.p.end();
 
@@ -2643,12 +2633,11 @@ pub(crate) fn chat_params_init_lfm2(
         p.p.sequence(&[generation_prompt, reasoning, content, tool_calls, end])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy =
             !(has_response_format || (has_tools && inputs.tool_choice == ChatToolChoice::Required));
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(TOOL_CALL_START)];
     }
@@ -2688,7 +2677,7 @@ pub(crate) fn chat_params_init_gigachat_v3(
     let include_grammar = has_tools && inputs.tool_choice != ChatToolChoice::None;
     let tool_call_start_prefix = "<|message_sep|>\n\nfunction call<|role_sep|>\n";
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let ret;
         if has_tools && inputs.tool_choice != ChatToolChoice::None {
             // Build a choice of all available tools
@@ -2762,12 +2751,11 @@ pub(crate) fn chat_params_init_gigachat_v3(
         p.p.sequence(&[prefix, ret])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = has_tools && inputs.tool_choice == ChatToolChoice::Auto;
 
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(tool_call_start_prefix)];
     }
@@ -2782,7 +2770,7 @@ pub(crate) fn chat_params_init_gigachat_v3(
 /// XML-expansion of a schema node.
 fn minimax_m3_build_value_of(
     p: &mut ChatPegBuilder,
-    doc: &Rc<SchemaDocument>,
+    doc: &Arc<SchemaDocument>,
     node: crate::json_schema::NodeId,
     rule_name: &str,
     close: &str,
@@ -2849,7 +2837,7 @@ fn minimax_m3_build_value_of(
             let sch = p.p.schema_node(
                 json_p,
                 &format!("{rule_name}-schema"),
-                Rc::clone(doc),
+                Arc::clone(doc),
                 node,
                 false,
             );
@@ -2862,7 +2850,7 @@ fn minimax_m3_build_value_of(
 /// `members_of` (parsers/minimax-m3.cpp:154-179)
 fn minimax_m3_members_of(
     p: &mut ChatPegBuilder,
-    doc: &Rc<SchemaDocument>,
+    doc: &Arc<SchemaDocument>,
     properties: &[crate::json_schema::SchemaProperty],
     rule_prefix: &str,
 ) -> ParserId {
@@ -2988,7 +2976,7 @@ pub(crate) fn chat_params_init_minimax_m3(
     let tools_json = inputs.tools.clone();
     let json_schema = inputs.json_schema.clone();
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let generation_prompt = p.prefix(&gen_prompt, THINK_START);
         let end = p.p.end();
 
@@ -3051,7 +3039,7 @@ pub(crate) fn chat_params_init_minimax_m3(
             let params = tool_parameters(function);
             // the C++ common_chat_schema_from_json throws on bad schemas; keep
             // the builder total with an empty document (see PegBuilder::schema)
-            let doc = Rc::new(
+            let doc = Arc::new(
                 schema_from_json(&params).unwrap_or_else(|_| SchemaDocument {
                     nodes: Vec::new(),
                     root: 0,
@@ -3121,12 +3109,11 @@ pub(crate) fn chat_params_init_minimax_m3(
         ])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy =
             !(has_response_format || (has_tools && inputs.tool_choice == ChatToolChoice::Required));
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(FC_START)];
     }
@@ -3322,7 +3309,7 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
     let require_tools = inputs.tool_choice == ChatToolChoice::Required;
     let has_tool_calls = has_tools && inputs.tool_choice != ChatToolChoice::None;
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let generation_prompt = p.p.literal(GEN_PROMPT);
         let end = p.p.end();
 
@@ -3358,7 +3345,7 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
                         let sch = p.p.schema_node(
                             json_p,
                             &format!("tool-{tool_index}-arg-{param_index}-schema"),
-                            Rc::clone(doc),
+                            Arc::clone(doc),
                             param.schema,
                             false,
                         );
@@ -3524,11 +3511,10 @@ pub(crate) fn chat_params_init_deepseek_v3_2(
         ])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = has_tools && !require_tools;
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word(&FC_START)];
     }
@@ -3788,7 +3774,7 @@ pub(crate) fn chat_params_init_gemma4(
         has_response_format || (has_tools && inputs.tool_choice != ChatToolChoice::None);
     let extract_reasoning = inputs.reasoning_format != ReasoningFormat::None;
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let start_opt = peg1!(p, optional, p.p.literal("<|turn>model\n"));
         let start = p.p.rule("start", start_opt, false);
 
@@ -3981,12 +3967,11 @@ pub(crate) fn chat_params_init_gemma4(
         p.p.sequence(&[start, oom])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy =
             !(has_response_format || (has_tools && inputs.tool_choice == ChatToolChoice::Required));
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word("<|tool_call>")];
     }
@@ -4049,7 +4034,7 @@ pub(crate) fn chat_params_init_minicpm5(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let generation_prompt = p.p.literal("<|im_start|>assistant\n");
 
         let mut reasoning = p.p.eps();
@@ -4118,7 +4103,7 @@ pub(crate) fn chat_params_init_minicpm5(
                         let sch = p.p.schema_node(
                             json_p,
                             &format!("tool-{tool_index}-arg-{param_index}-schema"),
-                            Rc::clone(doc),
+                            Arc::clone(doc),
                             prop.schema,
                             false,
                         );
@@ -4187,12 +4172,11 @@ pub(crate) fn chat_params_init_minicpm5(
         p.p.sequence(&[generation_prompt, reasoning, c, end])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy =
             !(has_response_format || (has_tools && inputs.tool_choice == ChatToolChoice::Required));
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         data.grammar_triggers = vec![GrammarTrigger::word("<function")];
     }
@@ -4290,7 +4274,7 @@ pub(crate) fn chat_params_init_qwen3_coder(
         });
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         let generation_prompt = p.p.literal(GEN_PREFIX);
 
         let mut reasoning = p.p.eps();
@@ -4365,7 +4349,7 @@ pub(crate) fn chat_params_init_qwen3_coder(
                         let sch = p.p.schema_node(
                             json_p,
                             &format!("{rule_name}-schema"),
-                            Rc::clone(doc),
+                            Arc::clone(doc),
                             param.schema,
                             false,
                         );
@@ -4487,12 +4471,11 @@ pub(crate) fn chat_params_init_qwen3_coder(
         p.p.sequence(&[generation_prompt, seq])
     })?;
 
-    data.parser = parser.save();
 
     if include_grammar {
         data.grammar_lazy = has_tools && inputs.tool_choice == ChatToolChoice::Auto;
 
-        data.grammar = parser.build_grammar(data.grammar_lazy)?;
+        data.grammar = data.parser.build_grammar(data.grammar_lazy)?;
 
         if data.grammar_lazy {
             for start in &tool_call_starts {
@@ -4590,14 +4573,13 @@ pub(crate) fn chat_params_init_translate_gemma(
         data.prompt += &data.generation_prompt;
     }
 
-    let parser = crate::chat_tools::build_chat_peg_parser(|p| {
+    data.parser = crate::chat_tools::build_chat_peg_parser(|p| {
         // literal(generation_prompt) << content(rest)
         let gp = p.p.literal(&data.generation_prompt);
         let rest = p.p.rest();
         let c = p.content(rest);
         p.p.spaced(gp, c)
     })?;
-    data.parser = parser.save();
 
     Ok(data)
 }
@@ -4606,12 +4588,40 @@ pub(crate) fn chat_params_init_translate_gemma(
 // dispatch — common_chat_try_specialized_template (chat.cpp:1090-1223)
 // ---------------------------------------------------------------------------
 
-/// `common_chat_try_specialized_template` (chat.cpp:1090-1223)
-pub(crate) fn try_specialized_template(
+/// `common_chat_params_init_lfm2_tokens` (chat.cpp:1062-1064, 8b5436102)
+fn chat_params_init_lfm2_tokens(
     tmpl: &ChatTemplate,
-    src: &str,
-    params: &mut GenerationParams,
-) -> Result<Option<ChatParams>, String> {
+    inputs: &GenerationParams,
+) -> Result<ChatParams, String> {
+    chat_params_init_lfm2(tmpl, inputs, /* tool_list_tokens = */ true)
+}
+
+/// `common_chat_params_init_lfm2_5` (chat.cpp:1066-1068, 8b5436102)
+fn chat_params_init_lfm2_5(
+    tmpl: &ChatTemplate,
+    inputs: &GenerationParams,
+) -> Result<ChatParams, String> {
+    chat_params_init_lfm2(tmpl, inputs, /* tool_list_tokens = */ false)
+}
+
+/// Older gemma4 templates need their tool responses rewritten before
+/// rendering — `common_chat_params_init_gemma4_legacy` (chat.cpp:1071-1076,
+/// 8b5436102). The rewrites land on a copy of the inputs (the pre-refactor
+/// code mutated the caller's messages in place).
+fn chat_params_init_gemma4_legacy(
+    tmpl: &ChatTemplate,
+    inputs: &GenerationParams,
+) -> Result<ChatParams, String> {
+    let mut adjusted = inputs.clone();
+    convert_tool_responses_gemma4(&mut adjusted.messages);
+    chat_params_init_gemma4(tmpl, &adjusted)
+}
+
+/// `common_chat_template_detect_params_init` (chat.cpp:1078-1241, 8b5436102):
+/// pick the dedicated handler for a template from its source, or None for the
+/// autoparser. Order matters: the first match wins, and later checks assume
+/// the earlier ones did not match. Runs once at template construction.
+pub(crate) fn detect_params_init(src: &str) -> Option<ChatParamsInitFn> {
     // Ministral/Mistral Large 3 - uses special reasoning structure fixes, can't use autoparser
     // Note: Mistral Small 3.2 uses [CALL_ID] which Ministral doesn't have, so we can distinguish them
     if src.contains("[SYSTEM_PROMPT]")
@@ -4619,71 +4629,79 @@ pub(crate) fn try_specialized_template(
         && src.contains("[ARGS]")
         && !src.contains("[CALL_ID]")
     {
-        return Ok(Some(chat_params_init_ministral_3(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Ministral/Magistral Large 3")
+        return Some(chat_params_init_ministral_3 as ChatParamsInitFn);
     }
 
     // LLM-jp-4.1 - GPT-OSS dialect (spaces after special tokens, <|end|>-separated parallel calls)
     if src.contains("chat_format=llm-jp-harmony-v1") {
-        return Ok(Some(chat_params_init_llm_jp_harmony(tmpl, params)?));
+        // LOG_DBG("Using specialized template: LLM-jp Harmony v1")
+        return Some(chat_params_init_llm_jp_harmony as ChatParamsInitFn);
     }
 
     // GPT-OSS - has unique channel-based structure that needs dedicated handler
     if src.contains("<|channel|>") {
-        return Ok(Some(chat_params_init_gpt_oss(tmpl, params)?));
+        // LOG_DBG("Using specialized template: GPT-OSS")
+        return Some(chat_params_init_gpt_oss as ChatParamsInitFn);
     }
 
     // Muse Glimmer format using " to=<recipient>" recipients and <|eom|>/<|eot|> message terminators.
     if src.contains("<atem:function_calls>") && src.contains("<|eom|>") {
-        return Ok(Some(chat_params_init_muse_glimmer(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Muse Glimmer")
+        return Some(chat_params_init_muse_glimmer as ChatParamsInitFn);
     }
 
     // Functionary v3.2 - uses recipient-based format with >>>recipient\n{content}
     // Detection: template has ">>>all" for content and ">>>" prefix for tool calls
     if src.contains(">>>all") && src.contains(">>>${recipient}") {
-        return Ok(Some(chat_params_init_functionary_v3_2(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Functionary v3.2")
+        return Some(chat_params_init_functionary_v3_2 as ChatParamsInitFn);
     }
 
     // Kimi K2 Thinking - uses unique tool call ID format: functions.<name>:<index>
     // Detection: template has "<|tool_calls_section_begin|>" and "functions." prefix in tool call IDs
     if src.contains("<|tool_calls_section_begin|>") && src.contains("<|tool_call_begin|>") {
-        return Ok(Some(chat_params_init_kimi_k2(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Kimi K2 Thinking")
+        return Some(chat_params_init_kimi_k2 as ChatParamsInitFn);
     }
 
     // Kimi K3 - the <|open|>/<|close|>/<|end_of_msg|> markers are unique to it
     if src.contains("<|open|>") && src.contains("<|close|>") && src.contains("<|end_of_msg|>") {
-        return Ok(Some(chat_params_init_kimi_k3(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Kimi K3")
+        return Some(chat_params_init_kimi_k3 as ChatParamsInitFn);
     }
 
     // K2 Horizon - <|ifm|im_start|> turns, <ifm|think*> reasoning picked by reasoning_effort and
     // <ifm|tool_calls> sections; the three think tag pairs defeat the autoparser's reasoning detection
     if src.contains("<|ifm|im_start|>") && src.contains("<ifm|tool_calls>") {
-        return Ok(Some(chat_params_init_k2_horizon(tmpl, params)?));
+        // LOG_DBG("Using specialized template: K2 Horizon")
+        return Some(chat_params_init_k2_horizon as ChatParamsInitFn);
     }
 
     // Ling 3.0 / Bailing V3 - <role>X</role> sections with <arg_key>/<arg_value> tagged
     // tool calls. <role> sections are unique to this family among the tagged-arg templates.
     if src.contains("<role>ASSISTANT</role>") && src.contains("<arg_key>") {
-        return Ok(Some(chat_params_init_ling3(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Ling 3.0 (Bailing V3)")
+        return Some(chat_params_init_ling3 as ChatParamsInitFn);
     }
 
     // Cohere2 MoE / North Code - marker-wrapped format with <|START_TEXT|> content and
     // <|START_ACTION|> JSON tool calls. <|START_TEXT|> is unique to this template (the older
     // Command-R templates use <|START_RESPONSE|>).
     if src.contains("<|START_TEXT|>") && src.contains("<|START_ACTION|>") {
-        return Ok(Some(chat_params_init_cohere2moe(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Cohere2 MoE")
+        return Some(chat_params_init_cohere2moe as ChatParamsInitFn);
     }
 
     if is_lfm2_template(src) {
-        return Ok(Some(chat_params_init_lfm2(
-            tmpl, params, /* tool_list_tokens = */ true,
-        )?));
+        // LOG_DBG("Using specialized template: LFM2")
+        return Some(chat_params_init_lfm2_tokens as ChatParamsInitFn);
     }
 
     // LFM2.5 format detection: template uses plain "List of tools: [...]" with no special tokens
     if src.contains("List of tools: [") && !src.contains("<|tool_list_start|>") {
-        return Ok(Some(chat_params_init_lfm2(
-            tmpl, params, /* tool_list_tokens = */ false,
-        )?));
+        // LOG_DBG("Using specialized template: LFM2.5")
+        return Some(chat_params_init_lfm2_5 as ChatParamsInitFn);
     }
 
     // GigaChatV3 format detection
@@ -4691,14 +4709,16 @@ pub(crate) fn try_specialized_template(
         && src.contains("<|message_sep|>")
         && !src.contains("<|function_call|>")
     {
-        return Ok(Some(chat_params_init_gigachat_v3(tmpl, params)?));
+        // LOG_DBG("Using specialized template: GigaChatV3")
+        return Some(chat_params_init_gigachat_v3 as ChatParamsInitFn);
     }
 
     // MiniMax-M3: the namespace token "]<]minimax[>[" collides with the autoparser's
     // markup delimiters, so detect the template and use a dedicated parser.
     if src.contains("]<]minimax[>[") && src.contains("<tool_call>") && src.contains("<invoke name=")
     {
-        return Ok(Some(chat_params_init_minimax_m3(tmpl, params)?));
+        // LOG_DBG("Using specialized template: MiniMax-M3")
+        return Some(chat_params_init_minimax_m3 as ChatParamsInitFn);
     }
 
     // DeepSeek V3.2/V4 format detection: template defines dsml_token and uses it for tool calls.
@@ -4708,22 +4728,22 @@ pub(crate) fn try_specialized_template(
         && src.contains("DSML")
         && (src.contains("function_calls") || src.contains("tool_calls"))
     {
-        return Ok(Some(chat_params_init_deepseek_v3_2(tmpl, params)?));
+        // LOG_DBG("Using specialized template: DeepSeek V3.2/V4")
+        return Some(chat_params_init_deepseek_v3_2 as ChatParamsInitFn);
     }
 
     // Gemma4 format detection
     if src.contains("'<|tool_call>call:'") {
         if !src.contains("{#- OpenAI Chat Completions:") {
             // apply workarounds if using the older gemma4 templates
-            // LOG_WRN: detected an outdated gemma4 chat template, applying
-            // compatibility workarounds. Consider updating to the official
-            // template. (chat.cpp:1210-1213)
+            // LOG_WRN (chat.cpp:1210-1213)
             eprintln!(
                 "common_chat_try_specialized_template: detected an outdated gemma4 chat template, applying compatibility workarounds. Consider updating to the official template."
             );
-            convert_tool_responses_gemma4(&mut params.messages);
+            return Some(chat_params_init_gemma4_legacy as ChatParamsInitFn);
         }
-        return Ok(Some(chat_params_init_gemma4(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Gemma4")
+        return Some(chat_params_init_gemma4 as ChatParamsInitFn);
     }
 
     // MiniCPM5 - XML tool calls with <function name="..."><param name="...">...</param></function>
@@ -4731,12 +4751,14 @@ pub(crate) fn try_specialized_template(
         && src.contains("<function name=\"")
         && src.contains("<param name=\"")
     {
-        return Ok(Some(chat_params_init_minicpm5(tmpl, params)?));
+        // LOG_DBG("Using specialized template: MiniCPM5")
+        return Some(chat_params_init_minicpm5 as ChatParamsInitFn);
     }
 
     // TranslateGemma - user content must follow a custom schema with language codes
     if src.contains("[source_lang_code]") && src.contains("[target_lang_code]") {
-        return Ok(Some(chat_params_init_translate_gemma(tmpl, params)?));
+        // LOG_DBG("Using specialized template: TranslateGemma")
+        return Some(chat_params_init_translate_gemma as ChatParamsInitFn);
     }
 
     // Qwen3-Coder XML tool calls, also used by Nemotron Nano 3, Qwen3.5 and StepFun-3.5-Flash
@@ -4746,10 +4768,11 @@ pub(crate) fn try_specialized_template(
         // Exclude models that don't use \n between tags
         && !src.contains("'<tool_call><function=' ~ tool_call.name ~ '>'")
     {
-        return Ok(Some(chat_params_init_qwen3_coder(tmpl, params)?));
+        // LOG_DBG("Using specialized template: Qwen3-Coder")
+        return Some(chat_params_init_qwen3_coder as ChatParamsInitFn);
     }
 
-    Ok(None)
+    None
 }
 
 // ---------------------------------------------------------------------------

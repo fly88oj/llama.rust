@@ -2976,6 +2976,31 @@ pub struct SamplingParams {
     /// user logit biases (common: also merged with vocab suppress tokens — the
     /// caller can pre-merge by pushing `{token, -inf}` entries here)
     pub logit_bias: Vec<LogitBias>,
+    /// `reasoning_budget_tokens` (common.h:292, -1 = disabled, >= 0 = budget)
+    pub reasoning_budget_tokens: i32,
+    /// `reasoning_budget_start` (common.h:293) — start tag token sequence
+    pub reasoning_budget_start: Vec<LlamaToken>,
+    /// `reasoning_budget_end` (common.h:294) — end tag token sequences; the
+    /// first tag is used as the forcing sequence
+    pub reasoning_budget_end: Vec<Vec<LlamaToken>>,
+    /// `reasoning_budget_forced` (common.h:295) — forced sequence (message +
+    /// first end tag)
+    pub reasoning_budget_forced: Vec<LlamaToken>,
+    /// `reasoning_budget_message` (common.h:296) — message injected before the
+    /// end tag when the budget is exhausted
+    pub reasoning_budget_message: String,
+    /// `reasoning_control` (common.h:297) — create the budget sampler on
+    /// demand so reasoning can be ended at runtime
+    pub reasoning_control: bool,
+    /// `grammar_lazy` (common.h:298) — the port keeps the grammar itself on
+    /// the server's task params, but the flag rides the sampling params like
+    /// the C's `common_params_sampling` because the budget sampler's init
+    /// gate reads it (common/sampling.cpp:315)
+    pub grammar_lazy: bool,
+    /// `generation_prompt` (common.h:288) — the assistant turn prefix the
+    /// template emitted; the budget sampler's prefill source
+    /// (common/sampling.cpp:280-296)
+    pub generation_prompt: String,
 }
 
 impl Default for SamplingParams {
@@ -3016,9 +3041,327 @@ impl Default for SamplingParams {
             adaptive_decay: 0.90,
             samplers: CommonSamplerType::default_chain(),
             logit_bias: Vec::new(),
+            reasoning_budget_tokens: -1,
+            reasoning_budget_start: Vec::new(),
+            reasoning_budget_end: Vec::new(),
+            reasoning_budget_forced: Vec::new(),
+            reasoning_budget_message: String::new(),
+            reasoning_control: false,
+            grammar_lazy: false,
+            generation_prompt: String::new(),
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// the reasoning-budget sampler (common/reasoning-budget.cpp) — the per-request
+// thinking budget of #23116/#21870: count the tokens inside the thinking
+// block, and when the budget expires force the end tag (plus the optional
+// message) through the logits. The 99f3dc322 four-field schema surface feeds
+// it (reasoning_budget_tokens / _start_tag / _end_tags / _message).
+// ---------------------------------------------------------------------------
+
+/// `common_reasoning_budget_state` (common/reasoning-budget.h:10-16)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningBudgetState {
+    /// waiting for the start tag
+    Idle,
+    /// inside the thinking block, counting down
+    Counting,
+    /// budget exhausted on a partial UTF-8 piece — force after completion
+    WaitingUtf8,
+    /// forcing the end sequence token by token
+    Forcing,
+    /// the block ended (naturally or forced); re-arms on a new start tag
+    Done,
+}
+
+/// `token_matcher` (common/reasoning-budget.cpp:24-49) — longest-token-seq
+/// match ending at the current token. The C rides a `common_trie` +
+/// `common_aho_corasick` automaton (`ac.next(state, token)` then
+/// `match_pattern`); this port keeps the last `max_len` tokens and checks
+/// which seq is a suffix — for the "longest sequence ending here" semantics
+/// the two are observably identical (state reset on a match is the automaton
+/// returning to root).
+#[derive(Clone)]
+struct TokenSeqMatcher {
+    /// `seqs` — deduplicated non-empty sequences (:29-37)
+    seqs: Vec<Vec<LlamaToken>>,
+    /// the tail of consumed tokens (the automaton's state)
+    tail: Vec<LlamaToken>,
+    max_len: usize,
+}
+
+impl TokenSeqMatcher {
+    fn new(seqs: &[Vec<LlamaToken>]) -> Self {
+        // `collect` (:29-37): drop empty seqs and duplicates, keep order
+        let mut uniq: Vec<Vec<LlamaToken>> = Vec::new();
+        for s in seqs {
+            if !s.is_empty() && !uniq.contains(s) {
+                uniq.push(s.clone());
+            }
+        }
+        let max_len = uniq.iter().map(|s| s.len()).max().unwrap_or(0);
+        TokenSeqMatcher {
+            seqs: uniq,
+            tail: Vec::with_capacity(max_len),
+            max_len,
+        }
+    }
+
+    /// `advance(token)` (:41-48) — the index of the longest sequence ending
+    /// at this token, or -1; a match resets the state (root).
+    fn advance(&mut self, token: LlamaToken) -> i32 {
+        self.tail.push(token);
+        if self.tail.len() > self.max_len {
+            self.tail.remove(0);
+        }
+        // longest first so the longest suffix wins (`match_pattern`)
+        let mut hit: i32 = -1;
+        let mut best_len = 0usize;
+        for (i, s) in self.seqs.iter().enumerate() {
+            let n = s.len();
+            if n > best_len && n <= self.tail.len() && &self.tail[self.tail.len() - n..] == s.as_slice()
+            {
+                hit = i as i32;
+                best_len = n;
+            }
+        }
+        if hit >= 0 {
+            self.tail.clear(); // state = 0
+        }
+        hit
+    }
+
+    fn reset(&mut self) {
+        self.tail.clear();
+    }
+}
+
+/// `common_utf8_is_complete` (common/unicode.cpp:77-89) — true when the
+/// string does not end mid-codepoint.
+fn utf8_is_complete(s: &[u8]) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    let n = s.len().min(4);
+    for i in 1..=n {
+        let c = s[s.len() - i];
+        if (c & 0xC0) != 0x80 {
+            let expected = if c >= 0xF0 {
+                4
+            } else if c >= 0xE0 {
+                3
+            } else if c >= 0xC0 {
+                2
+            } else {
+                1
+            };
+            return i >= expected;
+        }
+    }
+    false
+}
+
+/// `common_reasoning_budget_ctx` (common/reasoning-budget.cpp:52-68) — the
+/// sampler's state machine. `vocab` reaches the accept path only for the
+/// piece completeness check, so the non-special pieces
+/// (`common_token_to_piece(vocab, token, false)`) are snapshotted at init.
+#[derive(Clone)]
+pub struct ReasoningBudget {
+    start_matcher: TokenSeqMatcher,
+    end_matcher: TokenSeqMatcher,
+    /// non-special pieces, concatenated (offsets[id]..offsets[id+1])
+    piece_offs: Vec<u32>,
+    piece_buf: Vec<u8>,
+
+    forced_tokens: Vec<LlamaToken>,
+    /// maximum tokens in the reasoning block
+    budget: i32,
+    /// tokens remaining in the budget
+    remaining: i32,
+    state: ReasoningBudgetState,
+    /// next position in forced_tokens to force
+    force_pos: usize,
+    /// index into end_matcher.seqs of the sequence that transitioned to
+    /// DONE, -1 if none
+    end_match: i32,
+}
+
+impl ReasoningBudget {
+    fn piece(&self, token: LlamaToken) -> &[u8] {
+        let a = self.piece_offs[token as usize] as usize;
+        let b = self.piece_offs[token as usize + 1] as usize;
+        &self.piece_buf[a..b]
+    }
+
+    /// `common_reasoning_budget_accept` (common/reasoning-budget.cpp:74-165)
+    pub fn accept(&mut self, token: LlamaToken) {
+        match self.state {
+            ReasoningBudgetState::Idle => {
+                if self.start_matcher.advance(token) >= 0 {
+                    self.state = ReasoningBudgetState::Counting;
+                    self.remaining = self.budget;
+                    if self.remaining <= 0 {
+                        self.state = ReasoningBudgetState::Forcing;
+                        self.force_pos = 0;
+                    }
+                }
+            }
+            ReasoningBudgetState::Counting | ReasoningBudgetState::WaitingUtf8 => {
+                let matched = self.end_matcher.advance(token);
+                if matched >= 0 {
+                    // deactivated (natural end)
+                    self.state = ReasoningBudgetState::Done;
+                    self.end_match = matched;
+                    return;
+                }
+
+                let utf8_complete = utf8_is_complete(self.piece(token));
+
+                if self.state == ReasoningBudgetState::WaitingUtf8 {
+                    if utf8_complete {
+                        self.state = ReasoningBudgetState::Forcing;
+                        self.force_pos = 0;
+                        self.end_matcher.reset();
+                    }
+                } else {
+                    self.remaining -= 1;
+                    if self.remaining <= 0 {
+                        if utf8_complete {
+                            self.state = ReasoningBudgetState::Forcing;
+                            self.force_pos = 0;
+                            self.end_matcher.reset();
+                        } else {
+                            self.state = ReasoningBudgetState::WaitingUtf8;
+                            self.end_matcher.reset();
+                        }
+                    }
+                }
+            }
+            ReasoningBudgetState::Forcing => {
+                // track the end sequence within forced_tokens so it is also
+                // reported on DONE
+                let matched = self.end_matcher.advance(token);
+                self.force_pos += 1;
+                if self.force_pos >= self.forced_tokens.len() {
+                    self.state = ReasoningBudgetState::Done;
+                    self.end_match = matched;
+                }
+            }
+            ReasoningBudgetState::Done => {
+                // re-arm on a new start tag: some models emit multiple
+                // <think> blocks per response, each gets a fresh window
+                if self.start_matcher.advance(token) >= 0 {
+                    self.state = ReasoningBudgetState::Counting;
+                    self.remaining = self.budget;
+                    self.end_matcher.reset();
+                    self.end_match = -1;
+                    if self.remaining <= 0 {
+                        self.state = ReasoningBudgetState::Forcing;
+                        self.force_pos = 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// `common_reasoning_budget_apply` (:166-186) — while FORCING, mask
+    /// everything but the next forced token; passthrough otherwise.
+    pub fn apply(&self, cur_p: &mut TokenDataArray) {
+        if self.state != ReasoningBudgetState::Forcing {
+            return; // passthrough — don't modify logits
+        }
+        if self.force_pos >= self.forced_tokens.len() {
+            return;
+        }
+        let forced = self.forced_tokens[self.force_pos];
+        for i in 0..cur_p.size {
+            if cur_p.data[i].id != forced {
+                cur_p.data[i].logit = f32::NEG_INFINITY;
+            }
+        }
+    }
+
+    /// `common_reasoning_budget_reset` (:188-196)
+    pub fn reset(&mut self) {
+        self.state = ReasoningBudgetState::Idle;
+        self.remaining = self.budget;
+        self.start_matcher.reset();
+        self.end_matcher.reset();
+        self.force_pos = 0;
+        self.end_match = -1;
+    }
+
+    /// `common_reasoning_budget_get_state` (reasoning-budget.h:44)
+    pub fn get_state(&self) -> ReasoningBudgetState {
+        self.state
+    }
+
+    /// `common_reasoning_budget_get_end_match` (reasoning-budget.h:48) — the
+    /// sequence that transitioned to DONE (None when end_match < 0)
+    pub fn get_end_match(&self) -> Option<&[LlamaToken]> {
+        if self.end_match < 0 {
+            return None;
+        }
+        Some(&self.end_matcher.seqs[self.end_match as usize])
+    }
+
+    /// `common_reasoning_budget_force` (reasoning-budget.cpp:317-334) — only
+    /// a sampler actively counting down may be forced; any other state is
+    /// left untouched (returns false).
+    pub fn force(&mut self) -> bool {
+        if self.state != ReasoningBudgetState::Counting {
+            return false;
+        }
+        self.state = ReasoningBudgetState::Forcing;
+        self.force_pos = 0;
+        self.end_matcher.reset();
+        true
+    }
+}
+
+/// `common_reasoning_budget_init` (common/reasoning-budget.cpp:227-260) —
+/// builds the sampler; the non-special piece cache rides along because the
+/// accept path's UTF-8 check needs `common_token_to_piece(vocab, t, false)`.
+pub fn reasoning_budget_init(
+    vocab: &crate::vocab::Vocab,
+    start_seqs: &[Vec<LlamaToken>],
+    end_seqs: &[Vec<LlamaToken>],
+    forced_tokens: &[LlamaToken],
+    budget: i32,
+    initial_state: ReasoningBudgetState,
+) -> ReasoningBudget {
+    // `common_reasoning_budget_init_state`'s promotion (:244-247)
+    let initial_state = if initial_state == ReasoningBudgetState::Counting && budget <= 0 {
+        ReasoningBudgetState::Forcing
+    } else {
+        initial_state
+    };
+
+    let n = vocab.n_tokens() as usize;
+    let mut piece_offs = Vec::with_capacity(n + 1);
+    let mut piece_buf = Vec::new();
+    piece_offs.push(0u32);
+    for id in 0..n {
+        piece_buf.extend_from_slice(&vocab.token_to_piece_special(id as LlamaToken, false));
+        piece_offs.push(piece_buf.len() as u32);
+    }
+
+    ReasoningBudget {
+        start_matcher: TokenSeqMatcher::new(start_seqs),
+        end_matcher: TokenSeqMatcher::new(end_seqs),
+        piece_offs,
+        piece_buf,
+        forced_tokens: forced_tokens.to_vec(),
+        budget,
+        remaining: budget,
+        state: initial_state,
+        force_pos: 0,
+        end_match: -1,
+    }
+}
+
 
 /// `common_sampler` — the convenience sampling context (replacement for the
 /// removed `llama_sampling_context`). The chain is built in `params.samplers`
@@ -3031,6 +3374,10 @@ impl Default for SamplingParams {
 pub struct SamplingContext {
     pub params: SamplingParams,
     pub chain: SamplerChain,
+    /// `common_sampler::rbudget` (common/sampling.h:116) — the reasoning
+    /// budget sampler, `None` when the request carries no budget (or no
+    /// vocab was available to lower the tags)
+    pub rbudget: Option<ReasoningBudget>,
     /// `common_sampler::prev` — ring of recent tokens (max(32, n_prev))
     pub prev: RingBuffer<LlamaToken>,
     /// `common_sampler::cur` — candidates of the last sample() call
@@ -3042,9 +3389,11 @@ pub struct SamplingContext {
 }
 
 impl SamplingContext {
-    /// `common_sampler_init` (subset: no grammar / reasoning-budget).
-    /// Kept for the pre-DRY call sites: string DRY sequence breakers cannot
-    /// be processed without a vocab (equivalent to passing `NULL` breakers).
+    /// `common_sampler_init` (subset: no grammar — the port's grammar rides
+    /// the server's task params; the reasoning budget IS built here when the
+    /// params carry one). Kept for the pre-DRY call sites: string DRY
+    /// sequence breakers cannot be processed without a vocab (equivalent to
+    /// passing `NULL` breakers).
     pub fn new(n_vocab: i32, params: SamplingParams) -> Self {
         Self::new_with_vocab(n_vocab, None, params)
     }
@@ -3183,6 +3532,56 @@ impl SamplingContext {
             chain.add(s);
         }
 
+        // the reasoning budget sampler (common/sampling.cpp:313-326) — skip
+        // when the budget is unlimited unless a lazy grammar is active (it
+        // needs rbudget for thinking-block suppression) or reasoning_control
+        // asked for it. Needs the vocab (the tags are token sequences and the
+        // UTF-8 check reads pieces); the legacy vocab-less constructor leaves
+        // it off.
+        let mut rbudget = None;
+        if !params.reasoning_budget_start.is_empty()
+            && !params.reasoning_budget_end.is_empty()
+            && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_control)
+        {
+            if let Some(vocab) = vocab {
+                // `params.reasoning_budget_tokens < 0 ? INT_MAX : …` (:321)
+                let budget = if params.reasoning_budget_tokens < 0 {
+                    i32::MAX
+                } else {
+                    params.reasoning_budget_tokens
+                };
+                let mut rb = reasoning_budget_init(
+                    vocab,
+                    &[params.reasoning_budget_start.clone()],
+                    &params.reasoning_budget_end,
+                    &params.reasoning_budget_forced,
+                    budget,
+                    ReasoningBudgetState::Idle,
+                );
+
+                // the generation prompt's tokens prefill the state machine
+                // (:279-296 + :322-325) — a template that already emitted the
+                // start tag must not count the prompt against the budget
+                if !params.generation_prompt.is_empty() {
+                    let tokens = vocab.tokenize(&params.generation_prompt, false, true);
+                    for (i, &token) in tokens.iter().enumerate() {
+                        // skip a leading space some tokenizers add before the
+                        // first special token (:287-292)
+                        let piece = vocab.token_to_piece_special(token, true);
+                        if i == 0
+                            && !piece.is_empty()
+                            && (piece[0] as char).is_ascii_whitespace()
+                            && !params.generation_prompt.as_bytes()[0].is_ascii_whitespace()
+                        {
+                            continue;
+                        }
+                        rb.accept(token);
+                    }
+                }
+                rbudget = Some(rb);
+            }
+        }
+
         // `/* .rng = */ std::mt19937(llama_sampler_get_seed(chain) ^
         // 0x9e3779b9u)` (common/sampling.cpp:439-441) — mix it, the chain and
         // the draft are seeded from this one too
@@ -3192,8 +3591,30 @@ impl SamplingContext {
             prev: RingBuffer::new(32.max(params.n_prev as usize) as usize),
             params,
             chain,
+            rbudget,
             cur: Vec::new(),
             rng,
+        }
+    }
+
+    /// `grammar_should_apply` (common/sampling.cpp:462-473) — a grammar only
+    /// applies when one is attached, and a LAZY grammar is suppressed while
+    /// the budget sampler is inside the thinking block (the tool-call
+    /// grammars must not fire on reasoning text).
+    pub fn grammar_should_apply(&self, grmr_present: bool) -> bool {
+        if !grmr_present {
+            return false;
+        }
+        let Some(rb) = &self.rbudget else {
+            return true;
+        };
+        if self.params.grammar_lazy {
+            matches!(
+                rb.get_state(),
+                ReasoningBudgetState::Idle | ReasoningBudgetState::Done
+            )
+        } else {
+            true
         }
     }
 
@@ -3202,6 +3623,10 @@ impl SamplingContext {
     pub fn sample(&mut self, logits: &[f32]) -> LlamaToken {
         let mut cur_p = TokenDataArray::from_logits(logits);
 
+        // apply the reasoning budget first (common/sampling.cpp:643)
+        if let Some(rb) = self.rbudget.as_ref() {
+            rb.apply(&mut cur_p);
+        }
         self.chain.apply(&mut cur_p);
 
         assert!(
@@ -3212,9 +3637,7 @@ impl SamplingContext {
         let token = cur_p.data[cur_p.selected as usize].id;
         self.cur = cur_p.data[..cur_p.size].to_vec();
 
-        self.chain.accept(token);
-        self.prev.push_back(token);
-
+        self.accept_generated(token, None);
         token
     }
 
@@ -3254,6 +3677,10 @@ impl SamplingContext {
         if grmr.is_none() {
             // `if (grammar_first || !grammar_should_apply(gsmpl)) return id;`
             let mut cur_p = TokenDataArray::from_logits(logits);
+            // the reasoning budget applies first (:643)
+            if let Some(rb) = self.rbudget.as_ref() {
+                rb.apply(&mut cur_p);
+            }
             let id = sample_once(&mut self.chain, &mut cur_p);
             self.cur = cur_p.data[..cur_p.size].to_vec();
             return id;
@@ -3262,13 +3689,17 @@ impl SamplingContext {
         let mut grmr = grmr.unwrap();
 
         let mut cur_p = TokenDataArray::from_logits(logits);
-        if grammar_first {
-            // `llama_sampler_apply(grmr, &cur_p)` before the chain (:642-644)
+        // the reasoning budget applies first (:643)
+        if let Some(rb) = self.rbudget.as_ref() {
+            rb.apply(&mut cur_p);
+        }
+        if grammar_first && self.grammar_should_apply(true) {
+            // `llama_sampler_apply(grmr, &cur_p)` before the chain (:644-646)
             grmr.apply_to(&mut cur_p);
         }
         let id = sample_once(&mut self.chain, &mut cur_p);
         self.cur = cur_p.data[..cur_p.size].to_vec();
-        if grammar_first {
+        if grammar_first || !self.grammar_should_apply(true) {
             return id;
         }
 
@@ -3287,9 +3718,14 @@ impl SamplingContext {
             }
         }
 
-        // resample: grammar first, then the chain (:666-681)
+        // resample: budget + grammar first, then the chain (:666-681)
         let mut cur_p = TokenDataArray::from_logits(logits);
-        grmr.apply_to(&mut cur_p);
+        if let Some(rb) = self.rbudget.as_ref() {
+            rb.apply(&mut cur_p);
+        }
+        if self.grammar_should_apply(true) {
+            grmr.apply_to(&mut cur_p);
+        }
         let id = sample_once(&mut self.chain, &mut cur_p);
         self.cur = cur_p.data[..cur_p.size].to_vec();
         id
@@ -3305,16 +3741,73 @@ impl SamplingContext {
         token
     }
 
-    /// `common_sampler_accept` (feed a prompt token, no sampling)
+    /// `common_sampler_accept` (feed a prompt token, no sampling) — the
+    /// `is_generated = false` flow: the budget sampler is NOT advanced by
+    /// prompt tokens (common/sampling.cpp:486)
     pub fn accept(&mut self, token: LlamaToken) {
         self.chain.accept(token);
         self.prev.push_back(token);
     }
 
-    /// `common_sampler_reset`
+    /// `common_sampler_accept(..., is_generated = true)` (common/sampling.cpp:
+    /// 475-501): the budget sampler accepts first (its state decides the
+    /// grammar gating), a lazy grammar suppressed by an active budget gets
+    /// the matched end sequence replayed on DONE (it may contain a trigger),
+    /// then the grammar (when it applies) and the chain.
+    pub fn accept_generated(
+        &mut self,
+        token: LlamaToken,
+        grmr: Option<&mut GrammarSampler>,
+    ) -> Result<(), String> {
+        let mut grmr = grmr;
+        // computed BEFORE the budget accept — the state changes below
+        // (:477-478)
+        let accept_grammar = self.grammar_should_apply(grmr.is_some());
+
+        if let Some(rb) = self.rbudget.as_mut() {
+            rb.accept(token);
+
+            // if done, replay the end sequence which may contain a grammar
+            // trigger (:490-498)
+            if grmr.is_some() && !accept_grammar && rb.get_state() == ReasoningBudgetState::Done {
+                let end_seq = rb.get_end_match().map(|s| s.to_vec());
+                if let Some(end_seq) = end_seq {
+                    let g = grmr.as_deref_mut().unwrap();
+                    for end_token in end_seq {
+                        g.try_accept(end_token)?;
+                    }
+                }
+            }
+        }
+
+        if let Some(g) = grmr {
+            if accept_grammar {
+                // C throws std::runtime_error from `llama_sampler_accept`
+                g.try_accept(token)?;
+            }
+        }
+        self.chain.accept(token);
+        self.prev.push_back(token);
+        Ok(())
+    }
+
+    /// `common_sampler_reset` — the budget sampler is NOT reset (the C's
+    /// `reset()` clears only `prev` and the chain, common/sampling.cpp:
+    /// 128-132)
     pub fn reset(&mut self) {
         self.chain.reset();
         self.prev.clear();
+    }
+
+    /// `common_sampler_reasoning_budget_force` (common/sampling.cpp:854-860)
+    /// — force the budget sampler into its forcing state (the real-time
+    /// reasoning interruption); false when there is none to force or it is
+    /// not counting.
+    pub fn reasoning_budget_force(&mut self) -> bool {
+        match self.rbudget.as_mut() {
+            Some(rb) => rb.force(),
+            None => false,
+        }
     }
 
     /// `common_sampler_sample_and_accept_n` (common/sampling.cpp:678-715) — the
@@ -3389,7 +3882,10 @@ impl SamplingContext {
             let cur_p = self.get_candidates(true).to_vec();
             let q = &draft_q[i];
 
-            let masked = !grammar_first && grmr.is_some();
+            // `const bool masked = !grammar_first && grammar_should_apply(gsmpl)`
+            // (:752) — a lazy grammar suppressed by an active budget does
+            // not mask the candidates
+            let masked = !grammar_first && self.grammar_should_apply(grmr.is_some());
             if masked {
                 // `cand.assign(cur_p->data, ...)` + `llama_sampler_apply(grmr, &arr)`
                 let mut arr = TokenDataArray {
@@ -3482,16 +3978,14 @@ impl SamplingContext {
         result
     }
 
-    /// `common_sampler_accept(..., accept_grammar = true)` — the chain accept
-    /// plus the grammar accept when a grammar is attached
-    /// (common/sampling.cpp:475-489).
+    /// `common_sampler_accept(..., accept_grammar = true)` — the generated
+    /// flow: budget accept (with the end-seq replay), grammar accept when it
+    /// applies, chain accept (common/sampling.cpp:475-501).
     fn accept_grammar_or_plain(&mut self, token: LlamaToken, grmr: Option<&mut GrammarSampler>) {
-        if let Some(g) = grmr {
-            // C throws std::runtime_error from `llama_sampler_accept`; the
-            // port's try_accept propagates the same failure
-            g.try_accept(token).expect("grammar accept failed");
-        }
-        self.accept(token);
+        // C throws std::runtime_error from `llama_sampler_accept`; the
+        // port's try_accept propagates the same failure
+        self.accept_generated(token, grmr)
+            .expect("grammar accept failed");
     }
 }
 

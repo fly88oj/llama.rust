@@ -24,18 +24,21 @@
 //! reference's per-slot state machine; the checkpoint restore branch
 //! (`COMMON_CONTEXT_SEQ_RM_TYPE_FULL`) is not ported — the port's KV cache
 //! always supports partial sequence removal, which is the branch the reference
-//! takes for its full-attention contexts.
+//! takes for its full-attention contexts. The prompt-cache checkpoints
+//! (033df86b6) ARE ported (`create_checkpoint` + the rollback in
+//! `begin_prompt`, PARTIAL_ONLY blobs + the speculative `data_spec` stash);
+//! the decode-loop `spec_ckpt` (server-context.cpp:3346-3457) keeps its
+//! recorded simplification — the draft rewind rides `seq_rm` alone.
 //!
-//! Not ported (see the parity ledger): multimodal chunks, the prompt-cache checkpoints,
-//! KV shifting on context overflow, `n_cmpl > 1` child slots, and the `idle`
-//! slot sleep/purge logic.
+//! Not ported (see the parity ledger): multimodal chunks, KV shifting on context
+//! overflow, `n_cmpl > 1` child slots, and the `idle` slot sleep/purge logic.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 
 use llama::batch::LlamaBatch;
-use llama::chat_tools::{chat_parse, ChatMsg, ChatMsgDiff, ChatParserParams};
+use llama::chat_tools::{ChatMsg, ChatMsgDiff};
 use llama::context::{BatchOutput, DecodeContext, EncoderContext};
 use llama::sampling::{GrammarSampler, SamplingContext, TokenDataArray};
 use llama::speculative::CommonSpeculative;
@@ -106,6 +109,10 @@ pub struct Task {
     /// `SERVER_TASK_TYPE_DECISION` — the raw `/v1/systemone` body (the
     /// decision context that parses it lives on the engine)
     pub decision_body: Json,
+    /// the chat session of an OAI-chat task (`post_tasks(tasks, session)`,
+    /// server-queue.cpp:527-541 — the state clones it per task; the port
+    /// moves it into the slot's `ChatStreamState` at launch)
+    pub chat_session: Option<llama::chat_tools::ChatSession>,
     pub tx: mpsc::Sender<StreamEvent>,
 }
 
@@ -114,6 +121,87 @@ impl Task {
     pub fn n_tokens(&self) -> i32 {
         self.tokens.len() as i32
     }
+
+    /// `server_task::apply_chat_session` (server-task.h:261-271, 8b5436102):
+    /// apply the session's sampling side + reporting fields + antiprompts +
+    /// message spans to this task. The port also moves the session onto the
+    /// task (`post_tasks(tasks, session)` hands it to the result states).
+    pub fn apply_chat_session(&mut self, session: &llama::chat_tools::ChatSession) {
+        if !session.has_template() {
+            return;
+        }
+
+        // `session.apply_sampling(params.sampling)` — the TOOL_CALLS grammar
+        // kind maps to `grammar_prefill` (the sampler consumes the
+        // generation-prompt literal first, sampling.cpp:294-308)
+        let mut side = llama::chat_tools::ChatSamplingSide {
+            grammar: std::mem::take(&mut self.params.grammar),
+            grammar_lazy: self.params.grammar_lazy,
+            generation_prompt: std::mem::take(&mut self.params.generation_prompt),
+            preserved_tokens: std::mem::take(&mut self.params.preserved_tokens),
+            grammar_triggers: self
+                .params
+                .grammar_triggers
+                .iter()
+                .filter_map(|t| crate::api::json_trigger_to_typed_pub(t.clone()))
+                .collect(),
+        };
+        session.apply_sampling(&mut side);
+        if !side.grammar.is_empty() {
+            self.params.grammar = side.grammar;
+            self.params.grammar_prefill = true;
+        }
+        self.params.grammar_lazy = side.grammar_lazy;
+        self.params.generation_prompt = side.generation_prompt;
+        self.params.preserved_tokens = side.preserved_tokens;
+        self.params.grammar_triggers =
+            side.grammar_triggers.iter().map(crate::api::typed_trigger_to_json_pub).collect();
+
+        // `params.chat_format = session.format()`
+        self.params.chat_format = llama::chat_tools::chat_format_name(session.format())
+            .unwrap_or("Content-only")
+            .to_string();
+
+        // `params.antiprompt.insert(... session.additional_stops())`
+        self.params.antiprompt.extend(session.additional_stops().iter().cloned());
+
+        // `params.message_spans = tokens.find_message_spans(session.message_delimiters())`
+        // — the delimiters are already tokenized in the session
+        self.params.message_user_starts =
+            find_user_starts(&self.tokens, session.message_delimiters());
+
+        // `post_tasks(tasks, chat_session)` (server-queue.cpp:534) — the
+        // session rides the task to its result state
+        self.chat_session = Some(session.clone());
+    }
+}
+
+/// the USER-role half of `common_chat_msg_delimiters::split`
+/// (chat.cpp:143-165, reached through `server_tokens::find_message_spans`,
+/// server-common.cpp:791-797): scan the token stream for the delimiter token
+/// sequences (the first delimiter in list order wins at a position) and
+/// report where user messages start. No media chunks in the port, so the
+/// `skips` map is empty.
+pub fn find_user_starts(tokens: &[i32], delimiters: &[(String, Vec<i32>)]) -> Vec<usize> {
+    let parsed: Vec<(bool, &[i32])> = delimiters
+        .iter()
+        .map(|(role, dt)| (role == "user", dt.as_slice()))
+        .collect();
+    let mut out = Vec::new();
+    'pos: for i in 0..tokens.len() {
+        for (is_user, dt) in &parsed {
+            if dt.is_empty() || i + dt.len() > tokens.len() {
+                continue;
+            }
+            if tokens[i..i + dt.len()] == dt[..] {
+                if *is_user {
+                    out.push(i);
+                }
+                continue 'pos;
+            }
+        }
+    }
+    out
 }
 
 /// `server_slot` (server-context.cpp:239-560)
@@ -125,8 +213,9 @@ pub struct Slot {
     /// `slot.prompt.tokens` — the tokens of this slot's sequence in the cache
     pub prompt_tokens: Vec<i32>,
     /// `slot.prompt.checkpoints` — the saved rollback points of the prompt
-    /// processing (always empty until the prompt-cache checkpoint machinery
-    /// lands; restored slot files may carry them, 033df86b6)
+    /// processing (`create_checkpoint` fills them under the
+    /// `--ctx-checkpoints` gate; restored slot files may carry them,
+    /// 033df86b6)
     pub checkpoints: std::collections::VecDeque<SlotCheckpoint>,
     pub task: Option<Task>,
     pub sampler: Option<SamplingContext>,
@@ -285,9 +374,11 @@ const SLOT_CKPT_VERSION: u32 = 1;
 const N_CTX_CHECKPOINTS: usize = 32;
 
 /// `common_prompt_checkpoint` (common.h:1272-1306) — one saved rollback point
-/// of a slot's prompt processing. The port does not yet create checkpoints
-/// while processing prompts, but slot save files written by the reference
-/// carry them, and the appendix round-trips through here.
+/// of a slot's prompt processing: the PARTIAL_ONLY state blobs of the target
+/// and draft contexts plus the draft's speculative stash
+/// (`common_speculative_get_state`'s data_spec — the eagle3 deferred
+/// boundary). Slot save files written by the reference carry them in the
+/// SCKP appendix, and the appendix round-trips through here.
 #[derive(Clone, Debug, Default)]
 pub struct SlotCheckpoint {
     /// `id_task` — `-1` marks a checkpoint restored from a slot file (not
@@ -303,7 +394,6 @@ pub struct SlotCheckpoint {
 
 impl SlotCheckpoint {
     /// `common_prompt_checkpoint::size()` (common.h:1301-1303)
-    #[allow(dead_code)] // used by the checkpoint machinery (not yet ported)
     pub fn size(&self) -> usize {
         self.data_tgt.len() + self.data_dft.len() + self.data_spec.len()
     }
@@ -581,89 +671,63 @@ fn save_ms_json(key: &str, t_ms: f64) -> Json {
 // renders the final SSE frames.
 // ---------------------------------------------------------------------------
 
-/// the parse state of one OAI-chat task
+/// the parse state of one OAI-chat task — `task_result_state`
+/// (server-task.h:104-133, 8b5436102). The reference keeps it in its response
+/// reader (`server_response_reader::states`, server-queue.h:213); the port
+/// keeps it on the slot because its engine thread renders the final SSE
+/// frames. Since 8b5436102 the `common_chat_session` owns all parsing —
+/// `update_chat_msg` feeds/finishes it.
 pub struct ChatStreamState {
-    /// `chat_parser_params` — the autoparser's arena + the generation prompt
-    pub parser: ChatParserParams,
-    /// `chat_msg` — the previous parsed message (the diff base)
-    pub msg: ChatMsg,
-    /// `generated_input` — the text+tokens accumulated through
-    /// `update_chat_msg` (`common_chat_input`, server-task.h:111; 18b5f8b18)
-    /// (only what was *sent* — the C adds each partial's content chunk)
-    pub generated_input: llama::chat_tools::ChatInput,
+    /// `chat_session` — owns the parser, the accumulated input and the
+    /// current message for this generation (server-task.h:110)
+    pub session: llama::chat_tools::ChatSession,
     /// `generated_tool_call_ids` — the ids already handed out
     pub generated_tool_call_ids: Vec<String>,
 }
 
 impl ChatStreamState {
-    /// `task_result_state`'s constructor (server-task.cpp:141-159) from the
-    /// task's chat metadata; `is_continuation` is always false (the port does
-    /// not splice continuation prompts, see the parity ledger). The generation prompt
-    /// is token-aligned via `common_chat_input_tokenize` — the schema's
-    /// `generation_prompt` handler does this at request-parse time when a
-    /// vocab is available (server-schema.cpp:314-321, 18b5f8b18).
-    fn new(params: &TaskParams, vocab: &Vocab) -> Result<ChatStreamState, String> {
-        let mut parser = ChatParserParams::default();
-        parser.format = chat_format_from_name(&params.chat_format)?;
-        parser.generation_prompt = llama::chat_tools::chat_input_tokenize(vocab, &params.generation_prompt);
-        if !params.chat_parser.is_empty() {
-            // `chat_parser_params.parser.load(data.at("chat_parser"))`
-            // (server-schema.cpp:318-327)
-            parser.parser = llama::peg::PegArena::default();
-            parser
-                .parser
-                .load(&params.chat_parser)
-                .map_err(|e| format!("Failed to initialize chat parser: {e}"))?;
-        }
-        Ok(ChatStreamState {
-            parser,
-            msg: ChatMsg::default(),
-            generated_input: llama::chat_tools::ChatInput::default(),
+    /// `task_result_state(session)` (server-task.cpp:151-159, 8b5436102):
+    /// built from the request's chat session (the prefill parse for a
+    /// continued message already happened in the session constructor,
+    /// chat.cpp:1666-1669)
+    fn new(session: llama::chat_tools::ChatSession) -> ChatStreamState {
+        ChatStreamState {
+            session,
             generated_tool_call_ids: Vec::new(),
-        })
+        }
     }
 
-    /// `task_result_state::update_chat_msg` (server-task.cpp:162-230) with
-    /// `filter_tool_calls = false` — re-parse the accumulated text, hand out
-    /// tool-call ids, and diff against the previous message. Since 18b5f8b18
-    /// the accumulated parse input carries the generating tokens.
+    /// `task_result_state::update_chat_msg` (server-task.cpp:161-197) with
+    /// `filter_tool_calls = false` — feed the chunk to the session, hand out
+    /// tool-call ids, and diff against the previous message.
     fn update_chat_msg(
         &mut self,
         added: &llama::chat_tools::ChatInput,
         is_partial: bool,
     ) -> Result<Vec<ChatMsgDiff>, String> {
-        self.generated_input.append_chunk(added);
-        let msg_prv = self.msg.clone();
+        let msg_prv = self.session.msg().clone();
         //SRV_DBG("Parsing chat message: %s\n", …)
-        let new_msg = chat_parse(&self.generated_input, is_partial, &self.parser)?;
+        // `feed`/`finish` return a reference to the session's message; the
+        // C++ mutates it in place through that alias, the port clones and
+        // stores the id-assigned copy back (same observable state)
+        let mut new_msg = if is_partial {
+            self.session.feed(added)?.clone()
+        } else {
+            self.session.finish(added)?.clone()
+        };
         let mut diffs = Vec::new();
         if !new_msg.empty() {
-            let mut new_msg = new_msg;
             // `new_msg.set_tool_call_ids(generated_tool_call_ids,
             // gen_tool_call_id)` — `gen_tool_call_id()` is a bare
             // `random_string()` (server-common.cpp:130-132)
             let mut ids = std::mem::take(&mut self.generated_tool_call_ids);
             new_msg.set_tool_call_ids(&mut ids, || crate::api::random_string(32));
             self.generated_tool_call_ids = ids;
-            self.msg = new_msg;
-            diffs = ChatMsgDiff::compute_diffs(&msg_prv, &self.msg)?;
+            self.session.set_msg(new_msg.clone());
+            diffs = ChatMsgDiff::compute_diffs(&msg_prv, &new_msg)?;
         }
         Ok(diffs)
     }
-}
-
-/// `static_cast<common_chat_format>(data.at("chat_format"))` — the task params
-/// carry the format *name* (`generation_settings.chat_format`); map it back.
-fn chat_format_from_name(name: &str) -> Result<llama::chat_tools::ChatFormat, String> {
-    use llama::chat_tools::ChatFormat;
-    Ok(match name {
-        "Content-only" => ChatFormat::ContentOnly,
-        "peg-simple" => ChatFormat::PegSimple,
-        "peg-native" => ChatFormat::PegNative,
-        "peg-gemma4" => ChatFormat::PegGemma4,
-        "peg-minimax-m3" => ChatFormat::PegMinimaxM3,
-        other => return Err(format!("unknown chat format: {other}")),
-    })
 }
 
 /// `server_chat_msg_diff_to_json_oaicompat` (server-chat.cpp:621-649) — the
@@ -780,7 +844,10 @@ fn anchor_pattern_full(pattern: &str) -> String {
 /// of `llama_grammar_accept_impl` (llama-grammar.cpp:1398-1455): while the
 /// grammar awaits its trigger, `apply` constrains nothing and the accepted
 /// tokens accumulate in the trigger buffer until a trigger fires (then the
-/// overlapping tokens replay into the grammar).
+/// overlapping tokens replay into the grammar). The reasoning budget applies
+/// before the chain (:643) and gates the grammar — a lazy grammar is
+/// suppressed while the budget is inside the thinking block
+/// (`grammar_should_apply`, :462-473).
 fn sample_with_lazy_grammar(
     smpl: &mut SamplingContext,
     logits: &[f32],
@@ -789,33 +856,65 @@ fn sample_with_lazy_grammar(
 ) -> Result<i32, String> {
     use llama::sampling::TokenData;
     let mut cur_p = TokenDataArray::from_logits(logits);
+    // apply the reasoning budget first (common/sampling.cpp:643)
+    if let Some(rb) = smpl.rbudget.as_ref() {
+        rb.apply(&mut cur_p);
+    }
     smpl.chain.apply(&mut cur_p);
     let id = cur_p.data[cur_p.selected as usize].id;
     smpl.cur = cur_p.data[..cur_p.size].to_vec();
 
-    // the sampled id is checked against the grammar as a single candidate
-    // (`llama_sampler_sample`'s grammar_first=false flow)
-    let mut single = TokenDataArray {
-        data: vec![TokenData { id, logit: 1.0, p: 0.0 }],
-        size: 1,
-        selected: -1,
-        sorted: false,
-    };
-    grammar.apply_to(&mut single);
-    let token = if single.data[0].logit != f32::NEG_INFINITY {
+    // the grammar gate — `grammar_first || !grammar_should_apply(gsmpl)`
+    // returns the id untouched (grammar_first is false on the server)
+    let apply_grammar = smpl.grammar_should_apply(true);
+    let token = if !apply_grammar {
         id
     } else {
-        // resample: grammar first, then the chain
-        let mut cur_p = TokenDataArray::from_logits(logits);
-        grammar.apply_to(&mut cur_p);
-        smpl.chain.apply(&mut cur_p);
-        let t = cur_p.data[cur_p.selected as usize].id;
-        smpl.cur = cur_p.data[..cur_p.size].to_vec();
-        t
+        // the sampled id is checked against the grammar as a single candidate
+        // (`llama_sampler_sample`'s grammar_first=false flow)
+        let mut single = TokenDataArray {
+            data: vec![TokenData { id, logit: 1.0, p: 0.0 }],
+            size: 1,
+            selected: -1,
+            sorted: false,
+        };
+        grammar.apply_to(&mut single);
+        if single.data[0].logit != f32::NEG_INFINITY {
+            id
+        } else {
+            // resample: budget + grammar first, then the chain (:666-681)
+            let mut cur_p = TokenDataArray::from_logits(logits);
+            if let Some(rb) = smpl.rbudget.as_ref() {
+                rb.apply(&mut cur_p);
+            }
+            grammar.apply_to(&mut cur_p);
+            smpl.chain.apply(&mut cur_p);
+            let t = cur_p.data[cur_p.selected as usize].id;
+            smpl.cur = cur_p.data[..cur_p.size].to_vec();
+            t
+        }
     };
 
+    // `common_sampler_accept(..., is_generated = true)` (:475-501) — the
+    // budget accepts first; a lazy grammar suppressed by the active budget
+    // gets the matched end sequence replayed on DONE (it may contain a
+    // trigger), then the lazy accept runs when the grammar applies
+    let accept_grammar = apply_grammar;
+    if let Some(rb) = smpl.rbudget.as_mut() {
+        rb.accept(token);
+        if !accept_grammar && rb.get_state() == llama::sampling::ReasoningBudgetState::Done {
+            let end_seq = rb.get_end_match().map(|s| s.to_vec());
+            if let Some(end_seq) = end_seq {
+                for end_token in end_seq {
+                    grammar_accept_lazy(grammar, triggers, end_token)?;
+                }
+            }
+        }
+    }
+    if accept_grammar {
+        grammar_accept_lazy(grammar, triggers, token)?;
+    }
     smpl.chain.accept(token);
-    grammar_accept_lazy(grammar, triggers, token)?;
     smpl.prev.push_back(token);
     Ok(token)
 }
@@ -919,19 +1018,35 @@ pub struct D1OmniCore {
 }
 
 impl D1OmniCore {
-    /// one decision pass — the text-only mask shapes (single sequence, no
-    /// media: everything visible, plain neighbor taps). Returns the flat
-    /// score rows `[n_tokens][n_embd_out]` (ggml's [3, T] column-major
-    /// layout is token-major in memory — exactly `llama_get_embeddings_ith`
-    /// rows, llama-context.cpp's `outputs_embd`).
-    fn decide(&mut self, tokens: &[i32]) -> Result<Vec<f32>, String> {
+    /// one decision pass. The text-only mask shapes (single sequence, no
+    /// media: everything visible, plain neighbor taps) come out of the same
+    /// `lfm2_media_mask_rule`/`lfm2_conv_mask_rule` the media rows use
+    /// (lfm2.cpp:352-401's set_input). `prompt`'s media map
+    /// (LLAMA_TOKEN_NULL rows) rides `build_inp_embd`'s mixed arm — the
+    /// set_rows scatter of the encoded chunks into the embd input
+    /// (llama-graph.cpp:2462; the reference assembles the same rows in
+    /// server_batch through add_mtmd_chunk, server-context.cpp:900-927).
+    /// Returns the flat score rows `[n_tokens][n_embd_out]` (ggml's [3, T]
+    /// column-major layout is token-major in memory — exactly
+    /// `llama_get_embeddings_ith` rows, llama-context.cpp's `outputs_embd`).
+    fn decide(
+        &mut self,
+        tokens: &[i32],
+        media: &std::collections::BTreeMap<usize, crate::server_decision::MediaEmbds>,
+    ) -> Result<Vec<f32>, String> {
         use ggml::types::GgmlType;
         use llama::graph_arch;
 
+        let prompt_media = media;
         let n = tokens.len();
         let t = n as i64;
         let watermark = self.gctx.mark();
         self.gctx.reset_graph_to(watermark);
+
+        // lfm2_is_media (lfm2.cpp:348-351): a mixed batch's type array — the
+        // port marks the media rows with LLAMA_TOKEN_NULL (-1)
+        let is_media: Vec<bool> = tokens.iter().map(|&tk| tk < 0).collect();
+        let has_media = is_media.iter().any(|&m| m);
 
         let tokens_t = self.gctx.new_tensor_1d(GgmlType::I32, t);
         let pos_t = self.gctx.new_tensor_1d(GgmlType::I32, t);
@@ -939,42 +1054,122 @@ impl D1OmniCore {
         let head_mask = self.gctx.new_tensor_2d(GgmlType::F32, t, t);
         let conv_left = self.gctx.new_tensor_2d(GgmlType::F32, 1, t);
         let conv_right = self.gctx.new_tensor_2d(GgmlType::F32, 1, t);
-        for x in [tokens_t, pos_t, enc_mask, head_mask, conv_left, conv_right] {
-            self.gctx.arena_resize_tensor(x);
+        let mut input_tensors = vec![tokens_t, pos_t, enc_mask, head_mask, conv_left, conv_right];
+        // the arena must hold every input before the fills below (a fresh
+        // new_tensor_* is Storage::None until arena_resize_tensor runs)
+        for x in &input_tensors {
+            self.gctx.arena_resize_tensor(*x);
         }
-        self.gctx
-            .with_i32_mut(tokens_t, |q| q.copy_from_slice(tokens))
-            .ok_or("tensor access failed".to_string())?;
+
+        // the mixed-batch bundle (llama-graph.cpp:2510-2533): the token ids
+        // of the token rows, their batch slots, and the [n_embd, n] embd
+        // rows (the token rows' bytes are placeholders the set_rows
+        // overwrites)
+        let mixed;
+        if has_media {
+            let n_tok_rows = is_media.iter().filter(|&&m| !m).count();
+            let mixed_tokens = self.gctx.new_tensor_1d(GgmlType::I32, n_tok_rows as i64);
+            let mixed_slots = self.gctx.new_tensor_1d(GgmlType::I64, n_tok_rows as i64);
+            let mixed_embd = self.gctx.new_tensor_2d(GgmlType::F32, self.p.n_embd, t);
+            input_tensors.extend_from_slice(&[mixed_tokens, mixed_slots, mixed_embd]);
+            for x in [mixed_tokens, mixed_slots, mixed_embd] {
+                self.gctx.arena_resize_tensor(x);
+            }
+            // inp_tokens carries the raw ids (the C writes ubatch->token,
+            // LLAMA_TOKEN_NULL at media rows); the graph's embd0 gather is
+            // built unconditionally (:2506) so the media rows need a valid
+            // row index — 0, its output is dropped on the mixed arm
+            self.gctx
+                .with_i32_mut(tokens_t, |q| {
+                    for (k, &tk) in tokens.iter().enumerate() {
+                        q[k] = tk.max(0);
+                    }
+                })
+                .ok_or("tensor access failed".to_string())?;
+            self.gctx
+                .with_i32_mut(mixed_tokens, |q| {
+                    let mut j = 0usize;
+                    for &tk in tokens.iter() {
+                        if tk >= 0 {
+                            q[j] = tk;
+                            j += 1;
+                        }
+                    }
+                })
+                .ok_or("tensor access failed".to_string())?;
+            {
+                let bytes = self
+                    .gctx
+                    .data_bytes_mut(mixed_slots)
+                    .ok_or("tensor access failed".to_string())?;
+                let mut j = 0usize;
+                for (i, &m) in is_media.iter().enumerate() {
+                    if !m {
+                        bytes[j * 8..j * 8 + 8].copy_from_slice(&(i as i64).to_le_bytes());
+                        j += 1;
+                    }
+                }
+            }
+            // the embd rows: chunk k's [n_tokens, n_embd] block lands at
+            // batch row idx (row-major [n_embd, n]: element (i, j) at
+            // j * n_embd + i) — add_mtmd_chunk's embd + i * n_embd rows
+            self.gctx
+                .with_f32_mut(mixed_embd, |q| {
+                    q.fill(0.0);
+                    let n_embd = q.len() / n.max(1);
+                    for (&idx, chunk) in prompt_media.iter() {
+                        let embd = chunk.embd.as_ref();
+                        debug_assert_eq!(embd.len(), chunk.n_tokens * n_embd);
+                        for r in 0..chunk.n_tokens {
+                            let dst = (idx + r) * n_embd;
+                            q[dst..dst + n_embd]
+                                .copy_from_slice(&embd[r * n_embd..(r + 1) * n_embd]);
+                        }
+                    }
+                })
+                .ok_or("tensor access failed".to_string())?;
+            mixed = Some(llama::graph::InpMixed {
+                tokens: mixed_tokens,
+                slots: mixed_slots,
+                embd: mixed_embd,
+                type_: is_media.iter().map(|&m| i8::from(m)).collect(),
+            });
+        } else {
+            self.gctx
+                .with_i32_mut(tokens_t, |q| q.copy_from_slice(tokens))
+                .ok_or("tensor access failed".to_string())?;
+            mixed = None;
+        }
+
         self.gctx
             .with_i32_mut(pos_t, |q| {
+                // add_mtmd_chunk's positions (server-context.cpp:916-919):
+                // pos_0 + i — a fresh prompt starts at 0, every row is
+                // sequential, media and text alike
                 for (k, v) in q.iter_mut().enumerate() {
                     *v = k as i32;
                 }
             })
             .ok_or("tensor access failed".to_string())?;
-        // text-only single sequence: every position visible in both masks
-        // (lfm2.cpp:352-384's set_input with no media rows)
-        self.gctx.with_f32_mut(enc_mask, |q| q.fill(0.0)).ok_or("tensor access failed".to_string())?;
-        self.gctx.with_f32_mut(head_mask, |q| q.fill(0.0)).ok_or("tensor access failed".to_string())?;
-        // the neighbor taps: left[i+1] = right[i] = 1 within the sequence
-        // (lfm2_conv_mask_rule, graph_arch.rs)
+        // the media masks of llm_graph_input_attn_media::set_input
+        // (lfm2.cpp:360-384): enc — the media never reads the text; head —
+        // each kind reads its own only (all-visible without media rows)
+        let seq = vec![0u32; n];
+        let pos: Vec<i32> = (0..n as i32).collect();
+        let enc = graph_arch::lfm2_media_mask_rule(false, &is_media, &seq, n);
+        let head = graph_arch::lfm2_media_mask_rule(true, &is_media, &seq, n);
+        let (left, right) = graph_arch::lfm2_conv_mask_rule(&is_media, &seq, &pos, n);
         self.gctx
-            .with_f32_mut(conv_left, |q| {
-                q[0] = 0.0;
-                for v in q.iter_mut().skip(1) {
-                    *v = 1.0;
-                }
-            })
+            .with_f32_mut(enc_mask, |q| q.copy_from_slice(&enc))
             .ok_or("tensor access failed".to_string())?;
         self.gctx
-            .with_f32_mut(conv_right, |q| {
-                for v in q.iter_mut().take(n.saturating_sub(1)) {
-                    *v = 1.0;
-                }
-                if n > 0 {
-                    q[n - 1] = 0.0;
-                }
-            })
+            .with_f32_mut(head_mask, |q| q.copy_from_slice(&head))
+            .ok_or("tensor access failed".to_string())?;
+        self.gctx
+            .with_f32_mut(conv_left, |q| q.copy_from_slice(&left))
+            .ok_or("tensor access failed".to_string())?;
+        self.gctx
+            .with_f32_mut(conv_right, |q| q.copy_from_slice(&right))
             .ok_or("tensor access failed".to_string())?;
 
         let inp = graph_arch::Lfm2DecisionInputs {
@@ -984,6 +1179,7 @@ impl D1OmniCore {
             kq_mask_head: head_mask,
             conv_left,
             conv_right,
+            mixed,
             out_ids: None,
         };
         let result =
@@ -1009,6 +1205,14 @@ impl D1OmniCore {
 /// `server_context_impl` — the model side of the server.
 pub struct Engine {
     pub core: Core,
+    /// `ctx_server.mctx` (server-context.cpp:1150-1180) — the mtmd context
+    /// of `--mmproj`; the port wires it for the decision media path only
+    /// (the d1-omni audio lane), None without the flag
+    pub mctx: Option<llama::mtmd::MtmdContext>,
+    /// `meta->has_inp_image` = chat_params.allow_image =
+    /// mtmd_support_vision(mctx) — true when the mmproj carries a vision
+    /// encoder section (ctx_v != nullptr, server-context.cpp:1615 + 4704)
+    pub mmproj_has_vision: bool,
     /// shared with the connection threads (tokenize/detokenize) — `Vocab` has
     /// no interior mutability
     pub vocab: Arc<Vocab>,
@@ -1159,6 +1363,10 @@ pub struct Server {
     // ---- the chat / embedding surface the handlers read ----
     /// `params.embedding` — whether the embedding endpoints are enabled
     pub embeddings: bool,
+    /// `ctx_server.decision.type != COMMON_DECISION_TYPE_NONE`
+    /// (server-context.cpp:5757-5762) — the pre-body-parse guard of
+    /// `/v1/systemone`; the decision context itself lives on the engine
+    pub is_decision_model: bool,
     /// `llama_pooling_type(ctx_tgt)` (resolved, llama-context.cpp:216-222)
     pub pooling: llama::hparams::LlamaPoolingType,
     /// the chat-template inputs of `/v1/chat/completions`
@@ -1414,7 +1622,7 @@ impl Engine {
             // NONE was forced at load, common.cpp:1285-1290) — an /embeddings
             // request against the decision model answers with the per-token
             // score rows like the reference's encode reroute
-            Core::Decision(d) => match d.decide(&tokens) {
+            Core::Decision(d) => match d.decide(&tokens, &std::collections::BTreeMap::new()) {
                 Ok(v) => (d.n_embd_out, tokens.len(), v),
                 Err(e) => {
                     err(&format!("failed to encode: {e}"), 500);
@@ -1526,28 +1734,62 @@ impl Engine {
             }
         };
         // `if (!files.empty() && (!decision.can_use_images() || !meta->has_inp_image))`
-        // (server-context.cpp:5463-5467) — the port has no mmproj wiring, so
-        // `has_inp_image` is always false and ANY image answers 501
-        if !files.is_empty() {
-            err(
-                task,
-                "This server does not support image input for decisions. For a model that \
-                 supports it, start it with `--mmproj`",
-                501,
-            );
-            return;
-        }
+        // (server-context.cpp:5766-5771) — `has_inp_image` is
+        // chat_params.allow_image = mtmd_support_vision(mctx) = ctx_v !=
+        // nullptr (server-context.cpp:1615 + mtmd.cpp:2223): an mmproj with
+        // a vision encoder opens the gate for ANY media, audio included
+        // (d1-omni's real mmproj carries both towers). The port reads the
+        // vision section flag off the mmproj file (engine.rs `mmproj_has_vision`)
+        // hoisted out of the `dc` borrow: prepare_decision_media needs
+        // &mut self (the mtmd context), the gate check reads the context
+        let dc_can_use_images = dc.can_use_images();
+        let media = if files.is_empty() {
+            None
+        } else {
+            if !dc_can_use_images || !self.mmproj_has_vision || self.mctx.is_none() {
+                err(
+                    task,
+                    "This server does not support image input for decisions. For a model that \
+                     supports it, start it with `--mmproj`",
+                    501,
+                );
+                return;
+            }
+            // `process_mtmd_prompt(markers, files, mctx, init_opt)`
+            // (server-decision.cpp:776-789 + server-common.cpp:974-1007) —
+            // decode the files, tokenize the marker string, encode the
+            // chunks; non-omni formats stay text-only (the port's decode
+            // cores have no mixed-batch face yet — the reference rides
+            // process_mtmd_prompt for them at server-decision.cpp:683)
+            match self.prepare_decision_media(&files) {
+                Ok(m) => m,
+                Err((msg, code)) => {
+                    err(task, &msg, code);
+                    return;
+                }
+            }
+        };
 
-        // `get_media_marker()` (server-common.cpp) — only reachable with
-        // images in the reference; the port's constant marker
-        let media_marker = llama::mtmd::mtmd_default_marker();
+        // rebind the decision context: the media prep above released the
+        // first borrow (it needed &mut self for the mtmd context)
+        let dc = self.decision.as_ref().unwrap();
+
+        // `get_media_marker()` (server-common.cpp) — the instance marker of
+        // `server_context_impl` (mtmd's split marker is the same string,
+        // server-context.cpp:1158)
+        let media_marker = self.media_marker.clone();
 
         // one task per variant of each question, or one task for all the
         // questions (server-context.cpp:5477-5493)
         let mut specs: Vec<DecisionTaskSpec> = Vec::new();
         if dc.is_joint() {
             match dc.fill_task_joint(&state, &questions) {
-                Ok((tokens, spec)) => specs.push(DecisionTaskSpec { tokens, spec, index: 0 }),
+                Ok((prompt, spec)) => specs.push(DecisionTaskSpec {
+                    tokens: prompt.tokens,
+                    media: prompt.media,
+                    spec,
+                    index: 0,
+                }),
                 Err(e) => {
                     err(task, &e, 500);
                     return;
@@ -1557,16 +1799,25 @@ impl Engine {
             let mut flat = 0usize;
             for q in &questions {
                 for variant in 0..dc.n_variants(q) {
-                    match dc.fill_task(&state, &questions, q, variant, files.len(), &media_marker, &files) {
-                        Ok((tokens, spec)) => {
-                            specs.push(DecisionTaskSpec { tokens, spec, index: flat })
+                    match dc.fill_task(&state, &questions, q, variant, media.as_ref(), &media_marker) {
+                        Ok((prompt, spec)) => {
+                            specs.push(DecisionTaskSpec {
+                                tokens: prompt.tokens,
+                                media: prompt.media,
+                                spec,
+                                index: flat,
+                            })
                         }
                         Err(e) => {
                             // "the instructions and the options of a question
-                            // must not be empty" and d1's "no single-token
-                            // label left" are the path's invalid_argument
+                            // must not be empty", d1's "no single-token label
+                            // left" and d1-omni's "a request has images or one
+                            // audio clip, not both" are the path's
+                            // invalid_argument (400); the rest is 500
                             let code = if e.contains("must not be empty")
                                 || e.contains("no single-token label left")
+                                || e.contains("images or one audio clip")
+                                || e.contains("send fewer images")
                             {
                                 400
                             } else {
@@ -1653,7 +1904,7 @@ impl Engine {
             let parent_scores = if boundary.is_some() {
                 self.decision_decode_continue(&g.parent.tokens, g.n_tokens_shared, &g.parent.spec)
             } else {
-                self.decision_decode_one(&g.parent.tokens, &g.parent.spec)
+                self.decision_decode_one(&g.parent)
             };
             match parent_scores {
                 Ok(s) => {
@@ -1750,6 +2001,98 @@ impl Engine {
         let _ = task.tx.send(StreamEvent::Done);
     }
 
+    /// `process_mtmd_prompt` for the decision media (server-common.cpp:974-
+    /// 1007, reached from fill_task_d1omni at server-decision.cpp:785): the
+    /// request's file strings become raw buffers (handle_media's data:/
+    /// raw-base64 arms), the markers string is tokenized against them
+    /// (`mtmd_tokenize`, add_special = true — BOS/EOS wrap the whole prefix,
+    /// mtmd.cpp:1290-1312), every audio chunk is encoded through the mmproj
+    /// (`mtmd_encode_chunk`), and the flattened rows build the
+    /// `server_tokens` stand-in: LLAMA_TOKEN_NULL at the chunk positions,
+    /// the encoded block mapped at each chunk's start index. Non-audio
+    /// buffers have no tower in the port (the d1omni_v vision projector is
+    /// unported) — they answer the reference's no-mmproj 501.
+    fn prepare_decision_media(
+        &mut self,
+        files: &[String],
+    ) -> Result<Option<crate::server_decision::DecisionMedia>, (String, i64)> {
+        use crate::server_decision::{decision_media_bytes, DecisionMedia, DecisionTokens, MediaEmbds};
+        use llama::mtmd::{MtmdChunk, MtmdMedia};
+
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let not_supported = || {
+            (
+                "This server does not support image input for decisions. For a model that \
+                 supports it, start it with `--mmproj`"
+                    .to_string(),
+                501i64,
+            )
+        };
+        // handle_media (server-common.cpp:1123-1192): data: URL or raw
+        // base64 -> the decoded buffer; the http/file:// arms were rejected
+        // at parse time (decision_load_image/decision_load_audio)
+        let mut bufs: Vec<Vec<u8>> = Vec::with_capacity(files.len());
+        for f in files {
+            bufs.push(decision_media_bytes(f).map_err(|e| (e, 400i64))?);
+        }
+        // the port's audio decode is WAV-only (mtmd_audio's policy); mtmd
+        // tells an audio clip from an image by content
+        // (mtmd_helper_bitmap_init_from_buf, mtmd-helper.cpp:381-387) —
+        // anything else would need the vision tower
+        if bufs.iter().any(|b| !llama::mtmd::is_wav_file(b)) {
+            return Err(not_supported());
+        }
+        let Some(mctx) = self.mctx.as_mut() else {
+            return Err(not_supported());
+        };
+
+        // `mtmd_tokenize(mctx, markers, bitmaps, add_special=true)`: the
+        // markers string is the media marker repeated per file — n_files + 1
+        // empty segments, one audio part between each pair
+        // (server-decision.cpp:776-778 builds the same string)
+        let segments: Vec<&str> = vec![""; bufs.len() + 1];
+        let media_parts: Vec<MtmdMedia> = bufs.iter().map(|b| MtmdMedia::Audio(b.as_slice())).collect();
+        let chunks = mctx
+            .tokenize_parts(&self.vocab, &segments, &media_parts, true)
+            .map_err(|e| (format!("Failed to tokenize prompt: {e}"), 500i64))?;
+
+        // `server_tokens(chunks, true)` + the audio-kind scan
+        // (server-decision.cpp:786-792): a chunk's NULL rows carry its
+        // n_tokens; the audio kind is read off the chunk type
+        let mut rows = DecisionTokens::default();
+        let mut is_audio = false;
+        for chunk in &chunks {
+            match chunk {
+                MtmdChunk::Text(toks) => rows.tokens.extend_from_slice(toks),
+                MtmdChunk::Audio(audio) => {
+                    let idx = rows.tokens.len();
+                    let embd = mctx
+                        .encode_chunk(chunk)
+                        .map_err(|e| (format!("Failed to load image or audio file: {e}"), 500i64))?;
+                    rows.tokens
+                        .extend(std::iter::repeat(-1).take(audio.n_tokens as usize));
+                    rows.media.insert(
+                        idx,
+                        MediaEmbds {
+                            n_tokens: audio.n_tokens as usize,
+                            embd: std::sync::Arc::new(embd.to_vec()),
+                        },
+                    );
+                    is_audio = true;
+                }
+                // the gate above rejected every non-audio buffer
+                MtmdChunk::Image(_) => return Err(not_supported()),
+            }
+        }
+        Ok(Some(DecisionMedia {
+            rows,
+            is_audio,
+            n_files: bufs.len(),
+        }))
+    }
+
     /// `send_decision`'s label arm (server-context.cpp:2278-2286): the logits
     /// of the label tokens at the last prompt token.
     /// the `decision.label_groups` reduction of `send_decision`
@@ -1758,13 +2101,12 @@ impl Engine {
     #[allow(clippy::case_sensitive_file_extension_comparisons)]
     fn decision_decode_one(
         &mut self,
-        tokens: &[i32],
-        spec: &crate::server_decision::DecisionSpec,
+        spec: &crate::server_decision::DecisionTaskSpec,
     ) -> Result<Vec<f32>, (String, i64)> {
-        if !spec.labels.is_empty() {
-            let logits = self.decode_last_logits(tokens)?;
-            let mut out = Vec::with_capacity(spec.labels.len());
-            for &label in &spec.labels {
+        if !spec.spec.labels.is_empty() {
+            let logits = self.decode_last_logits(&spec.tokens)?;
+            let mut out = Vec::with_capacity(spec.spec.labels.len());
+            for &label in &spec.spec.labels {
                 let row = *logits
                     .get(label as usize)
                     .ok_or_else(|| ("failed to get logits".to_string(), 500i64))?;
@@ -1772,12 +2114,12 @@ impl Engine {
             }
             // `decision.label_groups`: the output of a group is the max of
             // its labels' scores (server-context.cpp:2347-2355, 88dcc460d)
-            reduce_label_groups(&mut out, spec);
+            reduce_label_groups(&mut out, &spec.spec);
             return Ok(out);
         }
         // markers / joint: the embeddings output (`llama_get_embeddings_ith`)
-        let (n_embd_out, n_rows, values) = self.decode_rows(tokens)?;
-        self.decision_scores_from_rows(spec, &values, n_rows, n_embd_out, tokens.len())
+        let (n_embd_out, n_rows, values) = self.decode_rows(&spec.tokens, &spec.media)?;
+        self.decision_scores_from_rows(&spec.spec, &values, n_rows, n_embd_out, spec.tokens.len())
     }
 
     /// the parent of a shared-prefix group: the prefix is already in the
@@ -1809,17 +2151,39 @@ impl Engine {
         let _ = tail;
         let _ = pos;
         // the embeddings family shares only via kev, whose child path
-        // re-decodes whole prompts anyway — unreachable in practice
-        self.decision_decode_one(tokens, spec)
+        // re-decodes whole prompts anyway — unreachable in practice (the
+        // text re-decode would need the whole spec, kept as-is below)
+        self.decision_decode_one_text(tokens, spec)
+    }
+
+    /// the text-only whole-prompt twin of `decision_decode_one` (labels at
+    /// the last token) — `decision_decode_continue`'s unreachable fallback
+    fn decision_decode_one_text(
+        &mut self,
+        tokens: &[i32],
+        spec: &crate::server_decision::DecisionSpec,
+    ) -> Result<Vec<f32>, (String, i64)> {
+        let pos: Vec<i32> = (0..tokens.len() as i32).collect();
+        let logits = self.decode_continue_logits_at(tokens, &pos)?;
+        let mut out = Vec::with_capacity(spec.labels.len());
+        for &label in &spec.labels {
+            let row = *logits
+                .get(label as usize)
+                .ok_or_else(|| ("failed to get logits".to_string(), 500i64))?;
+            out.push(row);
+        }
+        reduce_label_groups(&mut out, spec);
+        Ok(out)
     }
 
     /// the shared-prefix boundary decode: run the parent's first `shared`
     /// tokens (one batch, exactly where the reference's batch fill stops —
     /// "stop at the end of the shared prefix", server-context.cpp:3926-3932)
     /// and return the full-sequence state snapshot at that point
-    /// (`copy_prompt_to`'s `seq_cp` source state). The port's snapshot is
-    /// `state_seq_get_data(0, false)` — the full state, because the
-    /// recurrent half is not in the PARTIAL_ONLY blob.
+    /// (`copy_prompt_to`'s `seq_cp` source state, server-context.cpp:
+    /// 761-772). The port's snapshot is `state_seq_get_data(0, false)` — the
+    /// FULL state, standing in for the C's `seq_cp` (which copies every
+    /// half); a PARTIAL_ONLY blob would drop the attn half of a hybrid.
     fn decision_decode_prefix(
         &mut self,
         parent_tokens: &[i32],
@@ -1885,9 +2249,11 @@ impl Engine {
         }
         // embeddings path: re-decode the whole child prompt (the encode core
         // has no shared-prefix continuation; answers are identical, only the
-        // cache accounting differs)
+        // cache accounting differs) — the shared families are text-only, so
+        // the child's media map is empty here
         let _ = parent_tokens;
-        let (n_embd_out, n_rows, values) = self.decode_rows(child_tokens)?;
+        let (n_embd_out, n_rows, values) =
+            self.decode_rows(child_tokens, &std::collections::BTreeMap::new())?;
         self.decision_scores_from_rows(spec, &values, n_rows, n_embd_out, child_tokens.len())
     }
 
@@ -2008,7 +2374,11 @@ impl Engine {
     /// per-token embedding rows (pooling NONE) — the encoder core's
     /// `llama_encode`, the decode core's `decode_embed`, the d1-omni core's
     /// own stateless forward
-    fn decode_rows(&mut self, tokens: &[i32]) -> Result<(usize, usize, Vec<f32>), (String, i64)> {
+    fn decode_rows(
+        &mut self,
+        tokens: &[i32],
+        media: &std::collections::BTreeMap<usize, crate::server_decision::MediaEmbds>,
+    ) -> Result<(usize, usize, Vec<f32>), (String, i64)> {
         let pos: Vec<i32> = (0..tokens.len() as i32).collect();
         match &mut self.core {
             Core::Encode(enc) => match enc.encode(tokens) {
@@ -2017,8 +2387,9 @@ impl Engine {
             },
             // the d1-omni model: one whole-prompt pass through
             // `build_lfm2_decision_forward` — the [3, T] scores read as T
-            // rows of n_embd_out (the `llama_get_embeddings_ith` layout)
-            Core::Decision(d) => match d.decide(tokens) {
+            // rows of n_embd_out (the `llama_get_embeddings_ith` layout);
+            // the media map rides the mixed-batch arm of `build_inp_embd`
+            Core::Decision(d) => match d.decide(tokens, media) {
                 Ok(v) => Ok((d.n_embd_out, tokens.len(), v)),
                 Err(e) => Err((format!("failed to encode: {e}"), 500)),
             },
@@ -2044,14 +2415,19 @@ impl Engine {
         }
     }
 
-    /// the checkpoint blob's `partial_only` flag. The reference writes
-    /// `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (the swa half / the recurrent
-    /// cells / the whole plain KV); the port's partial blob SKIPS the
-    /// recurrent half (`state_write_attn_half`, context.rs:3306-3313), so a
-    /// recurrent/hybrid memory snapshots the full state — a superset that
-    /// restores the same cells (see `create_checkpoint`'s doc comment)
+    /// the checkpoint blob's `partial_only` flag — always
+    /// `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` on the reference
+    /// (server-context.cpp:2575-2576 update_tgt/update_dft, :3746-3747 the
+    /// rollback loads). The flag's meaning per memory kind (llama-memory-
+    /// hybrid.cpp:190-196 / llama-kv-cache-iswa.cpp:260-268): the recurrent
+    /// cells and the swa half are stashed, the attn base half of a hybrid
+    /// and the base half of an iswa pair are not; a plain KV writes
+    /// everything (GGML_UNUSED). The port's partial blob is the same shape
+    /// (context.rs `state_write_attn_half` + kv_cache.rs `state_seq_write`),
+    /// so the checkpoint snapshots are upstream-shaped — recurrent/hybrid
+    /// checkpoints no longer carry the attention prefix (memory saved).
     fn ckpt_partial_only(&self) -> bool {
-        !matches!(&self.core, Core::Decode(d) if d.weights.recurrent_dims().is_some())
+        true
     }
 
     /// `llama_memory_seq_pos_min` of the target memory, hybrid-aware:
@@ -2106,11 +2482,10 @@ impl Engine {
     /// The reference saves `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (the swa half
     /// of an iswa cache, the recurrent cells of a hybrid, everything of a
     /// plain KV — llama-kv-cache-iswa.cpp:260-266 /
-    /// llama-memory-hybrid.cpp:190-196). The port's partial blob skips the
-    /// recurrent half (`state_write_attn_half`,
-    /// context.rs:3306-3313), so on a recurrent/hybrid memory the port
-    /// snapshots the FULL state instead — a superset that restores the same
-    /// cells plus the (already identical) attention prefix.
+    /// llama-memory-hybrid.cpp:190-196). The port's partial blob is the same
+    /// shape (the recurrent half always serializes, the attn half of a hybrid
+    /// and the base half of an iswa pair are skipped), so the snapshot below
+    /// is upstream-shaped — no full-state superset any more.
     fn create_checkpoint(&mut self, si: usize, n_tokens_cur: usize) {
         let id_task = self.slots[si].task.as_ref().map(|t| t.id).unwrap_or(-1);
         let n_ctx_checkpoints = self.n_ctx_checkpoints.max(0) as usize;
@@ -2151,9 +2526,9 @@ impl Engine {
         // `update_pos` + `update_tgt`/`update_dft` (PARTIAL_ONLY)
         let id = self.slots[si].id;
         let (pos_min, pos_max) = (self.mem_pos_min(id), self.mem_pos_max(id));
-        let recurrent = !self.ckpt_partial_only();
-        // the partial/full choice — see the doc comment above
-        let partial_only = !recurrent;
+        // the partial/full choice — always PARTIAL_ONLY, see
+        // `ckpt_partial_only`
+        let partial_only = self.ckpt_partial_only();
         let (data_tgt, data_dft) = match &mut self.core {
             Core::Decode(d) => (
                 d.state_seq_get_data(id, partial_only),
@@ -2165,11 +2540,17 @@ impl Engine {
             Core::Encode(_) | Core::Decision(_) => (Vec::new(), Vec::new()),
         };
         // `common_speculative_get_state` (server-context.cpp:2577) — the
-        // draft's speculative stash (eagle3's deferred g_embd row). The
-        // port's CommonSpeculative has no get/set-state surface, so the
-        // stash stays empty; nothing reads it on the port's rollback path
-        // (the draft sequence is rebuilt from the restored target state)
-        let data_spec = Vec::new();
+        // draft's speculative stash (eagle3's deferred g_embd row, only when
+        // the target is recurrent/hybrid — the single-position checkpoint
+        // restore would otherwise drop it, speculative.cpp:938-942)
+        let data_spec = match self.spec.as_mut() {
+            Some(spec) => {
+                let mut data = Vec::new();
+                spec.get_state(id, &mut data);
+                data
+            }
+            None => Vec::new(),
+        };
 
         self.slots[si].checkpoints.push_back(SlotCheckpoint {
             id_task,
@@ -2592,7 +2973,7 @@ impl Engine {
     /// `launch_slot_with_task` (server-context.cpp:1707-1825) — the parts the
     /// port honours: the prompt validation, the sampler chain, the per-request
     /// generation limit.
-    fn launch_slot(&mut self, si: usize, task: Task) {
+    fn launch_slot(&mut self, si: usize, mut task: Task) {
         let n_predict = if task.params.n_predict != -1 {
             task.params.n_predict
         } else {
@@ -2605,6 +2986,12 @@ impl Engine {
         // `n_probs` rides on the sampling params (common.h:700) — it decides
         // the greedy/dist eligibility of the chain's tail (d0b490f25)
         sampling.n_probs = task.params.n_probs;
+        // `generation_prompt` (common.h:288) and `grammar_lazy` — the budget
+        // sampler's prefill source and init gate
+        // (common/sampling.cpp:280-296/:315); the port carries both on the
+        // task params like n_probs
+        sampling.generation_prompt = task.params.generation_prompt.clone();
+        sampling.grammar_lazy = task.params.grammar_lazy;
         let mut sampler = SamplingContext::new_with_vocab(
             self.n_vocab,
             Some(&self.vocab),
@@ -2762,22 +3149,10 @@ impl Engine {
             }
         };
 
-        // the OAI-chat parse state (`task::create_state`, server-queue.cpp:530)
+        // the OAI-chat parse state (`task_result_state(session)`,
+        // server-queue.cpp:534, 8b5436102)
         let chat = if task.params.res_type == ResponseType::OaiChat {
-            match ChatStreamState::new(&task.params, &self.vocab) {
-                Ok(state) => Some(state),
-                Err(e) => {
-                    let _ = task.tx.send(StreamEvent::Frame(error_frame(
-                        crate::api::json_error(
-                            &format!("Failed to initialize samplers: {e}"),
-                            crate::api::ERROR_TYPE_INVALID_REQUEST.0,
-                            crate::api::ERROR_TYPE_INVALID_REQUEST.1,
-                        ),
-                    )));
-                    let _ = task.tx.send(StreamEvent::Done);
-                    return;
-                }
-            }
+            Some(ChatStreamState::new(task.chat_session.take().unwrap_or_default()))
         } else {
             None
         };
@@ -3406,6 +3781,13 @@ impl Engine {
                         };
                         if ok {
                             do_reset = false;
+                            // `common_speculative_set_state(spec.get(), slot.id,
+                            // it->data_spec)` (server-context.cpp:3759) —
+                            // restore the draft's speculative stash (the
+                            // eagle3 deferred boundary) with the checkpoint
+                            if let Some(spec) = self.spec.as_mut() {
+                                spec.set_state(id, &c.data_spec);
+                            }
                             // `pos_next = min(pos_next, max(pos_min + 1, pos_max))`;
                             // `n_past = min(size_up_to_pos(pos_next), n_tokens)`
                             // (server-context.cpp:3755-3757 — the positions are
@@ -4118,7 +4500,7 @@ impl Engine {
                 .update_chat_msg(&added, false)
             {
                 Ok(diffs) => {
-                    let msg = self.slots[si].chat.as_ref().unwrap().msg.clone();
+                    let msg = self.slots[si].chat.as_ref().unwrap().session.msg().clone();
                     Some((msg, diffs))
                 }
                 Err(e) => {

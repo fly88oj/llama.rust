@@ -20,7 +20,10 @@
 //! overrides beyond what the hparams carry, and the `libmtmd` C ABI.
 
 use ggml::ops::GGML_ROPE_TYPE_NEOX;
-use ggml::ops::{GGML_ROPE_TYPE_VISION, GGML_SCALE_FLAG_ALIGN_CORNERS, GGML_SCALE_MODE_BILINEAR};
+use ggml::ops::{
+    GGML_ROPE_TYPE_VISION, GGML_SCALE_FLAG_ALIGN_CORNERS, GGML_SCALE_FLAG_ANTIALIAS,
+    GGML_SCALE_MODE_BILINEAR,
+};
 use ggml::{Context, GgmlType, Gguf, Graph, TensorId};
 use std::sync::Arc;
 
@@ -42,6 +45,15 @@ pub enum ProjectorType {
     /// swapped-swiglu two-layer projector (models/siglip.cpp:48-56,
     /// mtmd-image.cpp:1145, clip-impl.h:513 "cohere2v", upstream 50a6c5cf7)
     Cohere2V,
+    /// LFM2-VL vision — the SigLIP tower with the position grid bilinearly
+    /// resized to the image (siglip2 naflex) and a pixel-unshuffle + optional
+    /// input-norm + GELU projector (models/siglip.cpp:58-82, clip-impl.h:548
+    /// "lfm2")
+    Lfm2,
+    /// d1-omni vision — the LFM2-VL tower with GELU-ERF in the projector,
+    /// PAD_NONE refined tiles and no marker tokens (models/siglip.cpp:58-82,
+    /// clip-impl.h:549 "d1omni_v", mtmd.cpp:874-877)
+    D1OmniV,
 
     /// audio-only whisper-encoder family (`clip.audio.projector_type` /
     /// `clip.projector_type` == "qwen2a", clip-impl.h:533)
@@ -100,6 +112,8 @@ impl ProjectorType {
             "qwen3vl_merger" => ProjectorType::Qwen3Vl,
             "ling3vl" => ProjectorType::Ling3Vl,
             "cohere2v" => ProjectorType::Cohere2V,
+            "lfm2" => ProjectorType::Lfm2,
+            "d1omni_v" => ProjectorType::D1OmniV,
             "qwen2a" => ProjectorType::Qwen2A,
             "ultravox" => ProjectorType::Ultravox,
             "voxtral" => ProjectorType::Voxtral,
@@ -129,6 +143,8 @@ impl ProjectorType {
             ProjectorType::Qwen3Vl => "qwen3vl_merger",
             ProjectorType::Ling3Vl => "ling3vl",
             ProjectorType::Cohere2V => "cohere2v",
+            ProjectorType::Lfm2 => "lfm2",
+            ProjectorType::D1OmniV => "d1omni_v",
             ProjectorType::Qwen2A => "qwen2a",
             ProjectorType::Ultravox => "ultravox",
             ProjectorType::Voxtral => "voxtral",
@@ -452,6 +468,10 @@ pub struct ClipHparams {
     pub rvq_num_quantizers: i32,
     pub rvq_codebook_size: Vec<i32>,
     pub attn_window_size: i32,
+    /// clip-model.h:101 `n_wa_pattern` — the qwen2.5-vl window/full attention
+    /// period: layer il takes full attention iff `(il + 1) % n_wa_pattern ==
+    /// 0`, otherwise windowed (models/qwen2vl.cpp:97). 0 = no windowed layers.
+    pub n_wa_pattern: i32,
     /// -1 (full attention) / 0 (windowed) per layer
     pub wa_pattern_mode: Vec<i32>,
     /// `clip.gen.audio.model_variant` (clip-impl.h:98) — the c2w/pocket decoder selector
@@ -541,6 +561,7 @@ impl Default for ClipHparams {
             rvq_num_quantizers: 0,
             rvq_codebook_size: Vec::new(),
             attn_window_size: 0,
+            n_wa_pattern: 0,
             wa_pattern_mode: Vec::new(),
             gen_model_variant: String::new(),
             audio_local_n_layer: 0,
@@ -1178,12 +1199,15 @@ mod keys {
     pub const PREPROC_MAX_TILES: &str = "clip.vision.preproc_max_tiles";
     /// clip.vision.image_resize_algo — the lfm2/d1omni_v optional override
     /// (clip-impl.h:60, read at clip.cpp:1533-1543)
-    #[allow(dead_code)] // its reading arm is the lfm2 vision family — gap open
     pub const IMAGE_RESIZE_ALGO: &str = "clip.vision.image_resize_algo";
     /// clip.vision.projector.scale_factor — cohere2v n_merge (clip.cpp:1522)
     pub const PROJ_SCALE_FACTOR: &str = "clip.vision.projector.scale_factor";
     pub const LAYER_NORM_EPS: &str = "clip.vision.attention.layer_norm_epsilon";
-    pub const WIN_ATTN_PATTERN: &str = "clip.vision.attention.window_pattern";
+    /// clip-impl.h:71 `KEY_WIN_ATTN_PATTERN` — the qwen2.5-vl window/full
+    /// attention period (add_vision_n_wa_pattern, conversion/qwenvl.py:70-78).
+    /// (Fixed from the stale "clip.vision.attention.window_pattern" string —
+    /// upstream key and gguf-py constants.py:419 both read n_wa_pattern.)
+    pub const WIN_ATTN_PATTERN: &str = "clip.vision.n_wa_pattern";
     /// clip-impl.h:60 — `clip.%s.*` templates
     pub const N_EMBD: &str = "clip.vision.embedding_length";
     pub const N_FF: &str = "clip.vision.feed_forward_length";
@@ -1504,14 +1528,14 @@ fn load_hparams(
         | ProjectorType::Ling3Vl => {
             hparams.n_merge = gu32(keys::SPATIAL_MERGE_SIZE).unwrap_or(2);
             hparams.image_resize_algo = ResizeAlgo::Bicubic;
-            // KEY_WIN_ATTN_PATTERN is required for qwen2.5-vl; not read here —
-            // the window-attention branch of the graph is not ported
-            // (clip.cpp:1666, models/qwen2vl.cpp:37-99).
-            if gguf.get_u32(keys::WIN_ATTN_PATTERN).is_some() {
-                log_line(&format!(
-                    "warning: {} has window attention, which this port does not implement",
-                    proj_type.name()
-                ));
+            // clip.cpp:1715 — KEY_WIN_ATTN_PATTERN is required for qwen2.5-vl
+            // only (get_u32's `required` flag); the window/full pattern drives
+            // models/qwen2vl.cpp:37/97. n_wa_pattern == 0 → no windowed layers.
+            if proj_type == ProjectorType::Qwen25Vl {
+                hparams.n_wa_pattern = gu32(keys::WIN_ATTN_PATTERN)
+                    .ok_or("Key not found: clip.vision.n_wa_pattern")? as i32;
+            } else {
+                hparams.n_wa_pattern = gu32(keys::WIN_ATTN_PATTERN).unwrap_or(0) as i32;
             }
             hparams.set_limit_image_tokens(8, 4096);
             // clip.cpp:1704-1713 — optional model-provided pixel limits; the
@@ -1540,6 +1564,23 @@ fn load_hparams(
                     hparams.preproc_max_tiles
                 ));
             }
+        }
+        // clip.cpp:1540-1571 (the LFM2/D1OMNI_V arm) — the resize algo key
+        // with its "bilinear" default for older GGUFs, mirrored into the
+        // refined/overview slots; d1-omni's refined tiles stretch (no pad);
+        // optional projector scale factor; 64..256 image tokens
+        ProjectorType::Lfm2 | ProjectorType::D1OmniV => {
+            let resize_algo = gguf.get_str(keys::IMAGE_RESIZE_ALGO).unwrap_or("bilinear");
+            hparams.image_resize_algo = parse_resize_algo(resize_algo)?;
+            hparams.image_resize_algo_rf = hparams.image_resize_algo;
+            hparams.image_resize_algo_ov = hparams.image_resize_algo;
+            // the tiles stretch the image to the grid (d1-omni vision.py)
+            if proj_type == ProjectorType::D1OmniV {
+                hparams.image_pad_rf = PadStyle::None;
+            }
+            hparams.n_merge = gu32(keys::PROJ_SCALE_FACTOR).unwrap_or(hparams.n_merge);
+            // ref: LFM2.5-VL-1.6B processor_config.json
+            hparams.set_limit_image_tokens(64, 256);
         }
         ProjectorType::Gemma4UA => {
             // clip.cpp:1968-1974: encoder-free — raw 16 kHz waveform chunked
@@ -1757,10 +1798,9 @@ fn load_hparams(
     Ok((hparams, proj_type))
 }
 
-/// clip.cpp:1533-1543 — the `KEY_IMAGE_RESIZE_ALGO` string parse (the
-/// lfm2/d1omni_v hparams arm). The reading arm itself lands with the lfm2
-/// vision tower family (documented gap); the parse is ported and unit-tested
-/// so the key's contract is pinned.
+/// clip.cpp:1545-1555 — the `KEY_IMAGE_RESIZE_ALGO` string parse of the
+/// lfm2/d1omni_v hparams arm (default "bilinear" for older GGUFs; an
+/// unknown string throws in the C).
 fn parse_resize_algo(resize_algo: &str) -> Result<ResizeAlgo, String> {
     match resize_algo {
         "bilinear" => Ok(ResizeAlgo::Bilinear),
@@ -1969,29 +2009,42 @@ fn load_tensors(loader: &mut Loader, model: &mut ClipModel) -> Result<(), String
         // the merger graph uses fused qkv; the whisper-enc graph uses separate
         // q/k/v (build_vit's else branch, clip.cpp:412-437) and the gen-audio
         // code_predictor likewise (qwen3tts-gen.cpp:148-150), so those layers
-        // legitimately have no attn_qkv.weight — the siglip tower (cohere2v)
-        // too: HF SigLIP keeps separate q/k/v projections and the converter
-        // does not fuse them (conversion fuse_qkv defaults off)
-        if layer.qkv_w.is_none()
-            && model.modality == ClipModality::Vision
-            && !matches!(model.proj_type, ProjectorType::Cohere2V)
-        {
-            return Err(format!(
-                "blk.{il}: attn_qkv.weight missing (separate q/k/v not ported)"
-            ));
-        }
-        if model.proj_type == ProjectorType::Cohere2V
-            && (layer.q_w.is_none()
+        // legitimately have no attn_qkv.weight — the siglip tower (cohere2v +
+        // lfm2/d1omni_v) too: HF SigLIP keeps separate q/k/v projections and
+        // the converter does not fuse them (conversion fuse_qkv defaults
+        // off). The qwen2/2.5
+        // tower is the same: conversion/qwenvl.py:100-112 splits the fused
+        // qkv back into attn_{q,k,v}, and models/qwen2vl.cpp:107-112 consumes
+        // the separate projections.
+        if layer.qkv_w.is_none() && model.modality == ClipModality::Vision {
+            if matches!(model.proj_type, ProjectorType::Qwen2Vl | ProjectorType::Qwen25Vl) {
+                // the qwen2vl graph's separate-qkv branch: all three
+                // projections (with biases) are required
+                if layer.q_w.is_none() || layer.k_w.is_none() || layer.v_w.is_none() {
+                    return Err(format!(
+                        "blk.{il}: qwen2vl tower needs separate attn_q/attn_k/attn_v"
+                    ));
+                }
+            } else if !matches!(
+                model.proj_type,
+                ProjectorType::Cohere2V | ProjectorType::Lfm2 | ProjectorType::D1OmniV
+            ) {
+                return Err(format!(
+                    "blk.{il}: attn_qkv.weight missing (separate q/k/v not ported)"
+                ));
+            } else if layer.q_w.is_none()
                 || layer.k_w.is_none()
                 || layer.v_w.is_none()
                 || layer.ln_1_w.is_none()
-                || layer.ln_2_w.is_none())
-        {
-            // the siglip tower runs build_vit's separate-qkv branch
-            // (clip.cpp:412-437): attn_{q,k,v} + ln1/ln2 are required
-            return Err(format!(
-                "blk.{il}: siglip tower needs separate attn_q/attn_k/attn_v + ln1/ln2"
-            ));
+                || layer.ln_2_w.is_none()
+            {
+                // the siglip tower (cohere2v + lfm2/d1omni_v) runs build_vit's
+                // separate-qkv branch (clip.cpp:412-437): attn_{q,k,v} +
+                // ln1/ln2 are required
+                return Err(format!(
+                    "blk.{il}: siglip tower needs separate attn_q/attn_k/attn_v + ln1/ln2"
+                ));
+            }
         }
         model.layers.push(layer);
     }
@@ -2085,6 +2138,17 @@ fn load_tensors(loader: &mut Loader, model: &mut ClipModel) -> Result<(), String
         // cohere2v (clip.cpp:2802-2809): the two-layer llava-style projector,
         // TN_LLAVA_PROJ mm.{1,2}.{weight,bias} — all four required
         ProjectorType::Cohere2V => {
+            model.mm_1_w = Some(loader.get_req(&tnames::mm(1, "weight"))?);
+            model.mm_1_b = Some(loader.get_req(&tnames::mm(1, "bias"))?);
+            model.mm_2_w = Some(loader.get_req(&tnames::mm(2, "weight"))?);
+            model.mm_2_b = Some(loader.get_req(&tnames::mm(2, "bias"))?);
+        }
+        // lfm2/d1omni_v (clip.cpp:2820-2831): the same mm.{1,2} pair plus an
+        // optional input norm (TN_MM_INP_NORM/B, `get_tensor(..., false)` —
+        // LFM2-VL's input norm is optional, models/siglip.cpp:67-75)
+        ProjectorType::Lfm2 | ProjectorType::D1OmniV => {
+            model.mm_input_norm_w = loader.get_opt("mm.input_norm.weight")?;
+            model.mm_input_norm_b = loader.get_opt("mm.input_norm.bias")?;
             model.mm_1_w = Some(loader.get_req(&tnames::mm(1, "weight"))?);
             model.mm_1_b = Some(loader.get_req(&tnames::mm(1, "bias"))?);
             model.mm_2_w = Some(loader.get_req(&tnames::mm(2, "weight"))?);
@@ -2870,17 +2934,30 @@ pub fn clip_init_modality(
         log_line(&format!("audio_n_fft:       {}", model.hparams.audio_n_fft));
     } else if modality == ClipModality::GenAudio {
         log_line("modality:          gen-audio (experimental)");
-    } else if proj_type == ProjectorType::Cohere2V {
+    } else if matches!(
+        proj_type,
+        ProjectorType::Cohere2V | ProjectorType::Lfm2 | ProjectorType::D1OmniV
+    ) {
         // requirements of the siglip graph (models/siglip.cpp:5-11): one
-        // patch conv and the square learned position grid
+        // patch conv and the learned position grid (bilinearly resized for
+        // the lfm2 family)
         if model.patch_embeddings_0.is_none() || model.position_embeddings.is_none() {
             return Err(format!(
                 "{} requires v.patch_embd.weight and v.position_embd.weight",
                 proj_type.name()
             ));
         }
+    } else if matches!(proj_type, ProjectorType::Qwen2Vl | ProjectorType::Qwen25Vl) {
+        // models/qwen2vl.cpp:3-16 — the two convs; NO learned position
+        // embedding (pure M-RoPE)
+        if model.patch_embeddings_0.is_none() || model.patch_embeddings_1.is_none() {
+            return Err(format!(
+                "{} requires v.patch_embd.weight and v.patch_embd.weight.1",
+                proj_type.name()
+            ));
+        }
     } else {
-        // requirements of the one graph this port builds (models/qwen3vl.cpp:4-6)
+        // requirements of the qwen3vl graph (models/qwen3vl.cpp:4-6)
         if model.patch_embeddings_0.is_none()
             || model.patch_embeddings_1.is_none()
             || model.position_embeddings.is_none()
@@ -3079,6 +3156,17 @@ impl ClipContext {
             let scale_factor = hp.n_merge;
             n_patches /= scale_factor * scale_factor;
         }
+        // clip.cpp:4310-4318 (lfm2/d1omni_v/kimivl/kimik25): the merged
+        // patch grid, edges aligned UP to patch_size * n_merge
+        if matches!(
+            self.model.proj_type,
+            ProjectorType::Lfm2 | ProjectorType::D1OmniV
+        ) {
+            let out_patch_size = patch * hp.n_merge;
+            let x_patch = clip_align(img.nx, out_patch_size) / out_patch_size;
+            let y_patch = clip_align(img.ny, out_patch_size) / out_patch_size;
+            n_patches = x_patch * y_patch;
+        }
         // clip.cpp:4261-4263 (qwen3a): chunk_size=100 frames -> 3x stride-2
         // conv2d -> 13 tokens per chunk
         if self.model.proj_type == ProjectorType::Qwen3A {
@@ -3220,6 +3308,27 @@ impl ClipContext {
                     ctx.with_i32_mut(*t, |p| p.copy_from_slice(v))
                         .expect(&format!("{name} is an arena tensor"));
                 }
+                // set_input_attn_mask (clip.cpp:4605-4617, 0fd868cbc) — the
+                // tensor from build_inp_attn_mask() is f16 when flash attn is
+                // enabled: ggml_fp32_to_fp16_row at fill time
+                ExtraInput::AttnMask(v) => {
+                    if ctx.ty(*t) == GgmlType::F16 {
+                        let bytes = ctx
+                            .data_bytes_mut(*t)
+                            .unwrap_or_else(|| panic!("{name} is an arena tensor"));
+                        let h: &mut [half::f16] = bytemuck::cast_slice_mut(bytes);
+                        // GGML_ASSERT(ggml_nelements(cur) == values.size())
+                        assert_eq!(h.len(), v.len(), "{name}: mask payload size mismatch");
+                        for (dst, &src) in h.iter_mut().zip(v.iter()) {
+                            *dst =
+                                half::f16::from_bits(ggml::ops::ggml_compute_fp32_to_fp16(src));
+                        }
+                    } else {
+                        assert_eq!(ctx.ty(*t), GgmlType::F32, "{name}: expected f16 or f32");
+                        ctx.with_f32_mut(*t, |p| p.copy_from_slice(v))
+                            .expect(&format!("{name} is an arena tensor"));
+                    }
+                }
             }
         }
 
@@ -3294,10 +3403,21 @@ impl ClipContext {
             return Err("cannot encode a placeholder image".into());
         }
 
-        // the siglip tower (cohere2v) takes its own graph: separate-qkv ViT +
-        // pixel shuffle + swapped-swiglu projector (clip.cpp:940)
-        if self.model.proj_type == ProjectorType::Cohere2V {
+        // the siglip tower (cohere2v + lfm2/d1omni_v) takes its own graph:
+        // separate-qkv ViT + pixel shuffle + projector (clip.cpp:940-957:
+        // GEMMA3/IDEFICS3/COHERE2V/LFM2/D1OMNI_V/JANUS_PRO/PHI4 → siglip)
+        if matches!(
+            self.model.proj_type,
+            ProjectorType::Cohere2V | ProjectorType::Lfm2 | ProjectorType::D1OmniV
+        ) {
             return self.image_batch_encode_siglip(imgs);
+        }
+
+        // the qwen2/2.5-vl tower takes its own graph too (clip.cpp:988-990:
+        // QWEN2VL/QWEN25VL -> clip_graph_qwen2vl): separate qkv, no learned
+        // position embedding, the window-attention arm
+        if matches!(self.model.proj_type, ProjectorType::Qwen2Vl | ProjectorType::Qwen25Vl) {
+            return self.image_batch_encode_qwen2vl(imgs);
         }
 
         self.out_embd.clear();
@@ -3339,6 +3459,106 @@ impl ClipContext {
             p.copy_from_slice(&nodes.positions_data)
         })
         .expect("positions is an arena tensor");
+
+        ggml::compute::graph_compute(ctx, &mut graph, *n_threads);
+
+        if let Ok(path) = std::env::var("MTMD_DEBUG_NODES") {
+            let _ = debug_dump_nodes(ctx, &graph, &path);
+        }
+
+        // clip.cpp:5790 — the last graph node is the embedding tensor
+        let out = *graph.nodes.last().expect("non-empty graph");
+        let n_elems = ctx.ne(out).iter().product::<i64>() as usize;
+        let out_ty = ctx.ty(out);
+        if out_ty != GgmlType::F32 {
+            return Err(format!("expected F32 embeddings, got {out_ty:?}"));
+        }
+        if n_elems as i32 != expected {
+            return Err(format!(
+                "expected output {expected} elements, got {n_elems}"
+            ));
+        }
+        out_embd.resize(n_elems, 0.0);
+        out_embd.copy_from_slice(ctx.f32s(out).expect("arena tensor"));
+        let debug = self.debug_output_embeddings;
+        let result = std::mem::take(out_embd);
+
+        if debug {
+            dump_debug_embeddings(ctx, out);
+        }
+        Ok(result)
+    }
+
+    /// the qwen2/2.5-vl encode path: `clip_encode` over the qwen2vl graph —
+    /// the pixel upload (clip.cpp:4538-4579) plus the window-attention
+    /// set_inputs payloads (clip.cpp:5037-5110) through the graph's `extra`.
+    fn image_batch_encode_qwen2vl(&mut self, imgs: &ClipImageF32Batch) -> Result<Vec<f32>, String> {
+        self.out_embd.clear();
+        let expected =
+            self.n_output_tokens(&imgs.entries[0]) * self.n_mmproj_embd();
+        let ClipContext {
+            ctx,
+            model,
+            watermark,
+            flash_attn_type,
+            n_threads,
+            out_embd,
+            ..
+        } = self;
+
+        ctx.reset_graph_to(*watermark);
+        let (mut graph, nodes) =
+            build_qwen2vl_graph(ctx, model, &imgs.entries[0], *flash_attn_type)?;
+
+        // set inputs (clip.cpp:4538-4579): the raw image, channel-major
+        let img = &imgs.entries[0];
+        let (nx, ny) = (img.nx as usize, img.ny as usize);
+        let n = nx * ny;
+        let mut inp_raw = vec![0.0f32; 3 * n];
+        for y in 0..ny {
+            for x in 0..nx {
+                let src = 3 * (y * nx + x);
+                let dst = y * nx + x;
+                inp_raw[dst] = img.buf[src];
+                inp_raw[n + dst] = img.buf[src + 1];
+                inp_raw[2 * n + dst] = img.buf[src + 2];
+            }
+        }
+        ctx.arena_resize_tensor(nodes.inp_raw);
+        ctx.with_f32_mut(nodes.inp_raw, |p| p.copy_from_slice(&inp_raw))
+            .expect("inp_raw is an arena tensor");
+
+        // the named set_inputs payloads (positions / window_idx /
+        // inv_window_idx / attn_mask — clip.cpp:5037-5110)
+        for (name, t, data) in &nodes.extra {
+            ctx.arena_resize_tensor(*t);
+            match data {
+                ExtraInput::I32(v) => {
+                    ctx.with_i32_mut(*t, |p| p.copy_from_slice(v))
+                        .expect(&format!("{name} is an arena tensor"));
+                }
+                // set_input_attn_mask (clip.cpp:4605-4617, 0fd868cbc) — f16
+                // conversion at fill time when flash attn typed the mask
+                ExtraInput::AttnMask(v) => {
+                    if ctx.ty(*t) == GgmlType::F16 {
+                        let bytes = ctx
+                            .data_bytes_mut(*t)
+                            .unwrap_or_else(|| panic!("{name} is an arena tensor"));
+                        let h: &mut [half::f16] = bytemuck::cast_slice_mut(bytes);
+                        assert_eq!(h.len(), v.len(), "{name}: mask payload size mismatch");
+                        for (dst, &src) in h.iter_mut().zip(v.iter()) {
+                            *dst =
+                                half::f16::from_bits(ggml::ops::ggml_compute_fp32_to_fp16(src));
+                        }
+                    } else {
+                        assert_eq!(ctx.ty(*t), GgmlType::F32, "{name}: expected f16 or f32");
+                        ctx.with_f32_mut(*t, |p| p.copy_from_slice(v))
+                            .expect(&format!("{name} is an arena tensor"));
+                    }
+                }
+                ExtraInput::F32(_) => unreachable!("the qwen2vl graph has no f32 inputs"),
+            }
+        }
 
         ggml::compute::graph_compute(ctx, &mut graph, *n_threads);
 
@@ -3547,7 +3767,15 @@ fn build_graph(
     // learned position embedding, resized to the patch grid (models/qwen3vl.cpp:40)
     match model.position_embeddings {
         Some(pe) => {
-            let pos = resize_position_embeddings(cx, pe, n_embd, pw, ph, hp.patch_size as i64);
+            let pos = resize_position_embeddings(
+                cx,
+                pe,
+                n_embd,
+                pw,
+                ph,
+                hp.patch_size as i64,
+                GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS,
+            );
             let pos = cx.cont_4d(pos, n_embd * 2, pw / 2, ph, 1);
             let pos = cx.reshape_4d(pos, n_embd * 2, pw / 2, 2, (ph / 2).max(1));
             let pos = cx.permute(pos, 0, 2, 1, 3);
@@ -3713,6 +3941,269 @@ fn build_graph(
 }
 
 // ======================================================================
+// qwen2/2.5-vl vision tower — models/qwen2vl.cpp:32 `clip_graph_qwen2vl::build`
+// (the use_window_attn arm; qwen2.0 runs it with n_wa_pattern == 0, the
+// no-window shape, and qwen3vl/ling3vl take their own graph above)
+// ======================================================================
+
+/// The named set_inputs payloads of the qwen2-vl graph (the positions /
+/// window_idx / inv_window_idx i32 vectors and the window attn_mask); built
+/// alongside the graph so the encode path can upload them like the audio
+/// graphs' `ExtraInput`s.
+pub struct Qwen2VlGraphNodes {
+    pub inp_raw: TensorId,
+    pub extra: Vec<(&'static str, TensorId, ExtraInput)>,
+    pub out: TensorId,
+}
+
+/// models/qwen2vl.cpp:32 `clip_graph_qwen2vl::build` — separate-qkv ViT with
+/// pure M-RoPE (no learned position embedding, no patch bias) and the
+/// window-attention arm: when `n_wa_pattern > 0` the merged 2x2 tiles are
+/// reordered window-major through `inv_window_idx` (:79-92), every layer but
+/// the `(il + 1) % n_wa_pattern == 0` ones attends through the
+/// block-diagonal window mask (:97, :133), and the projector output is
+/// restored to raster order through `window_idx` (:182-192).
+fn build_qwen2vl_graph(
+    cx: &mut Context,
+    model: &ClipModel,
+    img: &ClipImageF32,
+    flash_attn: ClipFlashAttn,
+) -> Result<(Graph, Qwen2VlGraphNodes), String> {
+    let hp = &model.hparams;
+    // models/qwen2vl.cpp:33-34 — no patch bias, no class embedding (nothing
+    // to assert: the loader never populates them for the merger family)
+    assert_eq!(img.nx % (hp.patch_size * 2), 0, "image width not aligned");
+    assert_eq!(img.ny % (hp.patch_size * 2), 0, "image height not aligned");
+
+    let use_window_attn = hp.n_wa_pattern > 0;
+    let n_wa_pattern = hp.n_wa_pattern as i64;
+    let (ipw, iph) = (
+        (img.nx / hp.patch_size) as i64,
+        (img.ny / hp.patch_size) as i64,
+    );
+    let n_pos = ipw * iph;
+    let n_embd = hp.n_embd as i64;
+    let n_layer = hp.n_layer as usize;
+    let n_head = hp.n_head as i64;
+    let d_head = if hp.n_embd_head > 0 {
+        hp.n_embd_head as i64
+    } else {
+        n_embd / n_head
+    };
+    let kq_scale = 1.0f32 / (d_head as f32).sqrt();
+
+    // models/qwen2vl.cpp:42-44 — qwen 2.5 vl normalizes with RMS, 2.0 plain
+    let norm_t = if model.proj_type == ProjectorType::Qwen25Vl {
+        NormType::Rms
+    } else {
+        NormType::Normal
+    };
+
+    let mut g = Graph::new(4096);
+
+    // build_inp_with_temporal_merge (models/qwen2vl.cpp:3-16): still image
+    let inp_raw = cx.new_tensor_4d(GgmlType::F32, img.nx as i64, img.ny as i64, 3, 1);
+    cx.set_name(inp_raw, "inp_raw");
+    let pe0 = model.patch_embeddings_0.unwrap();
+    let pe1 = model.patch_embeddings_1.unwrap();
+    let conv0 = cx.conv_2d(pe0, inp_raw, hp.patch_size, hp.patch_size, 0, 0, 1, 1);
+    let conv1 = cx.conv_2d(pe1, inp_raw, hp.patch_size, hp.patch_size, 0, 0, 1, 1);
+    let mut inp_l = cx.add(conv0, conv1);
+
+    // second conv dimension (models/qwen2vl.cpp:51-63) — the 2x2 spatial merge
+    inp_l = cx.permute(inp_l, 1, 2, 0, 3); // [w, h, c, b] -> [c, w, h, b]
+    inp_l = cx.cont_4d(inp_l, n_embd * 2, ipw / 2, iph, 1);
+    inp_l = cx.reshape_4d(inp_l, n_embd * 2, ipw / 2, 2, iph / 2);
+    inp_l = cx.permute(inp_l, 0, 2, 1, 3);
+    inp_l = cx.cont_3d(inp_l, n_embd, n_pos, 1);
+
+    // M-RoPE positions, `n_pos * 4` i32 (models/qwen2vl.cpp:70)
+    let positions = cx.new_tensor_1d(GgmlType::I32, n_pos * 4);
+    cx.set_name(positions, "positions");
+
+    // pre-layernorm (models/qwen2vl.cpp:74-77)
+    if let (Some(w), Some(b)) = (model.pre_ln_w, model.pre_ln_b) {
+        inp_l = build_norm(cx, inp_l, Some(w), Some(b), norm_t, hp.eps);
+    }
+
+    // the window-attention inputs (models/qwen2vl.cpp:79-92)
+    let mut window_mask = None;
+    let mut inv_window_idx_t = None;
+    if use_window_attn {
+        let t = cx.new_tensor_1d(GgmlType::I32, n_pos / 4);
+        cx.set_name(t, "inv_window_idx");
+        inv_window_idx_t = Some(t);
+        // the mask for window attention — build_inp_attn_mask (f16 under FA)
+        window_mask = Some(build_inp_attn_mask(cx, n_pos, n_pos, flash_attn, 0));
+        // reorder the merged tiles window-major (get_rows over n_pos/4 rows
+        // of n_embd*4, then back to patch granularity)
+        inp_l = cx.reshape_2d(inp_l, n_embd * 4, n_pos / 4);
+        inp_l = cx.get_rows(inp_l, t);
+        inp_l = cx.reshape_3d(inp_l, n_embd, n_pos, 1);
+    }
+
+    // the set_inputs payloads (clip.cpp:5037-5110, the QWEN25VL arm — the
+    // plain identity arm for qwen2.0's n_wa_pattern == 0)
+    let (idx, inv_idx, positions_data, mask_data) = qwen25vl_window_inputs(
+        ipw as i32,
+        iph as i32,
+        hp.patch_size,
+        hp.n_wa_pattern,
+        hp.attn_window_size,
+    );
+    let mut extra: Vec<(&'static str, TensorId, ExtraInput)> =
+        vec![("positions", positions, ExtraInput::I32(positions_data))];
+    if let (Some(t), Some(m)) = (inv_window_idx_t, mask_data.as_ref()) {
+        extra.push(("inv_window_idx", t, ExtraInput::I32(inv_idx)));
+        extra.push(("attn_mask", window_mask.unwrap(), ExtraInput::AttnMask(m.clone())));
+    }
+    let _ = idx; // window_idx is uploaded at the projector tail below
+
+    for il in 0..n_layer {
+        let layer = &model.layers[il];
+        // models/qwen2vl.cpp:97 — the full-attention layers of the pattern
+        let full_attn = if use_window_attn {
+            (il as i64 + 1) % n_wa_pattern == 0
+        } else {
+            true
+        };
+        let mut cur = inp_l;
+
+        cur = build_norm(cx, cur, layer.ln_1_w, layer.ln_1_b, norm_t, hp.eps);
+
+        // self-attention (models/qwen2vl.cpp:107-136): separate projections
+        {
+            let q = cx.mul_mat(layer.q_w.unwrap(), cur);
+            let q = match layer.q_b {
+                Some(b) => cx.add(q, b),
+                None => q,
+            };
+            let k = cx.mul_mat(layer.k_w.unwrap(), cur);
+            let k = match layer.k_b {
+                Some(b) => cx.add(k, b),
+                None => k,
+            };
+            let v = cx.mul_mat(layer.v_w.unwrap(), cur);
+            let v = match layer.v_b {
+                Some(b) => cx.add(v, b),
+                None => v,
+            };
+            let q = cx.reshape_3d(q, d_head, n_head, n_pos);
+            let k = cx.reshape_3d(k, d_head, n_head, n_pos);
+            let v = cx.reshape_3d(v, d_head, n_head, n_pos);
+
+            // ggml_rope_multi (models/qwen2vl.cpp:123-128): VISION mode
+            let sections = [
+                (d_head / 4) as i32,
+                (d_head / 4) as i32,
+                (d_head / 4) as i32,
+                (d_head / 4) as i32,
+            ];
+            let q = cx.rope_multi(
+                q,
+                positions,
+                None,
+                (d_head / 2) as i32,
+                sections,
+                GGML_ROPE_TYPE_VISION,
+                32768,
+                10000.0,
+                1.0,
+                0.0,
+                1.0,
+                32.0,
+                1.0,
+            );
+            let k = cx.rope_multi(
+                k,
+                positions,
+                None,
+                (d_head / 2) as i32,
+                sections,
+                GGML_ROPE_TYPE_VISION,
+                32768,
+                10000.0,
+                1.0,
+                0.0,
+                1.0,
+                32.0,
+                1.0,
+            );
+
+            // `attn_mask = full_attn ? nullptr : window_mask` (:133)
+            let attn_mask = if full_attn { None } else { window_mask };
+            cur = build_attn_ex(
+                cx,
+                layer.o_w,
+                layer.o_b,
+                q,
+                k,
+                v,
+                attn_mask,
+                kq_scale,
+                flash_attn,
+            );
+        }
+
+        // residual (models/qwen2vl.cpp:140-143)
+        cur = cx.add(cur, inp_l);
+        inp_l = cur;
+
+        // ffn + residual 2 (:147-164)
+        cur = build_norm(cx, cur, layer.ln_2_w, layer.ln_2_b, norm_t, hp.eps);
+        cur = build_ffn(cx, cur, layer, hp.ffn_op);
+        cur = cx.add(inp_l, cur);
+        inp_l = cur;
+    }
+
+    // post-layernorm (models/qwen2vl.cpp:167-170)
+    if let (Some(w), Some(b)) = (model.post_ln_w, model.post_ln_b) {
+        inp_l = build_norm(cx, inp_l, Some(w), Some(b), norm_t, hp.eps);
+    }
+
+    // multimodal projection (models/qwen2vl.cpp:172-180)
+    let projection_dim = hp.projection_dim as i64;
+    let mut embeddings = cx.reshape_3d(inp_l, n_embd * 4, n_pos / 4, 1);
+    embeddings = build_ffn_plain(
+        cx,
+        embeddings,
+        model.mm_0_w.unwrap(),
+        model.mm_0_b,
+        model.mm_1_w.unwrap(),
+        model.mm_1_b,
+        FfnOp::Gelu,
+    );
+
+    // the window tail (models/qwen2vl.cpp:182-192): restore raster order
+    if use_window_attn {
+        let t = cx.new_tensor_1d(GgmlType::I32, n_pos / 4);
+        cx.set_name(t, "window_idx");
+        extra.push(("window_idx", t, ExtraInput::I32(idx)));
+        embeddings = cx.reshape_2d(embeddings, projection_dim, n_pos / 4);
+        embeddings = cx.get_rows(embeddings, t);
+        embeddings = cx.reshape_3d(embeddings, projection_dim, n_pos / 4, 1);
+    }
+
+    // the C asserts the merged token count here (clip.cpp:5793)
+    assert_eq!(
+        cx.ne(embeddings)[1],
+        n_pos / 4,
+        "unexpected output token count"
+    );
+
+    g.build_forward(cx, embeddings);
+    let out = *g.nodes.last().expect("non-empty graph");
+    Ok((
+        g,
+        Qwen2VlGraphNodes {
+            inp_raw,
+            extra,
+            out,
+        },
+    ))
+}
+
+// ======================================================================
 // siglip vision tower — models/siglip.cpp:3 `clip_graph_siglip::build`
 // (the cohere2v slice; gemma3/idefics3/lfm2/janus/phi4 tails stay in the
 // documented projector gap — only the COHERE2V projector is loadable here)
@@ -3832,8 +4323,24 @@ fn build_siglip_graph(
     let (inp_raw, inp) = build_siglip_inp(cx, model, img, n_patches, n_embd);
 
     // siglip.cpp:6-10 — cohere2v does NOT resize the position grid: the tiles
-    // are exactly image_size x image_size, so the learned square grid fits
-    let learned_pos_embd = model.position_embeddings;
+    // are exactly image_size x image_size, so the learned square grid fits.
+    // lfm2/d1omni_v (and phi4) DO: the siglip2 naflex grid is bilinearly
+    // interpolated to the image's patch grid.
+    let learned_pos_embd = match (model.proj_type, model.position_embeddings) {
+        (ProjectorType::Lfm2 | ProjectorType::D1OmniV, Some(pe)) => Some(
+            resize_position_embeddings(
+                cx,
+                pe,
+                n_embd,
+                (img.nx / hp.patch_size) as i64,
+                (img.ny / hp.patch_size) as i64,
+                hp.patch_size as i64,
+                // the no-arg default (clip-graph.h:12)
+                GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS,
+            ),
+        ),
+        (_, pe) => pe,
+    };
 
     // siglip.cpp:11-16 `build_vit`: plain LayerNorm, the model's FFN op
     // (use_gelu -> GELU for cohere2), learned positions, no add_pos hook
@@ -3855,38 +4362,92 @@ fn build_siglip_graph(
     )
     .0;
 
-    // siglip.cpp:48-56 (COHERE2V) — tiles are square, so the pixel shuffle is
-    // the same as Idefics3, then linear_1 / swiglu(gate)*x / linear_2
-    let cur = build_patch_merge_permute(
-        cx,
-        cur,
-        hp.n_merge as i64,
-        hp.patch_size,
-        img.nx,
-        img.ny,
-    );
-    let cur = cx.mul_mat(model.mm_1_w.unwrap(), cur);
-    let cur = cx.add(cur, model.mm_1_b.unwrap());
-    // linear_1 output is [x, gate], HF computes silu(gate) * x
-    let cur = swiglu_swapped(cx, cur);
-    let cur = cx.mul_mat(model.mm_2_w.unwrap(), cur);
-    let cur = cx.add(cur, model.mm_2_b.unwrap());
+    // the projector tails (models/siglip.cpp:18-86)
+    let cur = match model.proj_type {
+        // siglip.cpp:48-56 (COHERE2V) — tiles are square, so the pixel shuffle
+        // is the same as Idefics3, then linear_1 / swiglu(gate)*x / linear_2
+        ProjectorType::Cohere2V => {
+            let cur = build_patch_merge_permute(
+                cx,
+                cur,
+                hp.n_merge as i64,
+                hp.patch_size,
+                img.nx,
+                img.ny,
+            );
+            let cur = cx.mul_mat(model.mm_1_w.unwrap(), cur);
+            let cur = cx.add(cur, model.mm_1_b.unwrap());
+            // linear_1 output is [x, gate], HF computes silu(gate) * x
+            let cur = swiglu_swapped(cx, cur);
+            let cur = cx.mul_mat(model.mm_2_w.unwrap(), cur);
+            cx.add(cur, model.mm_2_b.unwrap())
+        }
+        // siglip.cpp:58-82 (LFM2 / D1OMNI_V) — pixel unshuffle block, then
+        // the optional input norm (nn.LayerNorm's 1e-5 default, NOT hp.eps)
+        // and the mm.1 -> activation -> mm.2 projector; d1-omni uses the
+        // exact (erf) gelu
+        ProjectorType::Lfm2 | ProjectorType::D1OmniV => {
+            let cur = build_patch_merge_permute(
+                cx,
+                cur,
+                hp.n_merge as i64,
+                hp.patch_size,
+                img.nx,
+                img.ny,
+            );
+            let mut cur = cur;
+            // projection, in LFM2-VL input norm is optional
+            if let Some(w) = model.mm_input_norm_w {
+                cur = cx.norm(cur, 1e-5); // default nn.LayerNorm
+                cur = cx.mul(cur, w);
+            }
+            if let Some(b) = model.mm_input_norm_b {
+                cur = cx.add(cur, b);
+            }
+            let act = if model.proj_type == ProjectorType::D1OmniV {
+                FfnOp::GeluErf
+            } else {
+                FfnOp::Gelu
+            };
+            build_ffn_plain(
+                cx,
+                cur,
+                model.mm_1_w.unwrap(),
+                model.mm_1_b,
+                model.mm_2_w.unwrap(),
+                model.mm_2_b,
+                act,
+            )
+        }
+        other => return Err(format!("siglip graph: unsupported projector {other:?}")),
+    };
 
     g.build_forward(cx, cur);
     let out = *g.nodes.last().expect("non-empty graph");
     Ok((g, SiglipGraphNodes { inp_raw, out }))
 }
 
-/// clip.cpp:312 `clip_graph::resize_position_embeddings` — bilinear resize of
-/// the learned 2D grid to the image's patch grid.
-fn resize_position_embeddings(    cx: &mut Context,
+/// clip.cpp:312 `clip_graph::resize_position_embeddings` — resize of the
+/// learned 2D grid to the image's patch grid. `mode` is the caller's
+/// interpolation mode: qwen3vl passes GGML_SCALE_MODE_BILINEAR |
+/// GGML_SCALE_FLAG_ALIGN_CORNERS (models/qwen3vl.cpp:39); the siglip default
+/// (the no-arg overload, clip-graph.h:12) is BILINEAR | ANTIALIAS.
+///
+/// Port note: the CPU upscale kernel (ggml/src/compute.rs forward_upscale)
+/// does not yet implement the ANTIALIAS flag — until it lands (reference
+/// ops.cpp:8251-8349 @ aa94f2086), an ANTIALIAS mode degrades to plain
+/// bilinear. The mode is encoded correctly regardless so the op params match
+/// the reference graph dump.
+fn resize_position_embeddings(
+    cx: &mut Context,
     pos_embd: TensorId,
     n_embd: i64,
     width: i64,
     height: i64,
     _patch_size: i64,
+    mode: u32,
 ) -> TensorId {
-    const MODE: u32 = GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ALIGN_CORNERS; // clip-graph.h:11 DEFAULT_INTERPOLATION_MODE
+    let mode = mode;
     let ne = *cx.ne(pos_embd);
     let n_per_side = (ne[1] as f64).sqrt() as i64;
     assert!(
@@ -3898,7 +4459,7 @@ fn resize_position_embeddings(    cx: &mut Context,
     }
     let p = cx.reshape_3d(pos_embd, n_embd, n_per_side, n_per_side);
     let p = cx.permute(p, 2, 0, 1, 3); // -> (n_per_side, n_per_side, n_embd)
-    let p = cx.interpolate(p, width, height, n_embd, 1, MODE);
+    let p = cx.interpolate(p, width, height, n_embd, 1, mode);
     let p = cx.permute(p, 1, 2, 0, 3); // -> (n_embd, width, height)
     cx.cont_2d(p, n_embd, width * height)
 }
@@ -4032,6 +4593,43 @@ fn build_ffn_plain(
 /// clip.cpp:748 `clip_graph::build_attn`. Both branches are ported: the FA path
 /// (k/v cast to F16, `flash_attn_ext` — what the reference CPU build runs for
 /// AUTO/enabled) and the reference non-FA path (soft_max_ext over a mul_mat).
+/// clip.cpp:591-593 `get_attn_mask_name` (0fd868cbc) — idx 0 keeps the plain
+/// name, later masks get the _N suffix
+fn get_attn_mask_name(idx: i32) -> String {
+    if idx == 0 {
+        "attn_mask".to_string()
+    } else {
+        format!("attn_mask_{idx}")
+    }
+}
+
+/// clip-graph.h:104-106 + clip.cpp:595-601 `clip_graph::build_inp_attn_mask`
+/// (0fd868cbc) — an attention-mask graph input: f16 if flash attn is enabled,
+/// f32 otherwise. idx is only needed when the graph has more than one mask;
+/// the payload is uploaded through `ExtraInput::AttnMask`
+/// (`set_input_attn_mask`, clip.cpp:4605-4617).
+///
+/// Contract (for the later omni media stage): any consumer that feeds a mask
+/// to `build_attn`'s flash-attn arm must source it from this helper (or cast
+/// to f16 itself) — `build_attn` no longer casts and asserts f16.
+fn build_inp_attn_mask(
+    cx: &mut Context,
+    n_kv: i64,
+    n_q: i64,
+    flash_attn: ClipFlashAttn,
+    idx: i32,
+) -> TensorId {
+    // clip.cpp:596 — f16 if flash attn is enabled
+    let ty = if flash_attn == ClipFlashAttn::Enabled {
+        GgmlType::F16
+    } else {
+        GgmlType::F32
+    };
+    let mask = cx.new_tensor_2d(ty, n_kv, n_q);
+    cx.set_name(mask, &get_attn_mask_name(idx));
+    mask
+}
+
 fn build_attn(
     cx: &mut Context,
     layer: &ClipLayer,
@@ -4069,8 +4667,12 @@ fn build_attn_ex(
         // clip.cpp:776 — the CPU FA kernel only consumes F16 KV
         let k = cx.cast(k, GgmlType::F16);
         let v = cx.cast(v, GgmlType::F16);
-        // clip.cpp:780 — the mask goes through the same F16 cast
-        let kq_mask = kq_mask.map(|m| cx.cast(m, GgmlType::F16));
+        // clip.cpp:790-792 (0fd868cbc) — the mask must be f16 here: no cast
+        // anymore, the callers build it typed via build_inp_attn_mask() /
+        // an explicit ggml_cast
+        if let Some(m) = kq_mask {
+            assert!(cx.ty(m) == GgmlType::F16, "flash-attn kq_mask must be f16");
+        }
         // ggml_prec_set_acc(.., F32): the CPU dispatch treats prec F32
         // identically to the default (ops.cpp:9348)
         let cur = cx.flash_attn_ext(q, k, v, kq_mask, kq_scale, 0.0, 0.0);
@@ -4130,6 +4732,115 @@ fn qwen_vl_positions(pw: i64, ph: i64, merge_ratio: i64) -> Vec<i32> {
     }
     assert_eq!(ptr, n_pos);
     positions
+}
+
+/// clip.cpp:5037-5110 — the QWEN25VL set_inputs arm (the window-attention
+/// payload of the qwen2.5-vl tower). `pos_w`/`pos_h` are the *patch* grid
+/// (image_size/patch_size); the window permutation works at merged-token
+/// granularity (`pw`/`ph` = patch grid / merge_ratio 2), while the attention
+/// mask is full patch-resolution `[n_pos, n_pos]` with `std::numeric_limits<
+/// float>::lowest()` off-window. Returns `(idx, inv_idx, positions, mask)`:
+/// `idx`/`inv_idx` are the window-major permutation (identity when
+/// `n_wa_pattern == 0` — the else arm, :5086-5090), `positions` the remapped
+/// M-RoPE ids (`remap = idx[ptr/mpow]*mpow + ptr%mpow`, :5097-5100) and
+/// `mask` `None` unless windowed. Only the windowed case uploads
+/// window_idx/inv_window_idx/the mask (the graph builds those inputs only
+/// when `use_window_attn`, models/qwen2vl.cpp:79-92).
+fn qwen25vl_window_inputs(
+    pos_w: i32,
+    pos_h: i32,
+    patch_size: i32,
+    n_wa_pattern: i32,
+    attn_window_size: i32,
+) -> (Vec<i32>, Vec<i32>, Vec<i32>, Option<Vec<f32>>) {
+    let use_window_attn = n_wa_pattern > 0;
+    let merge_ratio = 2;
+    let pw = pos_w / merge_ratio;
+    let ph = pos_h / merge_ratio;
+    let n_tok = (ph * pw) as usize;
+    let mut idx = vec![0i32; n_tok];
+    let mut inv_idx = vec![0i32; n_tok];
+
+    let mask = if use_window_attn {
+        // clip.cpp:5054-5056 — the window edge in pixels, 112 by default
+        let attn_window_size = if attn_window_size > 0 {
+            attn_window_size
+        } else {
+            112
+        };
+        let grid_window = attn_window_size / patch_size / merge_ratio;
+        let mut dst = 0usize;
+        let n_pos = (pos_w * pos_h) as usize;
+        // [num_vision_tokens, num_vision_tokens], lowest() off-window
+        let lowest = f32::MIN; // std::numeric_limits<float>::lowest()
+        let mut mask = vec![lowest; n_pos * n_pos];
+        let mut mask_row = 0usize;
+        let mut y = 0;
+        while y < ph {
+            let mut x = 0;
+            while x < pw {
+                let win_h = grid_window.min(ph - y);
+                let win_w = grid_window.min(pw - x);
+                let dst_0 = dst;
+                // group all tokens of the same window into a contiguous range
+                for dy in 0..win_h {
+                    for dx in 0..win_w {
+                        let src = ((y + dy) * pw + (x + dx)) as usize;
+                        idx[src] = dst as i32;
+                        inv_idx[dst] = src as i32;
+                        dst += 1;
+                    }
+                }
+                // win_h*win_w*merge_ratio² mask rows per window, the merged
+                // token block [dst_0*4, dst*4) zeroed (clip.cpp:5074-5081)
+                for _ in 0..(win_h * win_w * merge_ratio * merge_ratio) {
+                    let row_offset = mask_row * n_pos;
+                    for m in &mut mask[row_offset + dst_0 * 4..row_offset + dst * 4] {
+                        *m = 0.0;
+                    }
+                    mask_row += 1;
+                }
+                x += grid_window;
+            }
+            y += grid_window;
+        }
+        Some(mask)
+    } else {
+        // the else arm (clip.cpp:5086-5090): identity permutation, no upload
+        for (i, v) in idx.iter_mut().enumerate() {
+            *v = i as i32;
+        }
+        None
+    };
+
+    // the M-RoPE ids through the window-major remap (clip.cpp:5091-5108):
+    // the merge-tile raster walk of `qwen_vl_positions`, each tile's 4 ids
+    // written at the remapped position of its window-major tile
+    let mpow = (merge_ratio * merge_ratio) as usize;
+    let n_pos = (pos_w * pos_h) as usize;
+    let mut positions = vec![0i32; n_pos * 4];
+    let mut ptr = 0usize;
+    let mut y = 0;
+    while y < pos_h {
+        let mut x = 0;
+        while x < pos_w {
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let mut remap = idx[ptr / mpow] as usize;
+                    remap = remap * mpow + (ptr % mpow);
+                    positions[remap] = y + dy;
+                    positions[n_pos + remap] = x + dx;
+                    positions[2 * n_pos + remap] = y + dy;
+                    positions[3 * n_pos + remap] = x + dx;
+                    ptr += 1;
+                }
+            }
+            x += merge_ratio;
+        }
+        y += merge_ratio;
+    }
+    assert_eq!(ptr, n_pos);
+    (idx, inv_idx, positions, mask)
 }
 
 // ======================================================================
@@ -4501,6 +5212,10 @@ pub struct AudioGraphNodes {
 pub enum ExtraInput {
     F32(Vec<f32>),
     I32(Vec<i32>),
+    /// one `set_input_attn_mask` payload (clip.cpp:4605-4617, 0fd868cbc) — the
+    /// f32 values of a `build_inp_attn_mask` input; when flash attn made the
+    /// tensor f16 they are converted with ggml_fp32_to_fp16_row at fill time
+    AttnMask(Vec<f32>),
 }
 
 /// the audio-encoder graph dispatcher (clip.cpp:1072-1140 `clip_graph::create`):
@@ -4515,7 +5230,9 @@ fn build_audio_graph(
     match model.proj_type {
         ProjectorType::Gemma4UA => build_gemma4ua_graph(cx, model, img),
         ProjectorType::Qwen3A => build_qwen3a_graph(cx, model, img, flash_attn),
-        ProjectorType::Lfm2A => build_conformer_graph(cx, model, img),
+        // clip.cpp's create routes both conformer projectors the same way
+        // (clip.cpp:1092-1094 lfm2a / d1omni_a -> clip_graph_conformer)
+        ProjectorType::Lfm2A | ProjectorType::D1OmniA => build_conformer_graph(cx, model, img),
         ProjectorType::Gemma4A => build_gemma4a_graph(cx, model, img),
         ProjectorType::GraniteSpeech => build_granite_speech_graph(cx, model, img, flash_attn),
         ProjectorType::Parakeet => build_parakeet_graph(cx, model, img),
@@ -6635,13 +7352,13 @@ fn build_mimo_graph(
 
     assert_eq!(hp.wa_pattern_mode.len(), hp.n_layer as usize);
 
-    // graph inputs (mimo-audio.cpp:20-30)
+    // graph inputs (mimo-audio.cpp:20-25)
     let inp_pos = cx.new_tensor_1d(GgmlType::I32, n_pos);
     cx.set_name(inp_pos, "mimo_audio_positions");
-    let full_mask = cx.new_tensor_2d(GgmlType::F32, n_pos, n_pos);
-    cx.set_name(full_mask, "mimo_audio_full_mask");
-    let window_mask = cx.new_tensor_2d(GgmlType::F32, n_pos, n_pos);
-    cx.set_name(window_mask, "mimo_audio_window_mask");
+    // mimo-audio.cpp:23-24 (0fd868cbc) — build_inp_attn_mask: f16 under flash
+    // attn, names attn_mask / attn_mask_1
+    let full_mask = build_inp_attn_mask(cx, n_pos, n_pos, flash_attn, 0);
+    let window_mask = build_inp_attn_mask(cx, n_pos, n_pos, flash_attn, 1);
 
     // build_vit opts (mimo-audio.cpp:32-60)
     let mut opts = BuildVitAudioOpts {
@@ -6788,8 +7505,8 @@ fn build_mimo_graph(
 
         let local_pos = cx.new_tensor_1d(GgmlType::I32, n_padded);
         cx.set_name(local_pos, "mimo_audio_local_positions");
-        let local_mask = cx.new_tensor_2d(GgmlType::F32, n_padded, n_padded);
-        cx.set_name(local_mask, "mimo_audio_local_mask");
+        // mimo-audio.cpp:147 (0fd868cbc) — third mask, attn_mask_2
+        let local_mask = build_inp_attn_mask(cx, n_padded, n_padded, flash_attn, 2);
 
         // the local transformer's input payloads (clip.cpp:5512-5530) — the
         // data only depends on the padded length, filled here while the
@@ -6810,7 +7527,8 @@ fn build_mimo_graph(
                     lm[q * np + k] = if (q / gs) == (k / gs) { 0.0 } else { neg_inf };
                 }
             }
-            local_extra.push(("mimo_audio_local_mask", local_mask, ExtraInput::F32(lm)));
+            // set_input_attn_mask(local_mask, 2) (clip.cpp:5664, 0fd868cbc)
+            local_extra.push(("attn_mask_2", local_mask, ExtraInput::AttnMask(lm)));
         }
 
         const LOCAL_ROPE_THETA: f32 = 640000.0; // mimo-audio.cpp:157
@@ -6919,8 +7637,10 @@ fn build_mimo_graph(
                 };
             }
         }
-        extra.push(("mimo_audio_full_mask", full_mask, ExtraInput::F32(full)));
-        extra.push(("mimo_audio_window_mask", window_mask, ExtraInput::F32(win)));
+        // set_input_attn_mask(full_mask, 0) / (window_mask, 1)
+        // (clip.cpp:5640-5641, 0fd868cbc)
+        extra.push(("attn_mask", full_mask, ExtraInput::AttnMask(full)));
+        extra.push(("attn_mask_1", window_mask, ExtraInput::AttnMask(win)));
     }
     extra.extend(local_extra);
 
@@ -7394,8 +8114,9 @@ fn build_pockettts_spkenc_graph(
 
     let inp_pos = cx.new_tensor_1d(GgmlType::I32, cx.ne(cur)[1]);
     cx.set_name(inp_pos, "inp_pos");
-    let kq_mask = cx.new_tensor_2d(GgmlType::F32, cx.ne(cur)[1], cx.ne(cur)[1]);
-    cx.set_name(kq_mask, "kq_mask");
+    // pockettts-spkenc.cpp:55 (0fd868cbc) — build_inp_attn_mask replaces the
+    // plain f32 kq_mask input ("attn_mask", f16 under flash attn)
+    let kq_mask = build_inp_attn_mask(cx, cx.ne(cur)[1], cx.ne(cur)[1], flash_attn, 0);
 
     // the mimi transformer layers (pockettts-spkenc.cpp:60-63)
     for layer in &model.layers {
@@ -7532,7 +8253,8 @@ fn build_pockettts_spkenc_graph(
                 }
             }
         }
-        extra.push(("kq_mask", kq_mask, ExtraInput::F32(mask)));
+        // set_input_attn_mask(mask) (clip.cpp:4667, 0fd868cbc)
+        extra.push(("attn_mask", kq_mask, ExtraInput::AttnMask(mask)));
     }
 
     g.build_forward(cx, cur);
@@ -7709,13 +8431,24 @@ fn q3t_const_i32(cx: &mut Context, anchor: TensorId, value: f32) -> TensorId {
 
 /// qwen3tts-gen.cpp:107 `code_gen::causal_mask_row` — the keep-mask row for a
 /// query at position pos over an n_kv_pad window.
-fn q3t_causal_mask_row(cx: &mut Context, n_kv_pad: i64, pos: i64) -> TensorId {
+fn q3t_causal_mask_row(
+    cx: &mut Context,
+    n_kv_pad: i64,
+    pos: i64,
+    flash_attn: ClipFlashAttn,
+) -> TensorId {
     let t = cx.new_tensor_2d(GgmlType::F32, n_kv_pad, n_kv_pad);
     let ones = cx.fill(t, 1.0);
     let keep = cx.tri(ones, ggml::ops::GGML_TRI_TYPE_LOWER_DIAG);
     let row = cx.view_1d(keep, n_kv_pad, (pos as usize) * cx.nb(keep)[1] as usize);
     let mask = cx.log(row); // 0 = keep, -inf = masked
-    cx.reshape_4d(mask, n_kv_pad, 1, 1, 1)
+    let mask = cx.reshape_4d(mask, n_kv_pad, 1, 1, 1);
+    // qwen3tts-gen.cpp:113-115 (0fd868cbc) — f16 for the FA kernel
+    if flash_attn == ClipFlashAttn::Enabled {
+        cx.cast(mask, GgmlType::F16)
+    } else {
+        mask
+    }
 }
 
 /// qwen3tts-gen.cpp:116 `code_gen::project_in` — talker -> predictor hidden
@@ -7858,7 +8591,7 @@ fn q3t_prefill(
     let n_kv_pad = cx.ne(k_cache[0])[1];
     {
         let mut cur = q3t_project_in(cx, model, h_state);
-        let kq_mask = q3t_causal_mask_row(cx, n_kv_pad, 0);
+        let kq_mask = q3t_causal_mask_row(cx, n_kv_pad, 0, flash_attn);
         let inp_pos = q3t_const_i32(cx, k_cache[0], 0.0);
         for (il, layer) in model.layers.iter().enumerate() {
             let (c, k, v) = q3t_layer_forward(
@@ -7882,7 +8615,7 @@ fn q3t_prefill(
     }
     {
         let mut cur = q3t_project_in(cx, model, code0_embd);
-        let kq_mask = q3t_causal_mask_row(cx, n_kv_pad, 1);
+        let kq_mask = q3t_causal_mask_row(cx, n_kv_pad, 1, flash_attn);
         let inp_pos = q3t_const_i32(cx, k_cache[0], 1.0);
         for (il, layer) in model.layers.iter().enumerate() {
             let (c, k, v) = q3t_layer_forward(
@@ -7956,7 +8689,7 @@ fn q3t_step(
 
     let cur = q3t_project_in(cx, model, cur);
 
-    let kq_mask = q3t_causal_mask_row(cx, n_kv_pad, pos);
+    let kq_mask = q3t_causal_mask_row(cx, n_kv_pad, pos, flash_attn);
     let inp_pos = q3t_const_i32(cx, k_cache[0], pos as f32);
 
     let mut cur = cur;
@@ -8324,6 +9057,12 @@ fn q3t_tfm_layer_forward(
 
     let mask = cx.log(keep);
     let mask = cx.reshape_4d(mask, total_kv, n, 1, 1); // 0 = keep, -inf = masked
+    // qwen3tts-gen.cpp:488-490 (0fd868cbc) — f16 for the FA kernel
+    let mask = if flash_attn == ClipFlashAttn::Enabled {
+        cx.cast(mask, GgmlType::F16)
+    } else {
+        mask
+    };
 
     let q_cur = cx.reshape_4d(q, d_head, n_head, n, 1);
     let k_cur = cx.reshape_4d(k_full, d_head, n_head_kv, total_kv, 1);
@@ -9288,6 +10027,13 @@ pub fn build_pockettts_gen_graph(
     let keep = cx.mul(keep, warm);
     let kq_mask = cx.log(keep);
     let kq_mask = cx.reshape_4d(kq_mask, n_kv, n_pos, 1, 1);
+    // pockettts-gen.cpp:228-230 (0fd868cbc) — the mask must be f16 for the FA
+    // kernel (build_attn no longer casts it)
+    let kq_mask = if flash_attn == ClipFlashAttn::Enabled {
+        cx.cast(kq_mask, GgmlType::F16)
+    } else {
+        kq_mask
+    };
 
     let n_embd = hp.n_embd as i64;
     let n_head = hp.n_head as i64;
@@ -9629,6 +10375,10 @@ pub enum ImagePreprocessorKind {
     /// mtmd-image.h:194 `mtmd_image_preprocessor_cohere2v` — stretch the image
     /// to a square-tile grid, add a thumbnail when there is more than 1 tile
     Cohere2Tiles,
+    /// mtmd-image.h:160 `mtmd_image_preprocessor_lfm2` — the lfm2 slicer:
+    /// target-ratio grid of 512px tiles + thumbnail when tiled, the aligned
+    /// image alone (no thumbnail) when not
+    Lfm2Tiles,
 }
 
 /// mtmd-image.h:11 `mtmd_image_preproc_out` — the preprocessor result the
@@ -9687,6 +10437,9 @@ impl ClipContext {
             }
             // mtmd.cpp:801-810 — cohere2v picks the square-tile slicer
             ProjectorType::Cohere2V => ImagePreprocessorKind::Cohere2Tiles,
+            // mtmd.cpp:857-878 — lfm2/d1omni_v pick the lfm2 slicer (the
+            // same tiles+thumbnail, d1omni_v without the separator tokens)
+            ProjectorType::Lfm2 | ProjectorType::D1OmniV => ImagePreprocessorKind::Lfm2Tiles,
             // audio-only projectors (incl. the tts generators): no image
             // preprocessor is ever selected
             ProjectorType::Qwen3TtsGen | ProjectorType::PocketTtsGen => {
@@ -9753,6 +10506,40 @@ impl ClipContext {
                 output.grid_y = inst.grid_size.1;
                 Ok(output)
             }
+            // mtmd-image.cpp:915-927 `mtmd_image_preprocessor_lfm2::preprocess`
+            ImagePreprocessorKind::Lfm2Tiles => {
+                let inst = self.get_slice_instructions_lfm2((img.nx, img.ny));
+                let sliced = self.slice_image(img, &inst);
+
+                if !inst.slices.is_empty() {
+                    // multi-tile: the llava-uhd shape — slices as entries,
+                    // then the thumbnail (ov_img_first == false, mtmd.cpp:871)
+                    let mut output = ImagePreprocOut::default();
+                    for s in &sliced.slices {
+                        let mut e = ClipImageF32::from_u8(s);
+                        e.normalize(&hp.image_mean, &hp.image_std);
+                        output.entries.push(e);
+                    }
+                    let mut ov = ClipImageF32::from_u8(&sliced.overview);
+                    ov.normalize(&hp.image_mean, &hp.image_std);
+                    output.overview = Some(ov);
+                    output.grid_x = inst.grid_size.0;
+                    output.grid_y = inst.grid_size.1;
+                    return Ok(output);
+                }
+
+                // single tile: no thumbnail — not `output.overview` because
+                // that would emit <|img_thumbnail|> (mtmd-image.cpp:921-926);
+                // the aligned image itself is the entry list
+                let mut e = ClipImageF32::from_u8(&sliced.overview);
+                e.normalize(&hp.image_mean, &hp.image_std);
+                Ok(ImagePreprocOut {
+                    entries: vec![e],
+                    overview: None,
+                    grid_x: 0,
+                    grid_y: 0,
+                })
+            }
             kind => {
                 let mut resized = ClipImageU8::default();
                 match kind {
@@ -9786,6 +10573,7 @@ impl ClipContext {
                         );
                     }
                     ImagePreprocessorKind::Cohere2Tiles => unreachable!(),
+                    ImagePreprocessorKind::Lfm2Tiles => unreachable!(),
                 }
                 let mut out = ClipImageF32::from_u8(&resized);
                 out.normalize(&hp.image_mean, &hp.image_std);
@@ -9854,6 +10642,106 @@ impl ClipContext {
             }
         }
         inst
+    }
+
+    /// mtmd-image.cpp:929-944
+    /// `mtmd_image_preprocessor_lfm2::should_tile` — tile once the
+    /// align-rounded image exceeds `image_max_pixels * 2.0` (the
+    /// `max_pixels_tolerance`, mtmd-image.h:166). The rounding is
+    /// `std::nearbyint` — round-half-to-even under the default FP mode.
+    fn lfm2_should_tile(hp: &ClipHparams, original: (i32, i32)) -> bool {
+        const MAX_PIXELS_TOLERANCE: f64 = 2.0; // mtmd-image.h:166
+        let align = hp.patch_size * hp.n_merge;
+        let round_by_factor = |x: f64| -> i32 {
+            // static_cast<int>(std::nearbyint(x / align)) * align
+            let n = (x / align as f64).round_ties_even();
+            (n as i64 * align as i64) as i32
+        };
+        let h_bar = hp.patch_size.max(round_by_factor(original.1 as f64));
+        let w_bar = hp.patch_size.max(round_by_factor(original.0 as f64));
+        (h_bar as f64) * (w_bar as f64)
+            > (hp.image_max_pixels as f64) * MAX_PIXELS_TOLERANCE
+    }
+
+    /// mtmd-image.cpp:946-987
+    /// `mtmd_image_preprocessor_lfm2::get_slice_instructions` — the
+    /// overview is the aspect-preserved align-rounded image within the
+    /// pixel budget; when tiled, a target-ratio grid of 512px tiles.
+    fn get_slice_instructions_lfm2(&self, original: (i32, i32)) -> SliceInstructions {
+        const TILE: i32 = 512; // mtmd-image.h:167
+        let hp = &self.model.hparams;
+        let align = (hp.patch_size * hp.n_merge) as i64;
+
+        let mut inst = SliceInstructions::default();
+        inst.overview_size = img_tool::calc_size_preserved_ratio(
+            original,
+            align,
+            hp.image_min_pixels as i64,
+            hp.image_max_pixels as i64,
+            0,
+        );
+
+        if !Self::lfm2_should_tile(hp, original) {
+            inst.refined_size = (0, 0);
+            inst.grid_size = (0, 0);
+            return inst;
+        }
+
+        let grid = self.lfm2_get_grid_layout(original.1, original.0); // (h, w) in
+        inst.grid_size = grid;
+        inst.refined_size = (TILE * grid.0, TILE * grid.1);
+
+        for row in 0..grid.1 {
+            for col in 0..grid.0 {
+                inst.slices.push(SliceCoordinates {
+                    x: col * TILE,
+                    y: row * TILE,
+                    w: TILE,
+                    h: TILE,
+                });
+            }
+        }
+        inst
+    }
+
+    /// mtmd-image.cpp:1013-1043 `get_target_ratios` + `get_grid_layout` +
+    /// :989-1011 `find_closest_aspect_ratio` — the WxH tile ratios with
+    /// 2..=10 tiles (dedup, sorted by tile count), the closest aspect ratio
+    /// wins; an exact tie prefers the ratio whose tile area the image
+    /// reaches half of.
+    fn lfm2_get_grid_layout(&self, height: i32, width: i32) -> (i32, i32) {
+        const MIN_TILES: i32 = 2; // mtmd-image.h:164
+        const MAX_TILES: i32 = 10; // mtmd-image.h:165
+        const TILE: i32 = 512;
+
+        let mut ratios: Vec<(i32, i32)> = Vec::new(); // (w, h)
+        for n in MIN_TILES..=MAX_TILES {
+            for w in 1..=n {
+                for h in 1..=n {
+                    if w * h >= MIN_TILES && w * h <= MAX_TILES && !ratios.contains(&(w, h)) {
+                        ratios.push((w, h));
+                    }
+                }
+            }
+        }
+        ratios.sort_by_key(|&(w, h)| w * h);
+
+        let aspect = width as f32 / height as f32;
+        let area = (width * height) as f32;
+        let mut best = (1.0f32, (1, 1));
+        for &(w, h) in &ratios {
+            let target = w as f32 / h as f32;
+            let diff = (aspect - target).abs();
+            if diff < best.0 {
+                best = (diff, (w, h));
+            } else if diff == best.0 {
+                let target_area = (TILE * TILE * w * h) as f32;
+                if area > 0.5 * target_area {
+                    best = (diff, (w, h));
+                }
+            }
+        }
+        best.1
     }
 
     /// mtmd-image.cpp:613 `mtmd_image_preprocessor_llava_uhd::slice_image` —
@@ -11126,6 +12014,766 @@ mod tests {
     /// separate attn_{q,k,v} (HF SigLIP, no conversion qkv fusion), pre/post
     /// layernorms, patch bias, TN_LLAVA_PROJ mm.{1,2} with biases, and the
     /// cohere2v kv (scale_factor + preproc_max_tiles + use_gelu).
+    fn write_synth_mmproj_qwen25vl(path: &str) {
+        const IMAGE_SIZE: i64 = 128; // must be divisible by patch*2 (16)
+        const PATCH: i64 = 8;
+        const N_EMBD: i64 = 16;
+        const N_FF: i64 = 32;
+        const N_HEAD: i64 = 2;
+        const N_LAYER: i64 = 4;
+        const N_WA_PATTERN: i64 = 2; // layers 1,3 full; 0,2 windowed
+        // == n_mmproj_embd (mm.2 out); must equal the parity text model's
+        // n_embd (qwen2.5-0.5b: 896) — mtmd_init_from_file checks the match
+        const PROJ: i64 = 896;
+
+        let mut w = GgufWriter::new(32);
+        w.set_kv("general.architecture", Value::String("clip".into()));
+        w.set_kv(
+            "general.name",
+            Value::String("llama-rust-synth-qwen25vl".into()),
+        );
+        w.set_kv("general.file_type", Value::U32(0));
+        w.set_kv("clip.has_vision_encoder", Value::Bool(true));
+        // qwenvl.py: projector type of the 2.5 family
+        w.set_kv(
+            "clip.projector_type",
+            Value::String("qwen2.5vl_merger".into()),
+        );
+        w.set_kv("clip.vision.image_size", Value::U32(IMAGE_SIZE as u32));
+        w.set_kv("clip.vision.patch_size", Value::U32(PATCH as u32));
+        w.set_kv("clip.vision.embedding_length", Value::U32(N_EMBD as u32));
+        w.set_kv("clip.vision.feed_forward_length", Value::U32(N_FF as u32));
+        w.set_kv("clip.vision.block_count", Value::U32(N_LAYER as u32));
+        w.set_kv(
+            "clip.vision.attention.head_count",
+            Value::U32(N_HEAD as u32),
+        );
+        w.set_kv("clip.vision.projection_dim", Value::U32(PROJ as u32));
+        w.set_kv(
+            "clip.vision.attention.layer_norm_epsilon",
+            Value::F32(1e-6),
+        );
+        // qwenvl.py add_vision_n_wa_pattern (required for qwen2.5-vl)
+        w.set_kv("clip.vision.n_wa_pattern", Value::U32(N_WA_PATTERN as u32));
+        // qwenvl.py: add_vision_use_gelu(True)
+        w.set_kv("clip.use_gelu", Value::Bool(true));
+        w.set_kv(
+            "clip.vision.image_mean",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+        w.set_kv(
+            "clip.vision.image_std",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+
+        let mut names: Vec<(String, [i64; 4])> = Vec::new();
+        let mut push =
+            |w: &mut GgufWriter, names: &mut Vec<(String, [i64; 4])>, n: String, ne: [i64; 4]| {
+                w.add_tensor(&n, GgmlType::F32, ne);
+                names.push((n, ne));
+            };
+        // the two conv patch embeddings (conversion/qwenvl.py: patch_conv +
+        // patch_conv_new; [PATCH, PATCH, 3, N_EMBD])
+        push(
+            &mut w,
+            &mut names,
+            "v.patch_embd.weight".into(),
+            [PATCH, PATCH, 3, N_EMBD],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.patch_embd.weight.1".into(),
+            [PATCH, PATCH, 3, N_EMBD],
+        );
+        // per-layer: ln1/ln2 + separate attn_{q,k,v} (the converter SPLITS the
+        // fused qkv — conversion/qwenvl.py:100-112) + attn_out + gelu FFN
+        for il in 0..N_LAYER {
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln1.weight"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln1.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln2.weight"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln2.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+            for proj in ["q", "k", "v"] {
+                push(
+                    &mut w,
+                    &mut names,
+                    format!("v.blk.{il}.attn_{proj}.weight"),
+                    [N_EMBD, N_EMBD, 1, 1],
+                );
+                push(
+                    &mut w,
+                    &mut names,
+                    format!("v.blk.{il}.attn_{proj}.bias"),
+                    [N_EMBD, 1, 1, 1],
+                );
+            }
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.attn_out.weight"),
+                [N_EMBD, N_EMBD, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.attn_out.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_up.weight"),
+                [N_EMBD, N_FF, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_up.bias"),
+                [N_FF, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_down.weight"),
+                [N_FF, N_EMBD, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_down.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+        }
+        // the projector MLP (mm.0/mm.2 — clip.cpp:2475's merger table)
+        push(&mut w, &mut names, "mm.0.weight".into(), [N_EMBD * 4, 4096, 1, 1]);
+        push(&mut w, &mut names, "mm.0.bias".into(), [4096, 1, 1, 1]);
+        push(&mut w, &mut names, "mm.2.weight".into(), [4096, PROJ, 1, 1]);
+        push(&mut w, &mut names, "mm.2.bias".into(), [PROJ, 1, 1, 1]);
+
+        // deterministic contents (same recipe as the cohere2v synth)
+        let payloads: Vec<Vec<u8>> = names
+            .iter()
+            .enumerate()
+            .map(|(ti, (_, ne))| {
+                let n: i64 = ne.iter().product();
+                let mut bytes = Vec::with_capacity(n as usize * 4);
+                for i in 0..n {
+                    let v = (((ti * 7919 + i as usize * 104729) % 2001) as f32 / 10000.0) - 0.1;
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                bytes
+            })
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        let f = std::fs::File::create(path).expect("create synth mmproj");
+        let mut bw = std::io::BufWriter::new(f);
+        w.write(&mut bw, &refs).expect("write synth mmproj");
+    }
+
+    /// clip.cpp:5037-5110 — the window-attention payload math, pinned against
+    /// a hand-computed 8x8 patch grid (patch 8, merge 2 → merged 4x4, window
+    /// edge 112px → grid_window 7 → one 4x4 window) and a grid that splits
+    /// into multiple windows (patch grid 16x16 → merged 8x8, grid_window 7 →
+    /// windows 7x7, 7x1, 1x7, 1x1).
+    #[test]
+    fn qwen25vl_window_inputs_math() {
+        // (a) grid_w 8x8 patch grid of merged 4x4, single window: identity
+        let (idx, inv, pos, mask) = qwen25vl_window_inputs(8, 8, 8, 2, 0);
+        assert_eq!(idx, (0..16i32).collect::<Vec<_>>());
+        assert_eq!(inv, (0..16i32).collect::<Vec<_>>());
+        // mask: all zeros (one window covers everything)
+        assert!(mask.as_ref().unwrap().iter().all(|&m| m == 0.0));
+        // positions: the plain merge-tile raster walk (== qwen_vl_positions)
+        assert_eq!(pos, qwen_vl_positions(8, 8, 2));
+
+        // (b) 16x16 patch grid: merged 8x8 tokens, grid_window 7 → 4 windows
+        let (idx, inv, pos, mask) = qwen25vl_window_inputs(16, 16, 8, 2, 0);
+        let n_tok = 64;
+        // the first window (7x7) is raster inside itself: dst = dy*7 + dx
+        // while src strides the 8-wide grid — NOT the identity
+        for dy in 0..7 {
+            for dx in 0..7 {
+                let src = dy * 8 + dx;
+                let dst = dy * 7 + dx;
+                assert_eq!(idx[src as usize], dst, "7x7 window is raster-compacted");
+                assert_eq!(inv[dst as usize], src);
+            }
+        }
+        // the second window along x (7x1 at x=7): dst 49..56
+        for dy in 0..7 {
+            let src = dy * 8 + 7;
+            assert_eq!(idx[src as usize], 49 + dy);
+            assert_eq!(inv[(49 + dy) as usize], src);
+        }
+        // the mask: block-diagonal at WINDOW granularity in patch rows/cols —
+        // the first 7x7 window owns merged dst 0..49, so its 196 patch rows
+        // allow exactly the patch cols [0, 196)
+        let m = mask.as_ref().unwrap();
+        let n_pos = 256usize;
+        assert_eq!(m.len(), n_pos * n_pos);
+        let lowest = f32::MIN;
+        for r in 0..196usize {
+            for c in 0..n_pos {
+                let expect = if c < 196 { 0.0 } else { lowest };
+                assert_eq!(m[r * n_pos + c], expect, "row {r} col {c}");
+            }
+        }
+        // the last window (1x1 at merged (7,7)): patch rows 252..256 allow
+        // only the patch cols of its own merged token: [252, 256)
+        for r in 252..256usize {
+            for c in 0..n_pos {
+                let expect = if (252..256).contains(&c) { 0.0 } else { lowest };
+                assert_eq!(m[r * n_pos + c], expect, "row {r} col {c}");
+            }
+        }
+        // positions: the M-RoPE ids are PATCH indices — the merged tile at
+        // raster index 7 sits at merged (x=7,y=0) = patch x 14..16, y 0..2,
+        // and lands at the window-major slot idx[7]*4 == 49*4
+        let n_pos_i = 256;
+        let tile7 = idx[7] as usize * 4;
+        for k in 0..4usize {
+            let remap = tile7 + k;
+            assert_eq!(pos[remap], (k / 2) as i32); // y section: 0,0,1,1
+            assert_eq!(pos[n_pos_i + remap], 14 + (k % 2) as i32); // x: 14,15,14,15
+            assert_eq!(pos[2 * n_pos_i + remap], (k / 2) as i32);
+            assert_eq!(pos[3 * n_pos_i + remap], 14 + (k % 2) as i32);
+        }
+
+        // (c) n_wa_pattern == 0: identity, no mask (the else arm)
+        let (idx, _inv, pos, mask) = qwen25vl_window_inputs(16, 16, 8, 0, 0);
+        assert!(mask.is_none());
+        assert_eq!(idx, (0..64i32).collect::<Vec<_>>());
+        assert_eq!(pos, qwen_vl_positions(16, 16, 2));
+    }
+
+    /// The whole qwen2.5-vl pipeline at toy scale, window attention active:
+    /// metadata parsing (n_wa_pattern required), the separate-qkv tensor
+    /// table, and the windowed ViT graph — finite, non-zero, repeatable.
+    #[test]
+    fn synth_mmproj_qwen25vl_load_encode() {
+        let dir = std::env::temp_dir().join("llama-rust-mtmd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth-mmproj-qwen25vl.gguf");
+        let path_s = path.to_str().unwrap().to_string();
+        write_synth_mmproj_qwen25vl(&path_s);
+
+        for fa in [ClipFlashAttn::Disabled, ClipFlashAttn::Enabled] {
+            let params = ClipContextParams {
+                flash_attn_type: fa,
+                ..Default::default()
+            };
+            let mut cx = clip_init_from_file(&path_s, &params).expect("load synth");
+            assert_eq!(cx.model.proj_type, ProjectorType::Qwen25Vl);
+            let hp = cx.hparams().clone();
+            assert_eq!(hp.n_wa_pattern, 2);
+            assert_eq!(hp.n_layer, 4);
+
+            let img = debug_pattern_cb(128);
+            let batch = ClipImageF32Batch {
+                entries: vec![img],
+                is_audio: false,
+            };
+            let embd = cx.image_batch_encode(&batch).expect("encode");
+            // 128px / 8 / 2 = 8 → 8x8 = 64 merged tokens x 896 proj
+            assert_eq!(embd.len(), 64 * 896);
+            assert!(embd.iter().all(|v| v.is_finite()));
+            assert!(embd.iter().any(|v| *v != 0.0));
+
+            // repeated encodes must be identical (same graph/arena reuse)
+            let img2 = debug_pattern_cb(128);
+            let batch2 = ClipImageF32Batch {
+                entries: vec![img2],
+                is_audio: false,
+            };
+            let embd2 = cx.image_batch_encode(&batch2).expect("encode 2");
+            assert_eq!(embd, embd2, "second encode differs (arena reuse bug)");
+        }
+    }
+
+    /// Encoder parity against the reference for the qwen2.5-vl window tower:
+    /// `llama-mtmd-debug -p encode --image cb -n 128` with
+    /// `MTMD_DEBUG_EMBEDDINGS=<path>` on the same synthetic mmproj. Run via
+    /// parity/qwen2vl_window_parity.sh.
+    #[test]
+    #[ignore = "needs the synthetic mmproj + a reference dump"]
+    fn clip_cb_parity_dump_qwen25vl() {
+        let size = std::env::var("MTMD_CB_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let fa = match std::env::var("MTMD_FA").as_deref() {
+            Ok("off") => ClipFlashAttn::Disabled,
+            Ok("on") => ClipFlashAttn::Enabled,
+            _ => ClipFlashAttn::Auto,
+        };
+        let mmproj = std::env::var("MTMD_QWEN25VL_MMPROJ").unwrap_or_else(|_| {
+            let dir = std::env::temp_dir().join("llama-rust-mtmd");
+            dir.join("synth-mmproj-qwen25vl.gguf")
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+        write_synth_mmproj_qwen25vl(&mmproj);
+        let params = ClipContextParams {
+            flash_attn_type: fa,
+            ..Default::default()
+        };
+        let mut cx = clip_init_from_file(&mmproj, &params).expect("load synth qwen25vl");
+        let img = debug_pattern_cb(size);
+        let batch = ClipImageF32Batch {
+            entries: vec![img],
+            is_audio: false,
+        };
+        let embd = cx.image_batch_encode(&batch).expect("encode");
+        let n_tokens = cx.n_output_tokens(&batch.entries[0]);
+        let out = std::env::var("MTMD_CB_OUT")
+            .unwrap_or_else(|_| format!("/tmp/rust_cb_qwen25vl_{size}.bin"));
+        write_embedding_dump(&out, &embd, n_tokens, cx.n_mmproj_embd()).unwrap();
+        eprintln!(
+            "wrote {out} ({n_tokens} tokens x {} embd)",
+            cx.n_mmproj_embd()
+        );
+    }
+
+    /// Kernel-level parity of resize_position_embeddings' BILINEAR|ANTIALIAS
+    /// mode (the siglip default, clip-graph.h:12) against the pinned
+    /// reference .so: parity/interp_antialias_probe.c runs clip.cpp:312-330's
+    /// exact chain on a 9x9 learned grid -> 16x16 and dumps the cont_2d
+    /// result to parity/interp_antialias_ref.bin; this test builds the same
+    /// chain (same deterministic contents) through the port's
+    /// [`resize_position_embeddings`] and compares bitwise. The port's scalar
+    /// kernel matches the reference SOURCE; the .so's -O3 -march=native build
+    /// contracts the multiply-adds, so a 1-2 ulp subset difference is the
+    /// documented ref_interp_dump phenomenon (the parity ledger's bilinear note),
+    /// not a transcription error.
+    #[test]
+    fn interp_antialias_port_vs_ref() {
+        const N_EMBD: i64 = 16;
+        const IN_SIDE: i64 = 9;
+        const OUT_SIDE: i64 = 16;
+
+        // parity/interp_antialias_probe.c's gen(tensor_idx = 3)
+        let n = (N_EMBD * IN_SIDE * IN_SIDE) as usize;
+        let mut pos = vec![0.0f32; n];
+        for (i, v) in pos.iter_mut().enumerate() {
+            let k = (3u64 * 7919 + (i as u64) * 104729) % 2001;
+            *v = (k as f32) / 10000.0 - 0.1;
+        }
+
+        let mut cx = Context::new();
+        let t = cx.new_tensor_2d(GgmlType::F32, N_EMBD, IN_SIDE * IN_SIDE);
+        cx.arena_resize_tensor(t);
+        cx.with_f32_mut(t, |p| p.copy_from_slice(&pos))
+            .expect("arena tensor");
+
+        let e = resize_position_embeddings(
+            &mut cx,
+            t,
+            N_EMBD,
+            OUT_SIDE,
+            OUT_SIDE,
+            8, // patch_size (unused by the fn)
+            GGML_SCALE_MODE_BILINEAR | GGML_SCALE_FLAG_ANTIALIAS,
+        );
+        let mut g = Graph::new(64);
+        g.build_forward(&cx, e);
+        ggml::compute::graph_compute(&mut cx, &mut g, 1);
+        let got = cx.f32s(e).expect("arena tensor").to_vec();
+
+        // the .so dump: [i64 x4 header][f32 data]
+        let bin = include_bytes!("../../../parity/interp_antialias_ref.bin");
+        let hdr: [i64; 4] = {
+            let b: [u8; 32] = bin[..32].try_into().unwrap();
+            unsafe { std::mem::transmute(b) }
+        };
+        assert_eq!(hdr, [N_EMBD, OUT_SIDE * OUT_SIDE, 1, 1], "dump shape");
+        let want: Vec<f32> = bin[32..]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(got.len(), want.len());
+
+        let same = got
+            .iter()
+            .zip(want.iter())
+            .filter(|(a, b)| a.to_bits() == b.to_bits())
+            .count();
+        let maxd = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("interp ANTIALIAS port vs .so: {same}/{} bit-identical, max |delta| = {maxd:.3e}", got.len());
+        // the whole tensor matches to 1-2 ulp — the .so's -O3 -march=native
+        // build contracts the kernel's multiply-adds (the documented
+        // ref_interp_dump profile: most values bit-same, the rest 1-2 ulp);
+        // any structural error would show O(1e-2) deltas
+        assert!(maxd < 1e-6, "max |delta| {maxd:.3e} exceeds ulp scale");
+        assert!(same >= got.len() / 2, "only {same}/{} bit-identical", got.len());
+    }
+
+    fn write_synth_mmproj_d1omni_v(path: &str) {
+        const IMAGE_SIZE: i64 = 512; // the lfm2-family tile edge (metadata)
+        const PATCH: i64 = 8;
+        const N_EMBD: i64 = 16;
+        const N_FF: i64 = 32;
+        const N_HEAD: i64 = 2;
+        const N_LAYER: i64 = 2;
+        const N_MERGE: i64 = 2;
+        const D1: i64 = 24; // the hidden width between mm.1 / mm.2
+        // == n_mmproj_embd (mm.2 out); must equal the parity text model's
+        // n_embd (qwen2.5-0.5b: 896) — mtmd_init_from_file checks the match
+        const PROJ: i64 = 896;
+        // a 9x9 learned grid by default: the 128px cb bitmap's 16x16 patch
+        // grid forces the interpolation of resize_position_embeddings
+        // (BILINEAR|ANTIALIAS, the siglip default). MTMD_D1OMNI_POS_GRID=16
+        // gives the no-interpolation control fixture.
+        let pos_grid: i64 = std::env::var("MTMD_D1OMNI_POS_GRID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(9);
+        const POS_GRID_DEF: i64 = 9;
+        let _ = POS_GRID_DEF;
+
+        let mut w = GgufWriter::new(32);
+        w.set_kv("general.architecture", Value::String("clip".into()));
+        w.set_kv(
+            "general.name",
+            Value::String("llama-rust-synth-d1omni_v".into()),
+        );
+        w.set_kv("general.file_type", Value::U32(0));
+        w.set_kv("clip.has_vision_encoder", Value::Bool(true));
+        w.set_kv("clip.projector_type", Value::String("d1omni_v".into()));
+        w.set_kv("clip.vision.image_size", Value::U32(IMAGE_SIZE as u32));
+        w.set_kv("clip.vision.patch_size", Value::U32(PATCH as u32));
+        w.set_kv("clip.vision.embedding_length", Value::U32(N_EMBD as u32));
+        w.set_kv("clip.vision.feed_forward_length", Value::U32(N_FF as u32));
+        w.set_kv("clip.vision.block_count", Value::U32(N_LAYER as u32));
+        w.set_kv(
+            "clip.vision.attention.head_count",
+            Value::U32(N_HEAD as u32),
+        );
+        w.set_kv("clip.vision.projection_dim", Value::U32(PROJ as u32));
+        w.set_kv(
+            "clip.vision.attention.layer_norm_epsilon",
+            Value::F32(1e-6),
+        );
+        // clip.cpp:1545-1547 — the resize algo key ("bilinear" default)
+        w.set_kv(
+            "clip.vision.image_resize_algo",
+            Value::String("bilinear".into()),
+        );
+        // clip.cpp:1561 — the optional projector scale factor
+        w.set_kv(
+            "clip.vision.projector.scale_factor",
+            Value::U32(N_MERGE as u32),
+        );
+        w.set_kv("clip.use_gelu", Value::Bool(true));
+        w.set_kv(
+            "clip.vision.image_mean",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+        w.set_kv(
+            "clip.vision.image_std",
+            Value::Array(ggml::GgufType::Float32, vec![Value::F32(0.5); 3]),
+        );
+
+        let mut names: Vec<(String, [i64; 4])> = Vec::new();
+        let mut push =
+            |w: &mut GgufWriter, names: &mut Vec<(String, [i64; 4])>, n: String, ne: [i64; 4]| {
+                w.add_tensor(&n, GgmlType::F32, ne);
+                names.push((n, ne));
+            };
+        push(
+            &mut w,
+            &mut names,
+            "v.patch_embd.weight".into(),
+            [PATCH, PATCH, 3, N_EMBD],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.patch_embd.bias".into(),
+            [N_EMBD, 1, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "v.position_embd.weight".into(),
+            [N_EMBD, pos_grid * pos_grid, 1, 1],
+        );
+        // the optional LFM2-VL input norm (mm.input_norm.{weight,bias})
+        push(
+            &mut w,
+            &mut names,
+            "mm.input_norm.weight".into(),
+            [N_EMBD * 4, 1, 1, 1],
+        );
+        push(
+            &mut w,
+            &mut names,
+            "mm.input_norm.bias".into(),
+            [N_EMBD * 4, 1, 1, 1],
+        );
+        // the siglip tower: separate attn_{q,k,v} (HF SigLIP convention)
+        for il in 0..N_LAYER {
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln1.weight"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln1.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln2.weight"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ln2.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+            for proj in ["q", "k", "v"] {
+                push(
+                    &mut w,
+                    &mut names,
+                    format!("v.blk.{il}.attn_{proj}.weight"),
+                    [N_EMBD, N_EMBD, 1, 1],
+                );
+                push(
+                    &mut w,
+                    &mut names,
+                    format!("v.blk.{il}.attn_{proj}.bias"),
+                    [N_EMBD, 1, 1, 1],
+                );
+            }
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.attn_out.weight"),
+                [N_EMBD, N_EMBD, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.attn_out.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_up.weight"),
+                [N_EMBD, N_FF, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_up.bias"),
+                [N_FF, 1, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_down.weight"),
+                [N_FF, N_EMBD, 1, 1],
+            );
+            push(
+                &mut w,
+                &mut names,
+                format!("v.blk.{il}.ffn_down.bias"),
+                [N_EMBD, 1, 1, 1],
+            );
+        }
+        // the projector MLP (mm.1/mm.2, clip.cpp:2820-2831)
+        push(&mut w, &mut names, "mm.1.weight".into(), [N_EMBD * 4, D1, 1, 1]);
+        push(&mut w, &mut names, "mm.1.bias".into(), [D1, 1, 1, 1]);
+        push(&mut w, &mut names, "mm.2.weight".into(), [D1, PROJ, 1, 1]);
+        push(&mut w, &mut names, "mm.2.bias".into(), [PROJ, 1, 1, 1]);
+
+        // deterministic contents (same recipe as the cohere2v synth)
+        let payloads: Vec<Vec<u8>> = names
+            .iter()
+            .enumerate()
+            .map(|(ti, (_, ne))| {
+                let n: i64 = ne.iter().product();
+                let mut bytes = Vec::with_capacity(n as usize * 4);
+                for i in 0..n {
+                    let v = (((ti * 7919 + i as usize * 104729) % 2001) as f32 / 10000.0) - 0.1;
+                    bytes.extend_from_slice(&v.to_le_bytes());
+                }
+                bytes
+            })
+            .collect();
+        let refs: Vec<&[u8]> = payloads.iter().map(|v| v.as_slice()).collect();
+        let f = std::fs::File::create(path).expect("create synth mmproj");
+        let mut bw = std::io::BufWriter::new(f);
+        w.write(&mut bw, &refs).expect("write synth mmproj");
+    }
+
+    /// The d1omni_v pipeline at toy scale: the KEY_IMAGE_RESIZE_ALGO read
+    /// arm, the 9x9->16x16 position-grid interpolation, the optional input
+    /// norm and the GELU-ERF projector tail — finite, non-zero, repeatable.
+    #[test]
+    fn synth_mmproj_d1omni_v_load_encode() {
+        let dir = std::env::temp_dir().join("llama-rust-mtmd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth-mmproj-d1omni_v.gguf");
+        let path_s = path.to_str().unwrap().to_string();
+        write_synth_mmproj_d1omni_v(&path_s);
+
+        for fa in [ClipFlashAttn::Disabled, ClipFlashAttn::Enabled] {
+            let params = ClipContextParams {
+                flash_attn_type: fa,
+                ..Default::default()
+            };
+            let mut cx = clip_init_from_file(&path_s, &params).expect("load synth");
+            assert_eq!(cx.model.proj_type, ProjectorType::D1OmniV);
+            let hp = cx.hparams().clone();
+            // clip.cpp:1545-1561: the algo key read + mirror, PAD_NONE for
+            // the refined tiles, set_limit_image_tokens(64, 256)
+            assert_eq!(hp.image_resize_algo, ResizeAlgo::Bilinear);
+            assert_eq!(hp.image_resize_algo_rf, ResizeAlgo::Bilinear);
+            assert_eq!(hp.image_resize_algo_ov, ResizeAlgo::Bilinear);
+            assert_eq!(hp.image_pad_rf, PadStyle::None);
+            assert_eq!(hp.n_merge, 2);
+            let patch_area = 8 * 8 * 2 * 2;
+            assert_eq!(hp.image_min_pixels, 64 * patch_area);
+            assert_eq!(hp.image_max_pixels, 256 * patch_area);
+
+            let img = debug_pattern_cb(128);
+            let batch = ClipImageF32Batch {
+                entries: vec![img],
+                is_audio: false,
+            };
+            let embd = cx.image_batch_encode(&batch).expect("encode");
+            // 128/8 = 16 patch grid, merged 2x2 -> 8x8 = 64 tokens x 896
+            assert_eq!(cx.n_output_tokens(&batch.entries[0]), 64);
+            assert_eq!(embd.len(), 64 * 896);
+            assert!(embd.iter().all(|v| v.is_finite()));
+            assert!(embd.iter().any(|v| *v != 0.0));
+
+            // repeated encodes must be identical (same graph/arena reuse)
+            let img2 = debug_pattern_cb(128);
+            let batch2 = ClipImageF32Batch {
+                entries: vec![img2],
+                is_audio: false,
+            };
+            let embd2 = cx.image_batch_encode(&batch2).expect("encode 2");
+            assert_eq!(embd, embd2, "second encode differs (arena reuse bug)");
+        }
+    }
+
+    /// The lfm2 slicer geometry (mtmd-image.cpp:929-1043), pinned against
+    /// hand-computed cases: the 64..256-token budget (patch 8, merge 2 ->
+    /// min/max pixels 16384/65536), round-half-even alignment and the
+    /// target-ratio grid.
+    #[test]
+    fn lfm2_slice_geometry() {
+        let dir = std::env::temp_dir().join("llama-rust-mtmd");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("synth-mmproj-d1omni_v.gguf");
+        let path_s = path.to_str().unwrap().to_string();
+        write_synth_mmproj_d1omni_v(&path_s);
+        let cx =
+            clip_init_from_file(&path_s, &ClipContextParams::default()).expect("load synth");
+
+        // (a) small image: no tiling (should_tile rounds 100 -> 96, well
+        // under the 2x budget); the overview is the min-pixels-aligned image
+        // (16384 = 64 tokens -> 128x128, the align-16 ratio-preserved fit)
+        let inst = cx.get_slice_instructions_lfm2((100, 100));
+        assert!(inst.slices.is_empty());
+        assert_eq!(inst.grid_size, (0, 0));
+        assert_eq!(inst.overview_size, (128, 128));
+
+        // (b) square beyond 2x the max budget: 4 tiles of 512 (2x2 grid)
+        let inst = cx.get_slice_instructions_lfm2((1000, 1000));
+        assert_eq!(inst.grid_size, (2, 2));
+        assert_eq!(inst.refined_size, (1024, 1024));
+        assert_eq!(inst.slices.len(), 4);
+        assert_eq!(inst.slices[1], SliceCoordinates { x: 512, y: 0, w: 512, h: 512 });
+
+        // (c) wide image (2x aspect): the exact ratios (2,1) and (4,2) tie;
+        // the tie-break (area > 0.5 * tile area) picks the denser (4,2) grid
+        // (mtmd-image.cpp:1005-1009)
+        let inst = cx.get_slice_instructions_lfm2((2048, 1024));
+        assert_eq!(inst.grid_size, (4, 2));
+        assert_eq!(inst.refined_size, (2048, 1024));
+        assert_eq!(inst.slices.len(), 8);
+    }
+
+    /// Encoder parity against the reference for the d1omni_v tower:
+    /// `llama-mtmd-debug -p encode --image cb -n 128` with
+    /// `MTMD_DEBUG_EMBEDDINGS=<path>` on the same synthetic mmproj. Run via
+    /// parity/d1omni_v_parity.sh (the cohere2v_parity.sh protocol).
+    #[test]
+    #[ignore = "needs the synthetic mmproj + a reference dump"]
+    fn clip_cb_parity_dump_d1omni_v() {
+        let size = std::env::var("MTMD_CB_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let fa = match std::env::var("MTMD_FA").as_deref() {
+            Ok("off") => ClipFlashAttn::Disabled,
+            Ok("on") => ClipFlashAttn::Enabled,
+            _ => ClipFlashAttn::Auto,
+        };
+        let mmproj = std::env::var("MTMD_D1OMNI_V_MMPROJ").unwrap_or_else(|_| {
+            let dir = std::env::temp_dir().join("llama-rust-mtmd");
+            dir.join("synth-mmproj-d1omni_v.gguf")
+                .to_str()
+                .unwrap()
+                .to_string()
+        });
+        write_synth_mmproj_d1omni_v(&mmproj);
+        let params = ClipContextParams {
+            flash_attn_type: fa,
+            ..Default::default()
+        };
+        let mut cx = clip_init_from_file(&mmproj, &params).expect("load synth d1omni_v");
+        let img = debug_pattern_cb(size);
+        let batch = ClipImageF32Batch {
+            entries: vec![img],
+            is_audio: false,
+        };
+        let embd = cx.image_batch_encode(&batch).expect("encode");
+        let n_tokens = cx.n_output_tokens(&batch.entries[0]);
+        let out = std::env::var("MTMD_CB_OUT")
+            .unwrap_or_else(|_| format!("/tmp/rust_cb_d1omni_v_{size}.bin"));
+        write_embedding_dump(&out, &embd, n_tokens, cx.n_mmproj_embd()).unwrap();
+        eprintln!(
+            "wrote {out} ({n_tokens} tokens x {} embd)",
+            cx.n_mmproj_embd()
+        );
+    }
+
     fn write_synth_mmproj_cohere2v(path: &str) {
         const IMAGE_SIZE: i64 = 64; // the tile edge
         const PATCH: i64 = 8;

@@ -464,17 +464,15 @@ pub struct TaskParams {
     pub oaicompat_cmpl_id: String,
     /// `oaicompat_model` — `meta->model_name`
     pub oaicompat_model: String,
-    /// `chat_parser_params.format` — the chat format name the request carries
-    /// (`generation_settings.chat_format`; the chat path sets "peg-native",
-    /// the plain completion path keeps "Content-only")
+    /// `chat_format` (server-task.h:92, 8b5436102) — reported in
+    /// generation_settings, parsing itself is owned by the chat session
+    /// (`task.apply_chat_session` sets it; the plain completion path keeps
+    /// "Content-only")
     pub chat_format: String,
-    /// `chat_parser_params.generation_prompt` — the assistant turn prefix the
-    /// template emitted (`generation_settings.generation_prompt`)
+    /// `sampling.generation_prompt` — the assistant turn prefix the template
+    /// emitted (`generation_settings.generation_prompt`); the grammar prefill
+    /// consumes it
     pub generation_prompt: String,
-    /// `chat_parser_params.parser` — the differential autoparser's serialized
-    /// arena (`chat_params.parser.save()`, server-common.cpp:1388-1390); empty
-    /// means the pure-content parser (chat.cpp:1447-1523)
-    pub chat_parser: String,
     /// `common_grammar_needs_prefill(params.grammar)` — the grammar begins
     /// with the generation-prompt literal; the sampler consumes those tokens
     /// before the first sample (common/sampling.cpp:294-308)
@@ -533,7 +531,6 @@ impl Default for TaskParams {
             oaicompat_model: String::new(),
             chat_format: "Content-only".into(),
             generation_prompt: String::new(),
-            chat_parser: String::new(),
             grammar_prefill: false,
             reasoning_format: "none".into(),
             preserved_tokens: Vec::new(),
@@ -807,21 +804,22 @@ pub fn eval_llama_cmpl_schema(
         }
     }
     if let Some(v) = data.at("preserved_tokens") {
-        // server-schema.cpp:341-351: each marker survives only when it
-        // tokenizes to a single id (a std::set<llama_token> → sorted unique)
-        let mut ids: Vec<i32> = Vec::new();
+        // server-schema.cpp:316-323 (8b5436102):
+        // common_sampling_add_preserved_tokens(ctx.params.sampling, ctx.vocab, …)
+        let mut side = llama::chat_tools::ChatSamplingSide {
+            preserved_tokens: std::mem::take(&mut p.preserved_tokens),
+            ..Default::default()
+        };
+        let mut tokens: Vec<String> = Vec::new();
         if let Json::Array(items) = v {
             for t in items {
-                let Ok(s) = t.get_str() else { continue };
-                let toks = vocab.tokenize(s, false, true);
-                if toks.len() == 1 {
-                    ids.push(toks[0]);
+                if let Ok(s) = t.get_str() {
+                    tokens.push(s.to_string());
                 }
             }
         }
-        ids.sort_unstable();
-        ids.dedup();
-        p.preserved_tokens = ids;
+        llama::chat_tools::sampling_add_preserved_tokens(&mut side, vocab, &tokens);
+        p.preserved_tokens = side.preserved_tokens;
     }
 
     // sequence breakers for DRY (server-schema.cpp:242-249): only a JSON
@@ -875,41 +873,97 @@ pub fn eval_llama_cmpl_schema(
     }
     p.grammar_lazy = field_bool(data, "grammar_lazy")?;
     if let Some(Json::Array(a)) = data.at("grammar_triggers") {
-        // server-schema.cpp:353-380: a WORD trigger whose word tokenizes to a
-        // single token is upgraded to a TOKEN trigger (and must already be a
-        // preserved token); multi-token words stay WORD
-        let mut out: Vec<Json> = Vec::new();
+        // server-schema.cpp:325-345 (8b5436102): the triggers run through
+        // common_sampling_add_grammar_triggers — a WORD trigger whose word
+        // tokenizes to a single token is upgraded to a TOKEN trigger (and
+        // must already be a preserved token)
+        let mut triggers: Vec<llama::chat_tools::GrammarTrigger> = Vec::new();
         for t in a {
+            // `server_grammar_trigger(t).value` (server-common.h:62-92)
             let ty = t.at("type").and_then(|v| v.get_i64().ok()).unwrap_or(-1);
             let value = t.at("value").and_then(|v| v.get_str().ok()).unwrap_or("").to_string();
-            if ty == 1 {
-                // COMMON_GRAMMAR_TRIGGER_TYPE_WORD
-                let ids = vocab.tokenize(&value, false, true);
-                if ids.len() == 1 {
-                    if !p.preserved_tokens.contains(&ids[0]) {
-                        return Err(format!(
-                            "Grammar trigger word should be marked as preserved token: {value}"
-                        ));
-                    }
-                    let trig = vec![
-                        ("type".to_string(), Json::Int(0)),
-                        ("value".to_string(), Json::String(value)),
-                        ("token".to_string(), Json::Int(ids[0] as i64)),
-                    ];
-                    out.push(Json::Object(trig));
-                } else {
-                    out.push(Json::Object(vec![
-                        ("type".to_string(), Json::Int(1)),
-                        ("value".to_string(), Json::String(value)),
-                    ]));
+            let ty = match ty {
+                0 => llama::chat_tools::GrammarTriggerType::Token,
+                1 => llama::chat_tools::GrammarTriggerType::Word,
+                2 => llama::chat_tools::GrammarTriggerType::Pattern,
+                3 => llama::chat_tools::GrammarTriggerType::PatternFull,
+                _ => llama::chat_tools::GrammarTriggerType::Word,
+            };
+            triggers.push(llama::chat_tools::GrammarTrigger {
+                ty,
+                word: value,
+                token: t
+                    .at("token")
+                    .and_then(|v| v.get_i64().ok())
+                    .map(|v| v as i32)
+                    .unwrap_or(-1),
+            });
+        }
+        let mut side = llama::chat_tools::ChatSamplingSide {
+            grammar_lazy: p.grammar_lazy,
+            preserved_tokens: p.preserved_tokens.clone(),
+            grammar_triggers: std::mem::take(&mut p.grammar_triggers)
+                .into_iter()
+                .filter_map(json_trigger_to_typed_pub)
+                .collect(),
+            ..Default::default()
+        };
+        llama::chat_tools::sampling_add_grammar_triggers(&mut side, vocab, triggers)
+            .map_err(|e| e)?;
+        p.preserved_tokens = side.preserved_tokens;
+        p.grammar_triggers = side.grammar_triggers.iter().map(typed_trigger_to_json_pub).collect();
+    }
+
+    // --- the reasoning-budget fields (server-schema.cpp:333-383, fed by the
+    // chat parse's reasoning_budget_* keys of server-common.cpp:1437-1455,
+    // the 99f3dc322 body-first semantics) ---
+    if field_bool(data, "reasoning_control")? {
+        p.sampling.reasoning_control = true;
+    }
+    match field_int(data, "reasoning_budget_tokens")? {
+        Some(v) if v < -1 => {
+            return Err(format!("value {v} is below the hard limit for field 'reasoning_budget_tokens'"));
+        }
+        Some(v) => p.sampling.reasoning_budget_tokens = v as i32,
+        // the field's default is the base params' value (typically -1)
+        None => p.sampling.reasoning_budget_tokens = base.sampling.reasoning_budget_tokens,
+    }
+    if let Some(tag) = field_str(data, "reasoning_budget_start_tag") {
+        // common_tokenize(vocab, tag, false, true) (:340-346)
+        p.sampling.reasoning_budget_start = vocab.tokenize(&tag, false, true);
+    }
+    {
+        // the array form with the singular alias (:348-364)
+        let end_tags: Option<Vec<String>> = match data.at("reasoning_budget_end_tags") {
+            Some(Json::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|x| x.get_str().map(|s| s.to_string()))
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| "field 'reasoning_budget_end_tags' must be an array of strings".to_string())?,
+            ),
+            _ => field_str(data, "reasoning_budget_end_tag").map(|s| vec![s]),
+        };
+        if let Some(tags) = end_tags {
+            p.sampling.reasoning_budget_end.clear();
+            for t in tags {
+                if !t.is_empty() {
+                    p.sampling.reasoning_budget_end.push(vocab.tokenize(&t, false, true));
                 }
-            } else {
-                out.push(t.clone());
             }
         }
-        p.grammar_triggers = out;
-        if p.grammar_lazy && p.grammar_triggers.is_empty() {
-            return Err("Error: no triggers set for lazy grammar!".to_string());
+    }
+    if let Some(message) = field_str(data, "reasoning_budget_message") {
+        p.sampling.reasoning_budget_message = message.clone();
+        // the handler (:366-383): with end tags present, the forced sequence
+        // is the first end tag with the message's tokens prepended
+        if !p.sampling.reasoning_budget_end.is_empty() {
+            let mut end_tag = p.sampling.reasoning_budget_end[0].clone();
+            if !message.is_empty() {
+                let mut message_tokens = vocab.tokenize(&message, false, true);
+                end_tag.splice(0..0, message_tokens.drain(..));
+            }
+            p.sampling.reasoning_budget_forced = end_tag;
         }
     }
 
@@ -1013,7 +1067,12 @@ pub fn task_params_to_json(p: &TaskParams, only_metrics: bool) -> Json {
     // `common_reasoning_format_name(chat_parser_params.reasoning_format)`
     // (server-task.cpp:136) — printed verbatim, no only_metrics distinction
     push("reasoning_format", Json::String(p.reasoning_format.clone()));
-    push("reasoning_in_content", Json::Bool(false));
+    // `stream && reasoning_format == COMMON_REASONING_FORMAT_DEEPSEEK_LEGACY`
+    // (server-task.cpp:78, 137, 8b5436102)
+    push(
+        "reasoning_in_content",
+        Json::Bool(p.stream && p.reasoning_format == "deepseek-legacy"),
+    );
     // `chat_parser_params.generation_prompt` (server-schema.cpp:310-315)
     push("generation_prompt", Json::String(p.generation_prompt.clone()));
     push(
@@ -1185,4 +1244,40 @@ pub fn format_embeddings_response_oaicompat(
         ),
         ("data".into(), Json::Array(data)),
     ])
+}
+/// `server_grammar_trigger::to_json` (server-common.h:84-92) — the typed
+/// trigger's JSON form (`{"type","value"[,"token"]}`; the token rides along
+/// for TOKEN triggers)
+pub fn typed_trigger_to_json_pub(t: &llama::chat_tools::GrammarTrigger) -> Json {
+    let ty = match t.ty {
+        llama::chat_tools::GrammarTriggerType::Token => 0,
+        llama::chat_tools::GrammarTriggerType::Word => 1,
+        llama::chat_tools::GrammarTriggerType::Pattern => 2,
+        llama::chat_tools::GrammarTriggerType::PatternFull => 3,
+    };
+    let mut fields = vec![
+        ("type".to_string(), Json::Int(ty)),
+        ("value".to_string(), Json::String(t.word.clone())),
+    ];
+    if t.ty == llama::chat_tools::GrammarTriggerType::Token && t.token >= 0 {
+        fields.push(("token".to_string(), Json::Int(t.token as i64)));
+    }
+    Json::Object(fields)
+}
+
+/// the inverse of [`typed_trigger_to_json`] (loses nothing the engine reads)
+pub fn json_trigger_to_typed_pub(t: Json) -> Option<llama::chat_tools::GrammarTrigger> {
+    let ty = t.at("type").and_then(|v| v.get_i64().ok())?;
+    let ty = match ty {
+        0 => llama::chat_tools::GrammarTriggerType::Token,
+        1 => llama::chat_tools::GrammarTriggerType::Word,
+        2 => llama::chat_tools::GrammarTriggerType::Pattern,
+        3 => llama::chat_tools::GrammarTriggerType::PatternFull,
+        _ => return None,
+    };
+    Some(llama::chat_tools::GrammarTrigger {
+        ty,
+        word: t.at("value").and_then(|v| v.get_str().ok()).unwrap_or("").to_string(),
+        token: t.at("token").and_then(|v| v.get_i64().ok()).map(|v| v as i32).unwrap_or(-1),
+    })
 }

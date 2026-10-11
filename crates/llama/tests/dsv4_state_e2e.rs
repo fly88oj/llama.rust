@@ -813,6 +813,108 @@ fn dsv4_state_round_trip() {
     }
 }
 
+/// the PARTIAL_ONLY round-trip (llama-kv-cache-iswa.cpp:260-268 / the dsv4
+/// kv_raw gate, @aa94f2086): the partial blob carries the swa half of the
+/// raw pair alone (the base half is skipped — upstream `kv_base->state_read`
+/// is never called under PARTIAL_ONLY) plus the compressor planes. The
+/// server's rollback shape: the LIVE context continues past the checkpoint
+/// (pollution), then the partial restore replaces the swa half and the
+/// compressor state with the checkpoint's, and the continuation from there
+/// must match the uninterrupted run bit-for-bit. Any write/read asymmetry
+/// in the base-half skip breaks the restore's parse (or placement) here.
+#[test]
+fn dsv4_state_partial_round_trip() {
+    let _files = file_lock();
+    let spec = spec_deepseek4();
+    build_file(&spec);
+
+    const N_PRE: usize = PROMPT.len(); // 16
+    const N_CKPT: usize = 4;
+    const N_POLLUTE: usize = 3;
+
+    for fa in [false, true] {
+        // the LIVE context: the prefill + checkpoint steps, then pollution
+        // past the checkpoint, then the partial restore (the server's
+        // rollback: create_checkpoint had stashed the partial blob at
+        // N_CKPT; the tail is what the restore must undo)
+        let mut m2 = open_model(&spec.path());
+        let mut d2 = driver_for_dsv4(&mut m2, fa, 1, 0);
+        let mut logits = d2
+            .decode(&PROMPT, &(0..N_PRE as i32).collect::<Vec<_>>())
+            .expect("prefill")
+            .to_vec();
+        for s in 0..N_CKPT {
+            let id = argmax(&logits);
+            let p = (N_PRE + s) as i32;
+            logits = d2.decode(&[id], &[p]).expect("decode").to_vec();
+        }
+        // the partial checkpoint (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) taken
+        // at the boundary, THEN the pollution the restore must roll back
+        let blob = d2.state_seq_get_data(0, true);
+        assert_eq!(
+            blob.len(),
+            d2.state_seq_get_size(0, true),
+            "fa={fa}: partial size mismatch"
+        );
+        for s in 0..N_POLLUTE {
+            let id = argmax(&logits);
+            let p = (N_PRE + N_CKPT + s) as i32;
+            logits = d2.decode(&[id], &[p]).expect("pollution decode").to_vec();
+        }
+
+        // the partial restore: the swa half (and the compressor planes) are
+        // replaced with the checkpoint's; the base half keeps its cells
+        // (upstream semantics — the parts that CAN roll back are not stashed)
+        d2.state_seq_set_data(0, &blob, true).expect("partial restore");
+        let swa_pos_max = {
+            let mask = 1u64;
+            d2.kv
+                .swa
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .filter(|c| !c.is_empty() && c.seq & mask != 0)
+                .map(|c| c.pos)
+                .max()
+                .unwrap_or(-1)
+        };
+        assert_eq!(
+            swa_pos_max,
+            (N_PRE + N_CKPT - 1) as i32,
+            "fa={fa}: the swa half rolled back to the checkpoint"
+        );
+
+        // the PARTIAL_ONLY contract is the stash, not a full replay: the
+        // partial blob covers the swa half + the compressor states, and NOT
+        // the base half / the compressed K caches (llama-kv-cache-dsv4.cpp:
+        // 1607-1620 skips them under PARTIAL_ONLY — the reference keeps the
+        // polluted rows too). So the content check is re-serialization: the
+        // partial blob of the restored state must equal the checkpoint's
+        // bit-for-bit (the base cells and compressed rows never enter it)
+        let blob2 = d2.state_seq_get_data(0, true);
+        assert_eq!(
+            blob, blob2,
+            "fa={fa}: the partial re-serialization differs from the checkpoint"
+        );
+
+        // a partial blob must NOT parse as a full one (the mode byte gates,
+        // llama-kv-cache-dsv4.cpp:1653-1656)
+        let mut m3 = open_model(&spec.path());
+        let mut d3 = driver_for_dsv4(&mut m3, fa, 1, 0);
+        assert!(
+            d3.state_seq_set_data(0, &blob, false).is_err(),
+            "fa={fa}: partial blob accepted as full"
+        );
+
+        println!(
+            "dsv4 partial round-trip fa={fa}: blob {} bytes, the swa half rolled back and the \
+             re-serialization is bit-identical",
+            blob.len()
+        );
+    }
+}
+
 /// self-consistency of the format itself: the dummy-mode size equals the real
 /// blob's length; the partial_only blob is shorter and shares the dsv4 frame
 /// header; a corrupted magic is refused.

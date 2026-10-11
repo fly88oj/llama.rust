@@ -25,8 +25,14 @@ run_one() {
     curl -s -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
     sleep 1
   done
-  curl -s -m 300 "http://127.0.0.1:$PORT/embedding" \
-      -H 'Content-Type: application/json' -d "$BODY" >"$out"
+  # the aa94f2086 server answers /health 200 while a slot can still be
+  # loading — /embedding then 503s "Loading model"; retry until a real body
+  for _ in $(seq 1 60); do
+    curl -s -m 300 "http://127.0.0.1:$PORT/embedding" \
+      -H "Content-Type: application/json" -d "$BODY" >"$out"
+    grep -q '"error"' "$out" || break
+    sleep 1
+  done
   kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
 }
