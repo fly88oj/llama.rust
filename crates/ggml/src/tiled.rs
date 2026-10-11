@@ -838,6 +838,176 @@ fn micro_vnni_8x16<const SUBBLK: usize, const HAS_MIN: bool, const BIAS: i32, co
     }
 }
 
+/// The reference build's VNNI gate (tiled-kernel.cpp:83
+/// `__AVX512VNNI__ && __AVX512VL__ && __AVX512DQ__`; F implied by the rest).
+#[cfg(target_arch = "x86_64")]
+fn vnni_micro() -> bool {
+    static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *HAS.get_or_init(|| {
+        is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512dq")
+            && is_x86_feature_detected!("avx512vnni")
+    })
+}
+
+/// `tiled_run_micro_vnni_8x16` (tiled-kernel.cpp:94-197) with explicit
+/// intrinsics — the branch the reference's native build compiles. Same math
+/// and op order as the scalar transcription above: exact int32 band pass,
+/// then the epilogue's fixed float sequence (vcvtdq2ps / vmulps /
+/// vfnmadd132ps / vfmadd213ps). The scalar version cannot stand in on this
+/// ISA: the generic build target leaves its `dpbusd_64` emulation at best
+/// SSE2 with stack-spilled `[[i32; 16]; 8]` accumulators (~2.5x slower).
+///
+/// # Safety
+/// Caller must have checked [`vnni_micro`]; tile offsets are the driver's
+/// invariant (same bounds the scalar twin's checked indexing enforces).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl,avx512dq,avx512vnni")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn micro_vnni_8x16_avx512<
+    const SUBBLK: usize,
+    const HAS_MIN: bool,
+    const BIAS: i32,
+    const NK: i32,
+>(
+    src0: &TiledTileSrc0,
+    src1: &TiledTileSrc1,
+    i0: usize,
+    j0: usize,
+    num_k: usize,
+    slab: usize,
+    buf: &mut [f32],
+    buf_stride: usize,
+) {
+    use core::arch::x86_64::*;
+    const NUM_ROWS: usize = 8; // band width (register-pressure note, C:102)
+    let nb = TILED_TILE_K / SUBBLK;
+    let ns = SUBBLK / 16;
+    let ng = SUBBLK / 4;
+
+    // num_k/slab stride selection (C:104-116)
+    let nkr = if NK > 0 { NK as usize } else { num_k };
+    let seff = if NK > 0 { 0 } else { slab };
+    let qk_stride = nkr * TILED_TILE_K;
+    let qk_off = seff * TILED_TILE_K;
+    let nb_stride = nb * nkr;
+    let nb_off = seff * nb;
+    let bs_stride = if nkr == 1 { TILED_TILE_ROWS } else { TILED_MICRO };
+    let bs_off = seff * TILED_MICRO;
+
+    debug_assert!(i0 + NUM_ROWS <= TILED_TILE_ROWS && j0 + 16 <= TILED_TILE_ROWS);
+    let (s0q, s1q, s1b) = (
+        src0.q.as_ptr(),
+        src1.q.as_ptr(),
+        src1.bsums.as_ptr(),
+    );
+
+    let d1_vec = _mm512_loadu_ps(src1.d.as_ptr().add(seff * TILED_MICRO + j0));
+
+    let zero = _mm512_setzero_si512();
+    let mut s1_acc = [zero; NUM_ROWS];
+    let mut s2_acc = [zero; NUM_ROWS];
+
+    // band pass: dpbusd over every 4-byte group of every subblock
+    for s in 0..nb {
+        let mut bsums32 =
+            _mm512_loadu_si512(s1b.add((bs_off + s * ns) * bs_stride + j0) as *const __m512i);
+        for u in 1..ns {
+            bsums32 = _mm512_add_epi32(
+                bsums32,
+                _mm512_loadu_si512(
+                    s1b.add((bs_off + s * ns + u) * bs_stride + j0) as *const __m512i,
+                ),
+            );
+        }
+        let bias32 = if BIAS != 0 {
+            _mm512_mullo_epi32(bsums32, _mm512_set1_epi32(BIAS))
+        } else {
+            zero
+        };
+
+        let mut acc16 = [zero; NUM_ROWS];
+        for g in 0..ng {
+            let kg = s * ng + g;
+            // in-place interleave layout: [kg%16 @ TILED_TILE_K][kg/16 @ 64][row @ 4]
+            let codes = _mm512_loadu_si512(
+                s1q.add(
+                    (j0 / TILED_MICRO) * (TILED_MICRO * qk_stride)
+                        + qk_off
+                        + (kg % TILED_MICRO) * qk_stride
+                        + (kg / TILED_MICRO) * (TILED_MICRO * 4),
+                ) as *const __m512i,
+            );
+            for t in 0..NUM_ROWS {
+                let u4 = s0q
+                    .add((i0 + t) * qk_stride + qk_off + kg * 4)
+                    .cast::<u32>()
+                    .read_unaligned();
+                acc16[t] = _mm512_dpbusd_epi32(acc16[t], _mm512_set1_epi32(u4 as i32), codes);
+            }
+        }
+
+        // int correction: s1_acc += scales*(raw - BIAS*bsums)
+        for t in 0..NUM_ROWS {
+            let ar = i0 + t;
+            let mut rawi = acc16[t];
+            if BIAS != 0 {
+                rawi = _mm512_sub_epi32(rawi, bias32);
+            }
+            s1_acc[t] = _mm512_add_epi32(
+                s1_acc[t],
+                _mm512_mullo_epi32(
+                    rawi,
+                    _mm512_set1_epi32(*src0.scales.as_ptr().add(ar * nb_stride + nb_off + s)),
+                ),
+            );
+        }
+    }
+
+    // s2_acc += mins*bsums (C:171-182)
+    if HAS_MIN {
+        for s in 0..nb {
+            let mut bsums32 =
+                _mm512_loadu_si512(s1b.add((bs_off + s * ns) * bs_stride + j0) as *const __m512i);
+            for u in 1..ns {
+                bsums32 = _mm512_add_epi32(
+                    bsums32,
+                    _mm512_loadu_si512(
+                        s1b.add((bs_off + s * ns + u) * bs_stride + j0) as *const __m512i,
+                    ),
+                );
+            }
+            for t in 0..NUM_ROWS {
+                s2_acc[t] = _mm512_add_epi32(
+                    s2_acc[t],
+                    _mm512_mullo_epi32(
+                        bsums32,
+                        _mm512_set1_epi32(
+                            *src0.mins.as_ptr().add((i0 + t) * nb_stride + nb_off + s),
+                        ),
+                    ),
+                );
+            }
+        }
+    }
+
+    // epilogue: int->float, per-row scales, fused buf update (C:185-196)
+    for t in 0..NUM_ROWS {
+        let ar = i0 + t;
+        let d_off = seff * TILED_MICRO + ar;
+        let f1 = _mm512_cvtepi32_ps(s1_acc[t]); // vcvtdq2ps
+        let mut result = _mm512_mul_ps(_mm512_set1_ps(src0.d[d_off]), f1); // vmulps d
+        if HAS_MIN {
+            let f2 = _mm512_cvtepi32_ps(s2_acc[t]);
+            result = _mm512_fnmadd_ps(_mm512_set1_ps(src0.dmin[d_off]), f2, result); // vfnmadd132ps dmin
+        }
+        let p = buf.as_mut_ptr().add((i0 + t) * buf_stride + j0);
+        let cur = _mm512_loadu_ps(p);
+        _mm512_storeu_ps(p, _mm512_fmadd_ps(result, d1_vec, cur)); // vfmadd213ps (buf, d1)
+    }
+}
+
 /// `tiled_run_microtile<SUBBLK, HAS_MIN, BIAS, ACTBIAS>` (tiled-kernel.cpp:
 /// 510-539), the reference build's VNNI branch: a 16x16 microtile as two
 /// explicit 8x16 band passes. `num_k == 1` takes the NK=1 instantiation
@@ -853,6 +1023,23 @@ fn run_microtile<const SUBBLK: usize, const HAS_MIN: bool, const BIAS: i32, cons
     buf: &mut [f32],
     buf_stride: usize,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if vnni_micro() {
+            // SAFETY: gate checked; tile offsets are the driver's invariant.
+            unsafe {
+                if num_k == 1 {
+                    micro_vnni_8x16_avx512::<SUBBLK, HAS_MIN, BIAS, 1>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
+                    micro_vnni_8x16_avx512::<SUBBLK, HAS_MIN, BIAS, 1>(src0, src1, i0 + 8, j0, num_k, slab, buf, buf_stride);
+                } else {
+                    micro_vnni_8x16_avx512::<SUBBLK, HAS_MIN, BIAS, 0>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
+                    micro_vnni_8x16_avx512::<SUBBLK, HAS_MIN, BIAS, 0>(src0, src1, i0 + 8, j0, num_k, slab, buf, buf_stride);
+                }
+            }
+            return;
+        }
+    }
+    // scalar fallback (the C's non-VNNI builds)
     if num_k == 1 {
         micro_vnni_8x16::<SUBBLK, HAS_MIN, BIAS, 1>(src0, src1, i0, j0, num_k, slab, buf, buf_stride);
         micro_vnni_8x16::<SUBBLK, HAS_MIN, BIAS, 1>(src0, src1, i0 + 8, j0, num_k, slab, buf, buf_stride);
@@ -866,7 +1053,106 @@ fn run_microtile<const SUBBLK: usize, const HAS_MIN: bool, const BIAS: i32, cons
 /// 16x16 int32 transpose of the natural `[row][k]` codes into the group-local
 /// `[kg%16][kg/16][row][4]` layout, four butterfly phases plus the
 /// `col_order` store. `bias` is unused on this ISA branch (GGML_UNUSED in C).
+///
+/// # Safety
+/// Caller must have checked [`vnni_micro`].
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512vl,avx512dq,avx512vnni")]
+unsafe fn repack_src1_avx512(src1: &mut TiledTileSrc1, row0: usize, num_k: usize) {
+    use core::arch::x86_64::*;
+    const IDX_A1: [i32; 16] = [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23];
+    const IDX_B1: [i32; 16] = [8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31];
+    const IDX_A2: [i32; 16] = [0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29];
+    const IDX_B2: [i32; 16] = [2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31];
+    const IDX_A3: [i32; 16] = [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23];
+    const IDX_B3: [i32; 16] = [8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31];
+    const IDX_A4: [i32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23];
+    const IDX_B4: [i32; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31];
+    const COL_ORDER: [usize; 16] = [0, 8, 1, 9, 4, 12, 5, 13, 2, 10, 3, 11, 6, 14, 7, 15];
+
+    let idx = |c: &[i32; 16]| {
+        _mm512_setr_epi32(
+            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12],
+            c[13], c[14], c[15],
+        )
+    };
+
+    let n_tiles = num_k * (TILED_TILE_K / (TILED_MICRO * 4));
+    let row_stride = num_k * TILED_TILE_K;
+    let base = src1.q.as_mut_ptr().add(row0 * row_stride);
+    for t in 0..n_tiles {
+        let cbase = base.add(t * (TILED_MICRO * 4));
+        let mut v = [_mm512_setzero_si512(); 16];
+        for (r, vr) in v.iter_mut().enumerate() {
+            *vr = _mm512_loadu_si512(cbase.add(r * row_stride) as *const __m512i);
+        }
+
+        let perm = |a: __m512i, ca: &[i32; 16], b: __m512i, cb: &[i32; 16]| {
+            let ia = idx(ca);
+            let x = _mm512_permutex2var_epi32(a, ia, b);
+            let y = _mm512_permutex2var_epi32(a, idx(cb), b);
+            [x, y]
+        };
+        // phase 1: 1-element interleave, pairs (0,1), (2,3), ..., (14,15)
+        let mut i = 0;
+        while i < 16 {
+            let [x, y] = perm(v[i], &IDX_A1, v[i + 1], &IDX_B1);
+            v[i] = x;
+            v[i + 1] = y;
+            i += 2;
+        }
+        // phase 2: 2-element interleave
+        let mut i = 0;
+        while i < 16 {
+            for j in 0..2 {
+                let [x, y] = perm(v[i + j], &IDX_A2, v[i + j + 2], &IDX_B2);
+                v[i + j] = x;
+                v[i + j + 2] = y;
+            }
+            i += 4;
+        }
+        // phase 3: 4-element interleave
+        let mut i = 0;
+        while i < 16 {
+            for j in 0..4 {
+                let [x, y] = perm(v[i + j], &IDX_A3, v[i + 4 + j], &IDX_B3);
+                v[i + j] = x;
+                v[i + 4 + j] = y;
+            }
+            i += 8;
+        }
+        // phase 4: 8-element interleave
+        for i in 0..8 {
+            let [x, y] = perm(v[i], &IDX_A4, v[i + 8], &IDX_B4);
+            v[i] = x;
+            v[i + 8] = y;
+        }
+
+        // store: v[g] holds 16 int32s for k-group col_order[g], rows 0..15
+        for (g, &co) in COL_ORDER.iter().enumerate() {
+            _mm512_storeu_si512(cbase.add(co * row_stride).cast(), v[g]);
+        }
+    }
+}
+
+/// Dispatching twin of [`repack_src1_avx512`]'s caller: the VNNI branch on
+/// capable hosts, the scalar butterfly otherwise.
 fn repack_src1(src1: &mut TiledTileSrc1, row0: usize, num_k: usize, _bias: bool) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if vnni_micro() {
+            // SAFETY: gate checked; offsets bounded by the tile allocation.
+            unsafe { repack_src1_avx512(src1, row0, num_k) };
+            return;
+        }
+    }
+    repack_src1_scalar(src1, row0, num_k, _bias)
+}
+
+/// Scalar butterfly (tiled-kernel.cpp's non-VNNI builds) — same layout
+/// transformation as [`repack_src1_avx512`], kept as the portable fallback
+/// and bit-exact oracle.
+fn repack_src1_scalar(src1: &mut TiledTileSrc1, row0: usize, num_k: usize, _bias: bool) {
     const IDX_A1: [u32; 16] = [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23];
     const IDX_B1: [u32; 16] = [8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31];
     const IDX_A2: [u32; 16] = [0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29];
@@ -1937,3 +2223,170 @@ mod tiled_ref_tests {
 }
 
 
+
+// ======================================================================
+// AVX512-vs-scalar bit equivalence (the workspace's to_bits idiom)
+// ======================================================================
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod vnni_avx512_tests {
+    use super::*;
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn byte(&mut self) -> u8 {
+            (self.next() >> 32) as u8
+        }
+        fn i32(&mut self) -> i32 {
+            ((self.next() >> 33) as i32) % 64
+        }
+        fn f32(&mut self) -> f32 {
+            ((self.next() >> 40) as i32 as f32) / 1024.0
+        }
+    }
+
+    fn rand_src0(r: &mut Rng) -> TiledTileSrc0 {
+        let mut t = TiledTileSrc0 {
+            q: Box::new([0; TILED_TILE_ROWS * TILED_TILE_K]),
+            d: Box::new([0.0; TILED_TILE_ROWS]),
+            dmin: Box::new([0.0; TILED_TILE_ROWS]),
+            scales: Box::new([0; TILED_TILE_ROWS * NB_MAX]),
+            mins: Box::new([0; TILED_TILE_ROWS * NB_MAX]),
+        };
+        for v in t.q.iter_mut() {
+            *v = r.byte();
+        }
+        for v in t.d.iter_mut() {
+            *v = r.f32();
+        }
+        for v in t.dmin.iter_mut() {
+            *v = r.f32();
+        }
+        for v in t.scales.iter_mut() {
+            *v = r.i32();
+        }
+        for v in t.mins.iter_mut() {
+            *v = r.i32();
+        }
+        t
+    }
+
+    fn rand_src1(r: &mut Rng) -> TiledTileSrc1 {
+        let mut t = TiledTileSrc1 {
+            q: Box::new([0; TILED_TILE_ROWS * TILED_TILE_K]),
+            bsums: Box::new([0; (TILED_TILE_K / TILED_MICRO) * TILED_TILE_ROWS]),
+            d: Box::new([0.0; TILED_TILE_ROWS]),
+        };
+        for v in t.q.iter_mut() {
+            *v = r.byte();
+        }
+        for v in t.bsums.iter_mut() {
+            *v = (r.i32() * 128) + r.i32();
+        }
+        for v in t.d.iter_mut() {
+            *v = r.f32();
+        }
+        t
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    #[test]
+    fn microtile_avx512_bit_matches_scalar() {
+        if !vnni_micro() {
+            eprintln!("skip: host lacks avx512 vnni gate");
+            return;
+        }
+        // (SUBBLK, HAS_MIN, BIAS) — the closed instantiation set of with_kernel!
+        macro_rules! case {
+            ($s:expr, $h:expr, $b:expr, $num_k:expr, $slab:expr) => {{
+                let mut r = Rng(0x9E37_79B9_7F4A_7C15 ^ ($s as u64) ^ ($b as u64) ^ ($num_k as u64) << 8);
+                let src0 = rand_src0(&mut r);
+                let src1 = rand_src1(&mut r);
+                let mut buf_a = vec![0.0f32; TILED_TILE_ROWS * TILED_TILE_ROWS];
+                let mut buf_b = vec![0.0f32; TILED_TILE_ROWS * TILED_TILE_ROWS];
+                for (a, b) in buf_a.iter_mut().zip(buf_b.iter_mut()) {
+                    *a = r.f32();
+                    *b = *a;
+                }
+                let (i0, j0) = (16, 32);
+                if $num_k == 1 {
+                    micro_vnni_8x16::<$s, $h, $b, 1>(&src0, &src1, i0, j0, $num_k, $slab, &mut buf_a, TILED_TILE_ROWS);
+                    micro_vnni_8x16::<$s, $h, $b, 1>(&src0, &src1, i0 + 8, j0, $num_k, $slab, &mut buf_a, TILED_TILE_ROWS);
+                    // SAFETY: vnni_micro() checked above.
+                    unsafe {
+                        micro_vnni_8x16_avx512::<$s, $h, $b, 1>(&src0, &src1, i0, j0, $num_k, $slab, &mut buf_b, TILED_TILE_ROWS);
+                        micro_vnni_8x16_avx512::<$s, $h, $b, 1>(&src0, &src1, i0 + 8, j0, $num_k, $slab, &mut buf_b, TILED_TILE_ROWS);
+                    }
+                } else {
+                    micro_vnni_8x16::<$s, $h, $b, 0>(&src0, &src1, i0, j0, $num_k, $slab, &mut buf_a, TILED_TILE_ROWS);
+                    micro_vnni_8x16::<$s, $h, $b, 0>(&src0, &src1, i0 + 8, j0, $num_k, $slab, &mut buf_a, TILED_TILE_ROWS);
+                    // SAFETY: vnni_micro() checked above.
+                    unsafe {
+                        micro_vnni_8x16_avx512::<$s, $h, $b, 0>(&src0, &src1, i0, j0, $num_k, $slab, &mut buf_b, TILED_TILE_ROWS);
+                        micro_vnni_8x16_avx512::<$s, $h, $b, 0>(&src0, &src1, i0 + 8, j0, $num_k, $slab, &mut buf_b, TILED_TILE_ROWS);
+                    }
+                }
+                assert_eq!(bits(&buf_a), bits(&buf_b), "mismatch SUBBLK={} HAS_MIN={} BIAS={} num_k={} slab={}", $s, $h, $b, $num_k, $slab);
+            }};
+        }
+        // standard path (num_k = 1) for every instantiation
+        case!(32, true, 0, 1, 0); // q4_K / q5_K
+        case!(32, false, 128, 1, 0); // iq4_xs
+        case!(32, false, 128, 1, 0); // (same consts; exercised once above)
+        case!(16, false, 128, 1, 0); // iq2_xs family
+        case!(16, false, 32, 1, 0); // q6_K
+        case!(16, false, 4, 1, 0); // q3_K
+        case!(16, true, 0, 1, 0); // q2_K
+        // narrow path (num_k > 1, per-slab offsets) spot checks
+        case!(32, true, 0, 2, 1);
+        case!(16, false, 32, 2, 0);
+        case!(16, false, 128, 4, 3);
+    }
+
+    #[test]
+    fn repack_src1_avx512_matches_scalar() {
+        if !vnni_micro() {
+            eprintln!("skip: host lacks avx512 vnni gate");
+            return;
+        }
+        for num_k in 1..=4usize {
+            let mut r = Rng(0x1234_5678_9ABC_DEF0 ^ num_k as u64);
+            let a = rand_src1(&mut r);
+            // driver-valid combos only: the narrow path (num_k > 1) always
+            // passes row0 = 0, the standard path (num_k = 1) any 16-aligned
+            // row0 — other combinations read past the tile allocation.
+            let rows: &[usize] = if num_k == 1 { &[0, 16, 128, 240] } else { &[0] };
+            for &row0 in rows {
+                let mut a2 = TiledTileSrc1 {
+                    q: Box::new([0; TILED_TILE_ROWS * TILED_TILE_K]),
+                    bsums: Box::new([0; (TILED_TILE_K / TILED_MICRO) * TILED_TILE_ROWS]),
+                    d: Box::new([0.0; TILED_TILE_ROWS]),
+                };
+                a2.q.copy_from_slice(&a.q[..]);
+                a2.bsums.copy_from_slice(&a.bsums[..]);
+                a2.d.copy_from_slice(&a.d[..]);
+                let mut b2 = TiledTileSrc1 {
+                    q: Box::new([0; TILED_TILE_ROWS * TILED_TILE_K]),
+                    bsums: Box::new([0; (TILED_TILE_K / TILED_MICRO) * TILED_TILE_ROWS]),
+                    d: Box::new([0.0; TILED_TILE_ROWS]),
+                };
+                b2.q.copy_from_slice(&a.q[..]);
+                repack_src1_scalar(&mut a2, row0, num_k, false);
+                // SAFETY: vnni_micro() checked above.
+                unsafe { repack_src1_avx512(&mut b2, row0, num_k) };
+                assert_eq!(a2.q, b2.q, "mismatch num_k={} row0={}", num_k, row0);
+            }
+        }
+    }
+}
