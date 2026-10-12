@@ -6,7 +6,8 @@
 # definitions, warm-up and rep protocol under identical flags.
 #
 #   ref  : $LLAMA_RUST_DATA_HOME/llm/llama.cpp-next/build-rust-ref  (aa94f2086, AVX512+REPACK, CPU only)
-#   port : ./target/release/llama-bench                     (da3deda, release)
+#   port : ./target/release/llama-bench                     (HEAD, release —
+#          compare against the pinned reference at the commit you built)
 #
 # Matrix: 6 models x {pp512, pp128, tg128} @ -t 8 -fa on -r 3
 #         + probes: -t 32 scaling (qwen-0.5b, gemma-12b Q4_0), -fa off (qwen-0.5b)
@@ -90,7 +91,6 @@ for spec in "${MODELS[@]}"; do
   av="$(avail_g)"
   if (( av < minavail )); then
     echo "    SKIP: available ${av}G < ${minavail}G" >&2
-    echo "$label SKIP lowmem" >>"$OUT/skips.txt"
     continue
   fi
   echo "    prewarming page cache ($(du -h "$model" | cut -f1))..." >&2
@@ -106,18 +106,25 @@ done
 fi
 
 if [[ "$PHASE" != "matrix" ]]; then
+probe_idx=0
 for spec in "${PROBES[@]}"; do
   IFS='|' read -r label model extra <<<"$spec"
   echo "=== probe $label ($extra) ===" >&2
   av="$(avail_g)"
   if (( av < 24 )); then
     echo "    SKIP: available ${av}G < 24G" >&2
-    echo "$label SKIP lowmem" >>"$OUT/skips.txt"
     continue
   fi
   prewarm "$model"
-  run_side ref  "$label" "$model" "$OUT/${label}_ref.csv"  $extra
-  run_side port "$label" "$model" "$OUT/${label}_port.csv" $extra
+  # alternate side order across probes like the matrix phase (drift cancel)
+  probe_idx=$((probe_idx + 1))
+  if (( probe_idx % 2 == 1 )); then
+    run_side ref  "$label" "$model" "$OUT/${label}_ref.csv"  $extra
+    run_side port "$label" "$model" "$OUT/${label}_port.csv" $extra
+  else
+    run_side port "$label" "$model" "$OUT/${label}_port.csv" $extra
+    run_side ref  "$label" "$model" "$OUT/${label}_ref.csv"  $extra
+  fi
 done
 fi
 

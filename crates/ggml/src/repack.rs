@@ -824,17 +824,25 @@ mod simd_x86 {
             }};
         }
         // ---- 16-row section (C:671-883), the reference's distributed shape ----
-        // One decode pass per (y, x) writes the 8 decoded rhs vectors + col
-        // scale of every slab to the relay; four per-row-group passes then
+        // One decode pass per (y, x) parks the 8 decoded rhs vectors + col
+        // scale of every slab in the relay; four per-row-group passes then
         // re-load them, re-apply the sp1/sp2 shuffles and fma into their own
         // 4-row accumulator. This bounds the live zmm set (4 acc + 9 relay +
         // transients) instead of the fused form's 16 acc + 16 shuffled rhs +
         // transients, which LLVM spills ~3x more than GCC's own distribution
-        // of the same math (185+ zmm stack round-trips in the fused loop;
-        // batch 18's fission attempt re-DECODED per group and lost to that —
-        // the relay is the missing piece, the shape the reference's -O3
-        // build actually runs).
-        let mut relay: Vec<__m512i> = vec![_mm512_setzero_si512(); nb * 9];
+        // of the same math (185+ zmm stack round-trips in the fused loop).
+        // The sp shuffles deliberately run per group (4x16 per b) rather
+        // than once into a 17-slot pre-shuffled relay — the parked-quad form
+        // measured SLOWER on Zen5 (8.7 vs 6.7 ms on the 2880^2 nr=128 A/B)
+        // even though the C source hoists them (repack.cpp:735-770): the
+        // extra relay stores/loads outweigh the redundant shuffles. Batch
+        // 18's fission attempt re-DECODED per group and lost to that — the
+        // decode relay is the piece that matters.
+        let mut relay: Vec<__m512i> = if anr > 0 {
+            vec![_mm512_setzero_si512(); nb * 17]
+        } else {
+            Vec::new() // nr < 16 (MoE small batches): only the 4-row section runs
+        };
         let mut accmem = [_mm512_setzero_ps(); 16];
         let mut y = 0usize;
         while y < anr / 4 {
@@ -896,8 +904,9 @@ mod simd_x86 {
                     relay[b * 9 + 8] = _mm512_castps_si512(col);
                 }
                 // four row-group passes: bounded register set each, sp
-                // shuffles re-applied from the relay (the reference's
-                // distribution), fma into a local 4-acc then parked
+                // shuffles re-applied from the relay (measured faster than
+                // parking the shuffled quads — see the section comment), fma
+                // into a local 4-acc then parked
                 macro_rules! group_pass {
                     ($G:expr) => {{
                         let mut acc = [_mm512_setzero_ps(); 4];
@@ -4068,7 +4077,11 @@ mod simd_x86_q4_0 {
         // form keeps 16 acc + 16 shuffled rhs live and LLVM spills it ~3x
         // harder than GCC's own distribution (see simd_x86::gemm_avx512's
         // relay note; same disease, same cure).
-        let mut relay: Vec<__m512i> = vec![_mm512_setzero_si512(); nb * 17];
+        let mut relay: Vec<__m512i> = if anr > 0 {
+            vec![_mm512_setzero_si512(); nb * 17]
+        } else {
+            Vec::new() // nr < 16 (small batches): only the 4-row section runs
+        };
         let mut accmem = [_mm512_setzero_ps(); 16];
         while y < anr / 4 {
             for x in (0..anc / 8).step_by(2) {
@@ -4610,21 +4623,98 @@ mod tests {
         assert!(d < c, "the SIMD kernel must be faster");
     }
 
-    /// Kernel-level A/B against the pinned reference .so via
-    /// `parity/ref_gemm_ab.c`: writes the repacked weights + interleaved q8
-    /// activations to /tmp/gemmab, times this side's dispatched gemm, and —
-    /// once the C harness has run — checks output bit-parity against the
-    /// reference kernel's result. The fixture keeps every E8M0 scale in the
-    /// normal band (the 1-in-16 {0,1,2} exponents of [`rand_mxfp4`]'s tail
-    /// trip Zen5 denormal microcode assists — perf round 32's lesson — and
-    /// would distort the A/B).
+    /// The port side of the kernel-level A/B instrument whose C counterpart
+    /// is `parity/ref_gemm_ab.c`. Protocol (both directions must hold, else
+    /// the test FAILS — a missing or stale reference artifact can never make
+    /// this pass vacuously):
+    ///   1. this side writes `<case>_{rep,act}.bin` and times the dispatched
+    ///      gemm (best of 5);
+    ///   2. the C harness (run separately) validates the input sizes, times
+    ///      the reference .so kernel on the same bytes and writes
+    ///      `<case>_ref_out.bin` + `<case>_ref_meta.txt`
+    ///      ("n nc nr fnv1a(rep||act)");
+    ///   3. this side re-checks shape AND the fnv over its own rep/act
+    ///      buffers against the meta, then bit-compares the outputs.
+    fn ab_vs_ref_kernel(
+        case: &str,
+        n: usize,
+        nc: usize,
+        nr: usize,
+        rep: &[u8],
+        q8x4: &[u8],
+        weight_bytes: usize,
+        gemm: fn(usize, &mut [f32], usize, &[u8], &[u8], usize, usize),
+    ) {
+        let dir = std::path::Path::new("/tmp/gemmab");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{case}_rep.bin")), rep).unwrap();
+        std::fs::write(dir.join(format!("{case}_act.bin")), q8x4).unwrap();
+
+        let mut out = vec![0f32; nr * nc];
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            for v in out.iter_mut() {
+                *v = 0.0;
+            }
+            let t = std::time::Instant::now();
+            gemm(n, &mut out, nc, rep, q8x4, nr, nc);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        println!(
+            "port {case} n={n} nc={nc} nr={nr}: {:9.3} ms  {:7.2} GB/s (weights)  out[0]={:.4}",
+            best * 1e3,
+            weight_bytes as f64 / best / 1e9,
+            out[0]
+        );
+
+        // handshake: the reference side must have run on THESE bytes
+        let meta = std::fs::read_to_string(dir.join(format!("{case}_ref_meta.txt")))
+            .expect("no ref meta: run parity/ref_gemm_ab first (see its header)");
+        let mut it = meta.split_whitespace();
+        let (rn, rnc, rnr): (usize, usize, usize) = (
+            it.next().unwrap().parse().unwrap(),
+            it.next().unwrap().parse().unwrap(),
+            it.next().unwrap().parse().unwrap(),
+        );
+        let rhash = u64::from_str_radix(it.next().unwrap(), 16).unwrap();
+        assert_eq!(
+            (rn, rnc, rnr),
+            (n, nc, nr),
+            "stale ref output shape {rn}x{rnc}x{rnr}: rerun ref_gemm_ab {case} {n} {nc} {nr}"
+        );
+        let mut h = 0xcbf29ce484222325u64;
+        for &b in rep.iter().chain(q8x4) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        assert_eq!(
+            h, rhash,
+            "ref output was produced from different bytes: rerun ref_gemm_ab after this test"
+        );
+
+        let rb = std::fs::read(dir.join(format!("{case}_ref_out.bin")))
+            .expect("ref meta present but ref_out missing: rerun ref_gemm_ab");
+        let rf: &[f32] = bytemuck::cast_slice(&rb);
+        assert_eq!(rf.len(), out.len());
+        let bad = out
+            .iter()
+            .zip(rf)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        println!("bit-parity vs ref kernel: {bad} mismatches / {} elems", out.len());
+        assert_eq!(bad, 0, "kernel-level bit divergence vs the reference");
+    }
+
+    /// mxfp4 expert-shaped A/B (gpt-oss 2880x2880). The fixture keeps every
+    /// E8M0 scale in the normal band — the 1-in-16 {0,1,2} exponents of
+    /// [`rand_mxfp4`]'s tail trip Zen5 denormal microcode assists (perf
+    /// round 32's lesson) and would distort the A/B. LLAMA_RUST_AB_NR
+    /// overrides nr (the MoE mul_mat_id path calls this kernel with small
+    /// row counts, 4-32).
     #[test]
     #[ignore = "manual: kernel A/B vs reference .so (parity/ref_gemm_ab.c)"]
     fn bench_repack_gemm_vs_ref() {
         let _serial = serial();
-        // nr is parametrizable: the MoE mul_mat_id path calls this kernel
-        // with small row counts (4-32) — LLAMA_RUST_AB_NR overrides the
-        // default gpt-oss-expert-sized 128
         let (n, nc) = (2880usize, 2880usize);
         let nr: usize = std::env::var("LLAMA_RUST_AB_NR")
             .ok()
@@ -4645,55 +4735,16 @@ mod tests {
         let act = lcg_f32(nr * n, 0x5150_2222);
         let mut q8x4 = vec![0u8; (nr / 4) * (n / QK8_0) * BLOCK_Q8_0X4_SIZE];
         quantize_mat_q8_0_4x8(&act, n, nr, &mut q8x4);
-
-        let dir = std::path::Path::new("/tmp/gemmab");
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("mxfp4_rep.bin"), &rep).unwrap();
-        std::fs::write(dir.join("mxfp4_act.bin"), &q8x4).unwrap();
-
-        let mut out = vec![0f32; nr * nc];
-        let mut best = f64::INFINITY;
-        for _ in 0..5 {
-            for v in out.iter_mut() {
-                *v = 0.0;
-            }
-            let t = std::time::Instant::now();
-            gemm_mxfp4_8x8_q8_0(n, &mut out, nc, &rep, &q8x4, nr, nc);
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        let bytes = nc as f64 * (n / 32) as f64 * BLOCK_MXFP4X8_SIZE as f64;
-        println!(
-            "port mxfp4 n={n} nc={nc} nr={nr}: {:9.3} ms  {:7.2} GB/s (weights)  out[0]={:.4}",
-            best * 1e3,
-            bytes / best / 1e9,
-            out[0]
-        );
-
-        let ref_path = dir.join("mxfp4_ref_out.bin");
-        if let Ok(rb) = std::fs::read(&ref_path) {
-            let rf: &[f32] = bytemuck::cast_slice(&rb);
-            assert_eq!(rf.len(), out.len(), "stale ref output: rerun ref_gemm_ab");
-            let bad = out
-                .iter()
-                .zip(rf)
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            println!("bit-parity vs ref kernel: {bad} mismatches / {} elems", out.len());
-            assert_eq!(bad, 0, "kernel-level bit divergence vs the reference");
-        } else {
-            eprintln!(
-                "no ref output yet: run parity/ref_gemm_ab (see its header), then rerun this test"
-            );
-        }
+        ab_vs_ref_kernel("mxfp4", n, nc, nr, &rep, &q8x4, rep.len(), gemm_mxfp4_8x8_q8_0);
     }
 
-    /// The q4_0 twin of [`bench_repack_gemm_vs_ref`]: random valid q4_0
-    /// blocks (d = 1.0, random nibbles) through the same file handshake.
+    /// The q4_0 A/B (gemma-class dense 2048x2048): random valid q4_0 blocks
+    /// (d = 1.0, random nibbles).
     #[test]
     #[ignore = "manual: kernel A/B vs reference .so (parity/ref_gemm_ab.c)"]
     fn bench_repack_gemm_q4_0_vs_ref() {
         let _serial = serial();
-        let (n, nc) = (2048usize, 2048usize); // gemma-class dense FFN shape
+        let (n, nc) = (2048usize, 2048usize);
         let nr: usize = std::env::var("LLAMA_RUST_AB_NR")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -4713,44 +4764,7 @@ mod tests {
         let act = lcg_f32(nr * n, 0x2468_ACE0);
         let mut q8x4 = vec![0u8; (nr / 4) * (n / QK8_0) * BLOCK_Q8_0X4_SIZE];
         quantize_mat_q8_0_4x8(&act, n, nr, &mut q8x4);
-
-        let dir = std::path::Path::new("/tmp/gemmab");
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("q4_0_rep.bin"), &rep).unwrap();
-        std::fs::write(dir.join("q4_0_act.bin"), &q8x4).unwrap();
-
-        let mut out = vec![0f32; nr * nc];
-        let mut best = f64::INFINITY;
-        for _ in 0..5 {
-            for v in out.iter_mut() {
-                *v = 0.0;
-            }
-            let t = std::time::Instant::now();
-            gemm_q4_0_8x8_q8_0(n, &mut out, nc, &rep, &q8x4, nr, nc);
-            best = best.min(t.elapsed().as_secs_f64());
-        }
-        let bytes = nc as f64 * (n / 32) as f64 * BLOCK_Q4_0X8_SIZE as f64;
-        println!(
-            "port q4_0 n={n} nc={nc} nr={nr}: {:9.3} ms  {:7.2} GB/s (weights)  out[0]={:.4}",
-            best * 1e3,
-            bytes / best / 1e9,
-            out[0]
-        );
-
-        let ref_path = dir.join("q4_0_ref_out.bin");
-        if let Ok(rb) = std::fs::read(&ref_path) {
-            let rf: &[f32] = bytemuck::cast_slice(&rb);
-            assert_eq!(rf.len(), out.len(), "stale ref output: rerun ref_gemm_ab");
-            let bad = out
-                .iter()
-                .zip(rf)
-                .filter(|(a, b)| a.to_bits() != b.to_bits())
-                .count();
-            println!("bit-parity vs ref kernel: {bad} mismatches / {} elems", out.len());
-            assert_eq!(bad, 0, "kernel-level bit divergence vs the reference");
-        } else {
-            eprintln!("no ref output yet: run parity/ref_gemm_ab q4_0 ..., then rerun");
-        }
+        ab_vs_ref_kernel("q4_0", n, nc, nr, &rep, &q8x4, rep.len(), gemm_q4_0_8x8_q8_0);
     }
 
     /// Rough cost of materializing one gpt-oss expert tensor (141 MiB), for the

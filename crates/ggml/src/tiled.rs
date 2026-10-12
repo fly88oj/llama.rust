@@ -1052,6 +1052,18 @@ fn run_microtile<const SUBBLK: usize, const HAS_MIN: bool, const BIAS: i32, cons
 /// `tiled_repack_src1` (tiled-kernel.cpp:577-642) — the VNNI build's in-place
 /// 16x16 int32 transpose of the natural `[row][k]` codes into the group-local
 /// `[kg%16][kg/16][row][4]` layout, four butterfly phases plus the
+/// Butterfly lane tables of `tiled_repack_src1` (tiled-kernel.cpp:590-637),
+/// shared by the AVX512 and scalar twins so the two cannot drift.
+const IDX_A1: [u32; 16] = [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23];
+const IDX_B1: [u32; 16] = [8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31];
+const IDX_A2: [u32; 16] = [0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29];
+const IDX_B2: [u32; 16] = [2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31];
+const IDX_A3: [u32; 16] = [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23];
+const IDX_B3: [u32; 16] = [8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31];
+const IDX_A4: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23];
+const IDX_B4: [u32; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31];
+const COL_ORDER: [usize; 16] = [0, 8, 1, 9, 4, 12, 5, 13, 2, 10, 3, 11, 6, 14, 7, 15];
+
 /// `col_order` store. `bias` is unused on this ISA branch (GGML_UNUSED in C).
 ///
 /// # Safety
@@ -1060,20 +1072,11 @@ fn run_microtile<const SUBBLK: usize, const HAS_MIN: bool, const BIAS: i32, cons
 #[target_feature(enable = "avx512f,avx512vl,avx512dq,avx512vnni")]
 unsafe fn repack_src1_avx512(src1: &mut TiledTileSrc1, row0: usize, num_k: usize) {
     use core::arch::x86_64::*;
-    const IDX_A1: [i32; 16] = [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23];
-    const IDX_B1: [i32; 16] = [8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31];
-    const IDX_A2: [i32; 16] = [0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29];
-    const IDX_B2: [i32; 16] = [2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31];
-    const IDX_A3: [i32; 16] = [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23];
-    const IDX_B3: [i32; 16] = [8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31];
-    const IDX_A4: [i32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23];
-    const IDX_B4: [i32; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31];
-    const COL_ORDER: [usize; 16] = [0, 8, 1, 9, 4, 12, 5, 13, 2, 10, 3, 11, 6, 14, 7, 15];
-
-    let idx = |c: &[i32; 16]| {
+    let idx = |c: &[u32; 16]| {
         _mm512_setr_epi32(
-            c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7], c[8], c[9], c[10], c[11], c[12],
-            c[13], c[14], c[15],
+            c[0] as i32, c[1] as i32, c[2] as i32, c[3] as i32, c[4] as i32, c[5] as i32,
+            c[6] as i32, c[7] as i32, c[8] as i32, c[9] as i32, c[10] as i32, c[11] as i32,
+            c[12] as i32, c[13] as i32, c[14] as i32, c[15] as i32,
         )
     };
 
@@ -1087,7 +1090,7 @@ unsafe fn repack_src1_avx512(src1: &mut TiledTileSrc1, row0: usize, num_k: usize
             *vr = _mm512_loadu_si512(cbase.add(r * row_stride) as *const __m512i);
         }
 
-        let perm = |a: __m512i, ca: &[i32; 16], b: __m512i, cb: &[i32; 16]| {
+        let perm = |a: __m512i, ca: &[u32; 16], b: __m512i, cb: &[u32; 16]| {
             let ia = idx(ca);
             let x = _mm512_permutex2var_epi32(a, ia, b);
             let y = _mm512_permutex2var_epi32(a, idx(cb), b);
@@ -1151,18 +1154,9 @@ fn repack_src1(src1: &mut TiledTileSrc1, row0: usize, num_k: usize, _bias: bool)
 
 /// Scalar butterfly (tiled-kernel.cpp's non-VNNI builds) — same layout
 /// transformation as [`repack_src1_avx512`], kept as the portable fallback
-/// and bit-exact oracle.
+/// and bit-exact oracle. The butterfly lane tables live at module level so
+/// the intrinsic and scalar twins cannot drift.
 fn repack_src1_scalar(src1: &mut TiledTileSrc1, row0: usize, num_k: usize, _bias: bool) {
-    const IDX_A1: [u32; 16] = [0, 16, 1, 17, 2, 18, 3, 19, 4, 20, 5, 21, 6, 22, 7, 23];
-    const IDX_B1: [u32; 16] = [8, 24, 9, 25, 10, 26, 11, 27, 12, 28, 13, 29, 14, 30, 15, 31];
-    const IDX_A2: [u32; 16] = [0, 1, 16, 17, 4, 5, 20, 21, 8, 9, 24, 25, 12, 13, 28, 29];
-    const IDX_B2: [u32; 16] = [2, 3, 18, 19, 6, 7, 22, 23, 10, 11, 26, 27, 14, 15, 30, 31];
-    const IDX_A3: [u32; 16] = [0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23];
-    const IDX_B3: [u32; 16] = [8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31];
-    const IDX_A4: [u32; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23];
-    const IDX_B4: [u32; 16] = [8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31];
-    const COL_ORDER: [usize; 16] = [0, 8, 1, 9, 4, 12, 5, 13, 2, 10, 3, 11, 6, 14, 7, 15];
-
     let n_tiles = num_k * (TILED_TILE_K / (TILED_MICRO * 4));
     let row_stride = num_k * TILED_TILE_K;
     let base = row0 * row_stride;
@@ -2343,7 +2337,6 @@ mod vnni_avx512_tests {
         // standard path (num_k = 1) for every instantiation
         case!(32, true, 0, 1, 0); // q4_K / q5_K
         case!(32, false, 128, 1, 0); // iq4_xs
-        case!(32, false, 128, 1, 0); // (same consts; exercised once above)
         case!(16, false, 128, 1, 0); // iq2_xs family
         case!(16, false, 32, 1, 0); // q6_K
         case!(16, false, 4, 1, 0); // q3_K
