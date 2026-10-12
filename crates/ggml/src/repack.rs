@@ -762,16 +762,18 @@ mod simd_x86 {
         // loadMask = low two dwords (block_q8_0x4.d[0..4] = 4 x f16)
         let load_mask = _mm_set_epi32(0, 0, -1, -1);
 
-        // one block_q8_0x4 (4 rows) against the decoded rhs pair + col
+        // one block_q8_0x4 (4 rows) against the pre-shuffled rhs quads + col
         // scale; fma into acc[BASE..BASE+4]. C:788-876 (16-row rp body) ==
         // C:902-1083 (4-row body) modulo the tile. BASE must be a literal:
         // runtime-indexed acc[] and the closure form this replaced both put
         // the dpb operands on the stack (the 32-entry zmm file needs the
-        // chains interleaved so the shuffle patterns are transient).
+        // chains interleaved so the shuffle patterns are transient). The rhs
+        // sp1/sp2 shuffles are done ONCE per b by the caller (C:740-770 hoists
+        // them out of the rp loop) — recomputing them per 4-row group cost
+        // 48 shuffles/b and was the bulk of the 1.23x residual.
         macro_rules! zmm_rows {
             ($a_tile:expr, $acc:expr, $BASE:expr, $col:expr,
-             $r0_0:expr, $r0_1:expr, $r0_2:expr, $r0_3:expr,
-             $r1_0:expr, $r1_1:expr, $r1_2:expr, $r1_3:expr) => {{
+             $r0_sp1:expr, $r1_sp1:expr, $r0_sp2:expr, $r1_sp2:expr) => {{
                 let qs = ($a_tile).add(8);
                 // lhs: four 32B loads (elements 0-7/8-15/16-23/24-31 of
                 // A0..A3), each split [A0A1|A0A1] / [A2A3|A2A3] (C:792-812)
@@ -792,33 +794,17 @@ mod simd_x86 {
                 // 2367], sp1 (lhs 160 / rhs 136) + sp2 (245 / 221) summed with
                 // an exact integer add (C:855-858)
                 let m00 = _mm512_add_epi32(
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf160(l01_3), shuf136($r0_3)), shuf160(l01_2), shuf136($r0_2)),
-                        shuf160(l01_1), shuf136($r0_1)), shuf160(l01_0), shuf136($r0_0)),
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf245(l01_3), shuf221($r0_3)), shuf245(l01_2), shuf221($r0_2)),
-                        shuf245(l01_1), shuf221($r0_1)), shuf245(l01_0), shuf221($r0_0)));
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf160(l01_3), $r0_sp1[3]), shuf160(l01_2), $r0_sp1[2]), shuf160(l01_1), $r0_sp1[1]), shuf160(l01_0), $r0_sp1[0]),
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf245(l01_3), $r0_sp2[3]), shuf245(l01_2), $r0_sp2[2]), shuf245(l01_1), $r0_sp2[1]), shuf245(l01_0), $r0_sp2[0]));
                 let m01 = _mm512_add_epi32(
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf160(l01_3), shuf136($r1_3)), shuf160(l01_2), shuf136($r1_2)),
-                        shuf160(l01_1), shuf136($r1_1)), shuf160(l01_0), shuf136($r1_0)),
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf245(l01_3), shuf221($r1_3)), shuf245(l01_2), shuf221($r1_2)),
-                        shuf245(l01_1), shuf221($r1_1)), shuf245(l01_0), shuf221($r1_0)));
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf160(l01_3), $r1_sp1[3]), shuf160(l01_2), $r1_sp1[2]), shuf160(l01_1), $r1_sp1[1]), shuf160(l01_0), $r1_sp1[0]),
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf245(l01_3), $r1_sp2[3]), shuf245(l01_2), $r1_sp2[2]), shuf245(l01_1), $r1_sp2[1]), shuf245(l01_0), $r1_sp2[0]));
                 let m10 = _mm512_add_epi32(
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf160(l23_3), shuf136($r0_3)), shuf160(l23_2), shuf136($r0_2)),
-                        shuf160(l23_1), shuf136($r0_1)), shuf160(l23_0), shuf136($r0_0)),
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf245(l23_3), shuf221($r0_3)), shuf245(l23_2), shuf221($r0_2)),
-                        shuf245(l23_1), shuf221($r0_1)), shuf245(l23_0), shuf221($r0_0)));
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf160(l23_3), $r0_sp1[3]), shuf160(l23_2), $r0_sp1[2]), shuf160(l23_1), $r0_sp1[1]), shuf160(l23_0), $r0_sp1[0]),
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf245(l23_3), $r0_sp2[3]), shuf245(l23_2), $r0_sp2[2]), shuf245(l23_1), $r0_sp2[1]), shuf245(l23_0), $r0_sp2[0]));
                 let m11 = _mm512_add_epi32(
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf160(l23_3), shuf136($r1_3)), shuf160(l23_2), shuf136($r1_2)),
-                        shuf160(l23_1), shuf136($r1_1)), shuf160(l23_0), shuf136($r1_0)),
-                    dpb512(dpb512(dpb512(dpb512(zero,
-                        shuf245(l23_3), shuf221($r1_3)), shuf245(l23_2), shuf221($r1_2)),
-                        shuf245(l23_1), shuf221($r1_1)), shuf245(l23_0), shuf221($r1_0)));
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf160(l23_3), $r1_sp1[3]), shuf160(l23_2), $r1_sp1[2]), shuf160(l23_1), $r1_sp1[1]), shuf160(l23_0), $r1_sp1[0]),
+                    dpb512(dpb512(dpb512(dpb512(zero, shuf245(l23_3), $r1_sp2[3]), shuf245(l23_2), $r1_sp2[2]), shuf245(l23_1), $r1_sp2[1]), shuf245(l23_0), $r1_sp2[0]));
                 // straighten to 4 row vectors (C:862-865)
                 let ir0 = _mm512_mask_blend_epi32(0xCCCC, m00, _mm512_shuffle_epi32::<78>(m01));
                 let ir1 = _mm512_mask_blend_epi32(0xCCCC, _mm512_shuffle_epi32::<78>(m00), m01);
@@ -837,88 +823,103 @@ mod simd_x86 {
                     _mm512_mul_ps($col, _mm512_shuffle_ps::<255>(rs, rs)), $acc[$BASE + 3]);
             }};
         }
-        // ---- 16-row section (C:671-883) ----
-        // arch batch 18 note: a loop-fission experiment (four b-loops, one
-        // per 4-row group, decode re-run per loop — the shape GCC's own
-        // distribution produces for the reference) measured 8036→9884 µs on
-        // the nr=128 isolated bench: the 4x re-decode costs more than the
-        // removed zmm spills. A 2-way split was ~2.4% better but under the
-        // concurrent-agent load the run-to-run spread was ±20%, below any
-        // keep threshold. The fused form below stays (perf9's shape);
-        // residual 1.31-1.4x vs GCC remains LLVM scheduling — see
-        // parity/asm/{port,ref}_mxfp4_gemm_avx512.asm.
+        // ---- 16-row section (C:671-883), the reference's distributed shape ----
+        // One decode pass per (y, x) writes the 8 decoded rhs vectors + col
+        // scale of every slab to the relay; four per-row-group passes then
+        // re-load them, re-apply the sp1/sp2 shuffles and fma into their own
+        // 4-row accumulator. This bounds the live zmm set (4 acc + 9 relay +
+        // transients) instead of the fused form's 16 acc + 16 shuffled rhs +
+        // transients, which LLVM spills ~3x more than GCC's own distribution
+        // of the same math (185+ zmm stack round-trips in the fused loop;
+        // batch 18's fission attempt re-DECODED per group and lost to that —
+        // the relay is the missing piece, the shape the reference's -O3
+        // build actually runs).
+        let mut relay: Vec<__m512i> = vec![_mm512_setzero_si512(); nb * 9];
+        let mut accmem = [_mm512_setzero_ps(); 16];
         let mut y = 0usize;
         while y < anr / 4 {
             for x in (0..anc / NROWS_INTERLEAVED).step_by(2) {
                 let b0 = vx.add(x * b_nb * BLOCK_MXFP4X8_SIZE);
                 let b1 = vx.add((x + 1) * b_nb * BLOCK_MXFP4X8_SIZE);
-                let mut acc = [_mm512_setzero_ps(); 16];
-                {
-                    for b in 0..nb {
-                        let q0 = b0.add(b * BLOCK_MXFP4X8_SIZE).add(8);
-                        let q1 = b1.add(b * BLOCK_MXFP4X8_SIZE).add(8);
-                        // raw 2-tile loads (C:694-702)
-                        let raw = |q: *const u8| {
-                            [
-                                _mm256_loadu_si256(q as *const __m256i),
-                                _mm256_loadu_si256(q.add(32) as *const __m256i),
-                                _mm256_loadu_si256(q.add(64) as *const __m256i),
-                                _mm256_loadu_si256(q.add(96) as *const __m256i),
-                            ]
-                        };
-                        let r0 = raw(q0);
-                        let r1 = raw(q1);
-                        // 0145/2367 blends (C:705-713)
-                        let bl = |a: __m256i, c: __m256i| -> (__m256i, __m256i) {
-                            let pc = _mm256_permutevar8x32_epi32(c, required_order);
-                            let pa = _mm256_permutevar8x32_epi32(a, required_order);
-                            (_mm256_blend_epi32::<240>(a, pc), _mm256_blend_epi32::<240>(pa, c))
-                        };
-                        let (a0145_0, a2367_0) = bl(r0[0], r0[1]);
-                        let (a0145_1, a2367_1) = bl(r0[2], r0[3]);
-                        let (a89cd_0, aabef_0) = bl(r1[0], r1[1]);
-                        let (a89cd_1, aabef_1) = bl(r1[2], r1[3]);
-                        let up = |lo: __m256i, hi: __m256i| _mm512_inserti32x8::<1>(_mm512_castsi256_si512(lo), hi);
-                        let raw0145 = [up(a0145_0, a89cd_0), up(a0145_1, a89cd_1)];
-                        let raw2367 = [up(a2367_0, aabef_0), up(a2367_1, aabef_1)];
-                        // nibble -> LUT (C:721-731)
-                        let rhs_0145 = [
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(raw0145[0], m4b)),
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(raw0145[1], m4b)),
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw0145[0]), m4b)),
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw0145[1]), m4b)),
-                        ];
-                        let rhs_2367 = [
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(raw2367[0], m4b)),
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(raw2367[1], m4b)),
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw2367[0]), m4b)),
-                            _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw2367[1]), m4b)),
-                        ];
-                        // col scale: 16 E8M0 gathers, tile1 in the high half
-                        // (C:766-784 mxfp4 branch)
-                        let e0 = b0.add(b * BLOCK_MXFP4X8_SIZE);
-                        let e1 = b1.add(b * BLOCK_MXFP4X8_SIZE);
-                        let g = |p: *const u8, i: usize| crate::quants::E8M0_HALF_LUT[*p.add(i) as usize];
-                        let col = _mm512_set_ps(
-                            g(e1, 7), g(e1, 6), g(e1, 5), g(e1, 4), g(e1, 3), g(e1, 2), g(e1, 1), g(e1, 0),
-                            g(e0, 7), g(e0, 6), g(e0, 5), g(e0, 4), g(e0, 3), g(e0, 2), g(e0, 1), g(e0, 0),
-                        );
-                        let a0 = vy.add((y * nb + b) * BLOCK_Q8_0X4_SIZE);
-                        let a1 = vy.add(((y + 1) * nb + b) * BLOCK_Q8_0X4_SIZE);
-                        let a2 = vy.add(((y + 2) * nb + b) * BLOCK_Q8_0X4_SIZE);
-                        let a3 = vy.add(((y + 3) * nb + b) * BLOCK_Q8_0X4_SIZE);
-                        zmm_rows!(a0, acc, 0, col, rhs_0145[0], rhs_0145[1], rhs_0145[2], rhs_0145[3],
-                                  rhs_2367[0], rhs_2367[1], rhs_2367[2], rhs_2367[3]);
-                        zmm_rows!(a1, acc, 4, col, rhs_0145[0], rhs_0145[1], rhs_0145[2], rhs_0145[3],
-                                  rhs_2367[0], rhs_2367[1], rhs_2367[2], rhs_2367[3]);
-                        zmm_rows!(a2, acc, 8, col, rhs_0145[0], rhs_0145[1], rhs_0145[2], rhs_0145[3],
-                                  rhs_2367[0], rhs_2367[1], rhs_2367[2], rhs_2367[3]);
-                        zmm_rows!(a3, acc, 12, col, rhs_0145[0], rhs_0145[1], rhs_0145[2], rhs_0145[3],
-                                  rhs_2367[0], rhs_2367[1], rhs_2367[2], rhs_2367[3]);
-                    }
+                // decode pass: rhs nibbles -> LUT bytes + col scale -> relay
+                for b in 0..nb {
+                    let q0 = b0.add(b * BLOCK_MXFP4X8_SIZE).add(8);
+                    let q1 = b1.add(b * BLOCK_MXFP4X8_SIZE).add(8);
+                    // raw 2-tile loads (C:694-702)
+                    let raw = |q: *const u8| {
+                        [
+                            _mm256_loadu_si256(q as *const __m256i),
+                            _mm256_loadu_si256(q.add(32) as *const __m256i),
+                            _mm256_loadu_si256(q.add(64) as *const __m256i),
+                            _mm256_loadu_si256(q.add(96) as *const __m256i),
+                        ]
+                    };
+                    let r0 = raw(q0);
+                    let r1 = raw(q1);
+                    // 0145/2367 blends (C:705-713)
+                    let bl = |a: __m256i, c: __m256i| -> (__m256i, __m256i) {
+                        let pc = _mm256_permutevar8x32_epi32(c, required_order);
+                        let pa = _mm256_permutevar8x32_epi32(a, required_order);
+                        (_mm256_blend_epi32::<240>(a, pc), _mm256_blend_epi32::<240>(pa, c))
+                    };
+                    let (a0145_0, a2367_0) = bl(r0[0], r0[1]);
+                    let (a0145_1, a2367_1) = bl(r0[2], r0[3]);
+                    let (a89cd_0, aabef_0) = bl(r1[0], r1[1]);
+                    let (a89cd_1, aabef_1) = bl(r1[2], r1[3]);
+                    let up = |lo: __m256i, hi: __m256i| _mm512_inserti32x8::<1>(_mm512_castsi256_si512(lo), hi);
+                    let raw0145 = [up(a0145_0, a89cd_0), up(a0145_1, a89cd_1)];
+                    let raw2367 = [up(a2367_0, aabef_0), up(a2367_1, aabef_1)];
+                    // nibble -> LUT (C:721-731)
+                    let rhs_0145 = [
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(raw0145[0], m4b)),
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(raw0145[1], m4b)),
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw0145[0]), m4b)),
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw0145[1]), m4b)),
+                    ];
+                    let rhs_2367 = [
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(raw2367[0], m4b)),
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(raw2367[1], m4b)),
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw2367[0]), m4b)),
+                        _mm512_shuffle_epi8(lut, _mm512_and_si512(_mm512_srli_epi16::<4>(raw2367[1]), m4b)),
+                    ];
+                    // col scale: 16 E8M0 gathers, tile1 in the high half
+                    // (C:766-784 mxfp4 branch)
+                    let e0 = b0.add(b * BLOCK_MXFP4X8_SIZE);
+                    let e1 = b1.add(b * BLOCK_MXFP4X8_SIZE);
+                    let g = |p: *const u8, i: usize| crate::quants::E8M0_HALF_LUT[*p.add(i) as usize];
+                    let col = _mm512_set_ps(
+                        g(e1, 7), g(e1, 6), g(e1, 5), g(e1, 4), g(e1, 3), g(e1, 2), g(e1, 1), g(e1, 0),
+                        g(e0, 7), g(e0, 6), g(e0, 5), g(e0, 4), g(e0, 3), g(e0, 2), g(e0, 1), g(e0, 0),
+                    );
+                    relay[b * 9..][..8].copy_from_slice(&[rhs_0145[0], rhs_0145[1], rhs_0145[2], rhs_0145[3],
+                                                          rhs_2367[0], rhs_2367[1], rhs_2367[2], rhs_2367[3]]);
+                    relay[b * 9 + 8] = _mm512_castps_si512(col);
                 }
+                // four row-group passes: bounded register set each, sp
+                // shuffles re-applied from the relay (the reference's
+                // distribution), fma into a local 4-acc then parked
+                macro_rules! group_pass {
+                    ($G:expr) => {{
+                        let mut acc = [_mm512_setzero_ps(); 4];
+                        for b in 0..nb {
+                            let rb = &relay[b * 9..];
+                            let col = _mm512_castsi512_ps(rb[8]);
+                            let r0_sp1 = [shuf136(rb[0]), shuf136(rb[1]), shuf136(rb[2]), shuf136(rb[3])];
+                            let r1_sp1 = [shuf136(rb[4]), shuf136(rb[5]), shuf136(rb[6]), shuf136(rb[7])];
+                            let r0_sp2 = [shuf221(rb[0]), shuf221(rb[1]), shuf221(rb[2]), shuf221(rb[3])];
+                            let r1_sp2 = [shuf221(rb[4]), shuf221(rb[5]), shuf221(rb[6]), shuf221(rb[7])];
+                            zmm_rows!(vy.add(((y + $G) * nb + b) * BLOCK_Q8_0X4_SIZE), acc, 0,
+                                      col, r0_sp1, r1_sp1, r0_sp2, r1_sp2);
+                        }
+                        accmem[$G * 4..][..4].copy_from_slice(&acc);
+                    }};
+                }
+                group_pass!(0);
+                group_pass!(1);
+                group_pass!(2);
+                group_pass!(3);
                 for i in 0..16 {
-                    _mm512_storeu_ps(s.add((y * 4 + i) * bs + x * 8), acc[i]);
+                    _mm512_storeu_ps(s.add((y * 4 + i) * bs + x * 8), accmem[i]);
                 }
             }
             y += 4;
@@ -974,8 +975,15 @@ mod simd_x86 {
                         g(e0, 7), g(e0, 6), g(e0, 5), g(e0, 4), g(e0, 3), g(e0, 2), g(e0, 1), g(e0, 0),
                     );
                     let a_tile = vy.add((y * nb + b) * BLOCK_Q8_0X4_SIZE);
-                    zmm_rows!(a_tile, acc, 0, col, rhs_0145[0], rhs_0145[1], rhs_0145[2], rhs_0145[3],
-                              rhs_2367[0], rhs_2367[1], rhs_2367[2], rhs_2367[3]);
+                    let r0_sp1 = [shuf136(rhs_0145[0]), shuf136(rhs_0145[1]),
+                                  shuf136(rhs_0145[2]), shuf136(rhs_0145[3])];
+                    let r1_sp1 = [shuf136(rhs_2367[0]), shuf136(rhs_2367[1]),
+                                  shuf136(rhs_2367[2]), shuf136(rhs_2367[3])];
+                    let r0_sp2 = [shuf221(rhs_0145[0]), shuf221(rhs_0145[1]),
+                                  shuf221(rhs_0145[2]), shuf221(rhs_0145[3])];
+                    let r1_sp2 = [shuf221(rhs_2367[0]), shuf221(rhs_2367[1]),
+                                  shuf221(rhs_2367[2]), shuf221(rhs_2367[3])];
+                    zmm_rows!(a_tile, acc, 0, col, r0_sp1, r1_sp1, r0_sp2, r1_sp2);
                 }
                 for i in 0..4 {
                     _mm512_storeu_ps(s.add((y * 4 + i) * bs + x * 8), acc[i]);
@@ -4053,12 +4061,19 @@ mod simd_x86_q4_0 {
         let mut y = 0usize;
 
         // groups of four block_q8_0x4 (16 activation rows) x 16 columns
-        // (arch/x86/repack.cpp:660-908)
+        // (arch/x86/repack.cpp:660-908), the reference's distributed shape:
+        // one decode pass per (y, x) parks the shuffled rhs + col scale of
+        // every slab in a relay; four row-group passes re-load them with a
+        // bounded register set (4 acc + 17 relay + transients) — the fused
+        // form keeps 16 acc + 16 shuffled rhs live and LLVM spills it ~3x
+        // harder than GCC's own distribution (see simd_x86::gemm_avx512's
+        // relay note; same disease, same cure).
+        let mut relay: Vec<__m512i> = vec![_mm512_setzero_si512(); nb * 17];
+        let mut accmem = [_mm512_setzero_ps(); 16];
         while y < anr / 4 {
             for x in (0..anc / 8).step_by(2) {
                 let b0 = vx.add(x * b_nb * BLOCK_Q4_0X8_SIZE);
                 let b1 = vx.add((x + 1) * b_nb * BLOCK_Q4_0X8_SIZE);
-                let mut acc = [_mm512_setzero_ps(); 16];
                 for b in 0..nb {
                     let (r_sp1, r_sp2, col) = rhs_512(
                         b0.add(b * BLOCK_Q4_0X8_SIZE),
@@ -4067,15 +4082,32 @@ mod simd_x86_q4_0 {
                         m4b512,
                         required_order,
                     );
-                    for rp in 0..4 {
-                        let a_tile = vy.add(((y + rp) * nb + b) * BLOCK_Q8_0X4_SIZE);
-                        let (l_sp1, l_sp2) = lhs_512(a_tile);
-                        acc_rows_512::<VNNI>(a_tile, &l_sp1, &l_sp2, &r_sp1, &r_sp2, col, load_mask, &mut acc, rp * 4);
-                    }
+                    relay[b * 17..][..8].copy_from_slice(&r_sp1);
+                    relay[b * 17 + 8..][..8].copy_from_slice(&r_sp2);
+                    relay[b * 17 + 16] = _mm512_castps_si512(col);
                 }
+                macro_rules! group_pass {
+                    ($G:expr) => {{
+                        let mut acc = [_mm512_setzero_ps(); 4];
+                        for b in 0..nb {
+                            let rb = &relay[b * 17..];
+                            let r_sp1: &[__m512i; 8] = rb[..8].try_into().unwrap();
+                            let r_sp2: &[__m512i; 8] = rb[8..16].try_into().unwrap();
+                            let col = _mm512_castsi512_ps(rb[16]);
+                            let a_tile = vy.add(((y + $G) * nb + b) * BLOCK_Q8_0X4_SIZE);
+                            let (l_sp1, l_sp2) = lhs_512(a_tile);
+                            acc_rows_512::<VNNI>(a_tile, &l_sp1, &l_sp2, r_sp1, r_sp2, col, load_mask, &mut acc, 0);
+                        }
+                        accmem[$G * 4..][..4].copy_from_slice(&acc);
+                    }};
+                }
+                group_pass!(0);
+                group_pass!(1);
+                group_pass!(2);
+                group_pass!(3);
                 // (arch/x86/repack.cpp:904-906)
                 for i in 0..16 {
-                    _mm512_storeu_ps(s.add((y * 4 + i) * bs + x * 8), acc[i]);
+                    _mm512_storeu_ps(s.add((y * 4 + i) * bs + x * 8), accmem[i]);
                 }
             }
             y += 4;
@@ -4576,6 +4608,149 @@ mod tests {
         });
         println!("gemm speedup: {:.2}x", c / d);
         assert!(d < c, "the SIMD kernel must be faster");
+    }
+
+    /// Kernel-level A/B against the pinned reference .so via
+    /// `parity/ref_gemm_ab.c`: writes the repacked weights + interleaved q8
+    /// activations to /tmp/gemmab, times this side's dispatched gemm, and —
+    /// once the C harness has run — checks output bit-parity against the
+    /// reference kernel's result. The fixture keeps every E8M0 scale in the
+    /// normal band (the 1-in-16 {0,1,2} exponents of [`rand_mxfp4`]'s tail
+    /// trip Zen5 denormal microcode assists — perf round 32's lesson — and
+    /// would distort the A/B).
+    #[test]
+    #[ignore = "manual: kernel A/B vs reference .so (parity/ref_gemm_ab.c)"]
+    fn bench_repack_gemm_vs_ref() {
+        let _serial = serial();
+        // nr is parametrizable: the MoE mul_mat_id path calls this kernel
+        // with small row counts (4-32) — LLAMA_RUST_AB_NR overrides the
+        // default gpt-oss-expert-sized 128
+        let (n, nc) = (2880usize, 2880usize);
+        let nr: usize = std::env::var("LLAMA_RUST_AB_NR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let nb = n / QK_MXFP4;
+        let mut s = 0x2468_1357u32;
+        let mut src = vec![0u8; nc * nb * BLOCK_MXFP4_SIZE];
+        for blk in src.chunks_mut(BLOCK_MXFP4_SIZE) {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            blk[0] = 118 + (s % 16) as u8;
+            for q in &mut blk[1..] {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                *q = (s >> 24) as u8;
+            }
+        }
+        let rep = repack_mxfp4_8x8(&src, nc, n);
+        let act = lcg_f32(nr * n, 0x5150_2222);
+        let mut q8x4 = vec![0u8; (nr / 4) * (n / QK8_0) * BLOCK_Q8_0X4_SIZE];
+        quantize_mat_q8_0_4x8(&act, n, nr, &mut q8x4);
+
+        let dir = std::path::Path::new("/tmp/gemmab");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("mxfp4_rep.bin"), &rep).unwrap();
+        std::fs::write(dir.join("mxfp4_act.bin"), &q8x4).unwrap();
+
+        let mut out = vec![0f32; nr * nc];
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            for v in out.iter_mut() {
+                *v = 0.0;
+            }
+            let t = std::time::Instant::now();
+            gemm_mxfp4_8x8_q8_0(n, &mut out, nc, &rep, &q8x4, nr, nc);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let bytes = nc as f64 * (n / 32) as f64 * BLOCK_MXFP4X8_SIZE as f64;
+        println!(
+            "port mxfp4 n={n} nc={nc} nr={nr}: {:9.3} ms  {:7.2} GB/s (weights)  out[0]={:.4}",
+            best * 1e3,
+            bytes / best / 1e9,
+            out[0]
+        );
+
+        let ref_path = dir.join("mxfp4_ref_out.bin");
+        if let Ok(rb) = std::fs::read(&ref_path) {
+            let rf: &[f32] = bytemuck::cast_slice(&rb);
+            assert_eq!(rf.len(), out.len(), "stale ref output: rerun ref_gemm_ab");
+            let bad = out
+                .iter()
+                .zip(rf)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            println!("bit-parity vs ref kernel: {bad} mismatches / {} elems", out.len());
+            assert_eq!(bad, 0, "kernel-level bit divergence vs the reference");
+        } else {
+            eprintln!(
+                "no ref output yet: run parity/ref_gemm_ab (see its header), then rerun this test"
+            );
+        }
+    }
+
+    /// The q4_0 twin of [`bench_repack_gemm_vs_ref`]: random valid q4_0
+    /// blocks (d = 1.0, random nibbles) through the same file handshake.
+    #[test]
+    #[ignore = "manual: kernel A/B vs reference .so (parity/ref_gemm_ab.c)"]
+    fn bench_repack_gemm_q4_0_vs_ref() {
+        let _serial = serial();
+        let (n, nc) = (2048usize, 2048usize); // gemma-class dense FFN shape
+        let nr: usize = std::env::var("LLAMA_RUST_AB_NR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        let nb = n / QK4_0;
+        let mut s = 0x1357_9BDFu32;
+        let mut src = vec![0u8; nc * nb * 18]; // block_q4_0 = 2B d + 16B qs
+        for blk in src.chunks_mut(18) {
+            blk[0] = 0x00;
+            blk[1] = 0x3C; // f16 1.0
+            for q in &mut blk[2..] {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                *q = (s >> 24) as u8;
+            }
+        }
+        let rep = repack_q4_0_8x8(&src, nc, n);
+        let act = lcg_f32(nr * n, 0x2468_ACE0);
+        let mut q8x4 = vec![0u8; (nr / 4) * (n / QK8_0) * BLOCK_Q8_0X4_SIZE];
+        quantize_mat_q8_0_4x8(&act, n, nr, &mut q8x4);
+
+        let dir = std::path::Path::new("/tmp/gemmab");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("q4_0_rep.bin"), &rep).unwrap();
+        std::fs::write(dir.join("q4_0_act.bin"), &q8x4).unwrap();
+
+        let mut out = vec![0f32; nr * nc];
+        let mut best = f64::INFINITY;
+        for _ in 0..5 {
+            for v in out.iter_mut() {
+                *v = 0.0;
+            }
+            let t = std::time::Instant::now();
+            gemm_q4_0_8x8_q8_0(n, &mut out, nc, &rep, &q8x4, nr, nc);
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let bytes = nc as f64 * (n / 32) as f64 * BLOCK_Q4_0X8_SIZE as f64;
+        println!(
+            "port q4_0 n={n} nc={nc} nr={nr}: {:9.3} ms  {:7.2} GB/s (weights)  out[0]={:.4}",
+            best * 1e3,
+            bytes / best / 1e9,
+            out[0]
+        );
+
+        let ref_path = dir.join("q4_0_ref_out.bin");
+        if let Ok(rb) = std::fs::read(&ref_path) {
+            let rf: &[f32] = bytemuck::cast_slice(&rb);
+            assert_eq!(rf.len(), out.len(), "stale ref output: rerun ref_gemm_ab");
+            let bad = out
+                .iter()
+                .zip(rf)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            println!("bit-parity vs ref kernel: {bad} mismatches / {} elems", out.len());
+            assert_eq!(bad, 0, "kernel-level bit divergence vs the reference");
+        } else {
+            eprintln!("no ref output yet: run parity/ref_gemm_ab q4_0 ..., then rerun");
+        }
     }
 
     /// Rough cost of materializing one gpt-oss expert tensor (141 MiB), for the
